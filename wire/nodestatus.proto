@@ -1,0 +1,62 @@
+syntax = "proto3";
+package nodestatus;
+
+// Basic node information
+message NodeInfo {
+  string peer_id = 1;              // libp2p peer ID
+  repeated string multiaddrs = 2;  // list of multiaddresses the node is listening on
+  string version = 3;              // software version
+  map<string, string> metadata = 4; // arbitrary key-value metadata
+  int64 start_timestamp = 5;       // unix timestamp when the node was started
+}
+
+// Runtime statistics
+message NodeStats {
+  int64 uptime_seconds = 1;
+  int64 connected_peers = 2;     // number of currently connected peers
+  int64 known_peers = 3;        // number of peers known through DHT
+  int64 bandwidth_in_bytes = 4;
+  int64 bandwidth_out_bytes = 5;
+  double cpu_usage = 6;
+  int64 memory_usage_bytes = 7;
+}
+
+// Node status details
+message NodeStatus {
+  enum State {
+    UNKNOWN = 0;
+    STARTING = 1;
+    RUNNING = 2;
+    STOPPING = 3;
+    STOPPED = 4;
+    ERROR = 5;
+  }
+  State state = 1;
+  string error_message = 2;      // populated if state is ERROR
+  NodeInfo info = 3;
+  NodeStats stats = 4;
+  int64 timestamp = 5;           // unix timestamp of status update
+}
+
+// Service requests and responses
+message GetNodeStatusRequest {}
+
+message GetNodeStatusResponse {
+  NodeStatus status = 1;
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  bool is_healthy = 1;
+  string message = 2;
+}
+
+// Node status service definition
+service NodeStatusService {
+  // Get current node status
+  rpc GetNodeStatus(GetNodeStatusRequest) returns (GetNodeStatusResponse);
+  
+  // Health check endpoint
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}

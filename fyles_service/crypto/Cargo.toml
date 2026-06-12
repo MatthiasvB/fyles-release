@@ -1,0 +1,28 @@
+[package]
+name = "crypto"
+version = "0.1.0"
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tap = { workspace = true }
+thiserror = { workspace = true }
+aes-gcm = { workspace = true }
+chacha20poly1305 = { workspace = true }
+x25519-dalek = { workspace = true, features = ["serde", "static_secrets"] }
+pqc_kyber = { workspace = true, features = ["kyber1024"] }
+ed25519-dalek = { workspace = true, features = ["serde", "rand_core"] }
+pqcrypto-dilithium = { workspace = true, features = ["serde", "serialization"] }
+hkdf = { workspace = true }
+pqcrypto-traits = { workspace = true }
+rand.workspace = true
+serde = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+bincode = { workspace = true, features = ["serde"] }
+serde_bytes = { workspace = true }
+
+[features]
+test-support = []

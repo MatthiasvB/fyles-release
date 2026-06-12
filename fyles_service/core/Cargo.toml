@@ -1,0 +1,61 @@
+[package]
+name = "fyles-core"
+version = "0.4.2"
+edition.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+bs58 = { workspace = true }
+futures = { workspace = true }
+grpc = { workspace = true }
+itertools = { workspace = true }
+prost = { workspace = true }
+protobuf = { workspace = true }
+rusqlite = { workspace = true, features = ["bundled", "backup"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tap = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "sync", "rt", "rt-multi-thread", "fs", "time"] }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+semver = { workspace = true, features = ["serde"] }
+shellexpand = { workspace = true }
+autosurgeon = { workspace = true }
+automerge = { workspace = true }
+expiringmap = { workspace = true }
+serde_bytes = { workspace = true }
+bincode = { workspace = true, features = ["serde"] }
+tracing = { workspace = true }
+test-log = { workspace = true, features = ["trace"] }
+async-std = { workspace = true }
+sanitize-filename = { workspace = true }
+rand = { workspace = true }
+zip_clone = { workspace = true }
+uds_windows = { workspace = true }
+crypto = { workspace = true }
+tempfile = { workspace = true, optional = true }
+async-io = { workspace = true }
+futures-util = { workspace = true }
+subtle = { workspace = true, features = ["const-generics"] }
+base64 = { workspace = true }
+zstd = { workspace = true }
+libc.workspace = true
+tokio-util = { workspace = true, features = ["compat", "time"] }
+derive_more = { workspace = true, features = ["as_ref", "deref", "deref_mut", "display", "from", "from_str"] }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+async-std = { workspace = true, features = ["attributes"] }
+crypto = { workspace = true, features = ["test-support"] }
+
+[features]
+default = []
+test-with-prod-db = []
+otel-jaeger = []
+test-support = ["tempfile", "crypto/test-support"]
+

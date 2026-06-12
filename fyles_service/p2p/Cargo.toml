@@ -1,0 +1,50 @@
+[package]
+name = "p2p"
+version = "0.2.0"
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# nothing in the code _or the runtime_ will let you know that this is required, but without
+# the "rsa" feature you will be unable to find nodes via the DHT (and possibly other problems!)
+libp2p = { workspace = true, features = ["autonat", "cbor", "dcutr", "dns", "ed25519", "identify", "kad", "macros", "mdns", "noise", "quic", "relay", "request-response", "rsa", "tcp", "tokio", "yamux"] }
+fyles-core = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+rand.workspace = true
+crypto = { workspace = true }
+bincode = { workspace = true, features = ["serde"] }
+x25519-dalek = { workspace = true, features = ["serde"] }
+pqc_kyber = { workspace = true }
+serde_bytes = { workspace = true }
+ed25519-dalek = { workspace = true, features = ["serde"] }
+pqcrypto-traits = { workspace = true }
+pqcrypto-dilithium = { workspace = true, features = ["serialization"] }
+thiserror = { workspace = true }
+tap = { workspace = true }
+chacha20poly1305 = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
+itertools = { workspace = true }
+futures = { workspace = true }
+test-log = { workspace = true, features = ["trace"] }
+tempfile = { workspace = true }
+bs58.workspace = true
+derive_more = { workspace = true, features = ["deref"] }
+tokio-util = { workspace = true, features = ["time"] }
+log = "0.4.28"
+hashbrown = "0.17.0"
+
+[dev-dependencies]
+libp2p-swarm-test = { workspace = true, features = ["tokio"] }
+tempfile = { workspace = true }
+fyles-core = { workspace = true, features = ["test-support"] }
+crypto = { workspace = true, features = ["test-support"] }
+
+[features]
+test-with-prod-db = []
+test-support = []

@@ -1,0 +1,36 @@
+[package]
+name = "fyles-daemon"
+version = "0.4.2"
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+clap = { workspace = true, features = ["derive", "env"] }
+fyles-core = { workspace = true }
+direct_host_utils = { workspace = true }
+tap = { workspace = true }
+test-log = { workspace = true, features = ["trace"] }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, features = ["experimental_async_runtime"], optional = true }
+opentelemetry = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+opentelemetry-stdout = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+p2p = { workspace = true }
+libp2p.workspace = true
+
+[features]
+default = []
+test-with-prod-db = ["fyles-core/test-with-prod-db"]
+console = ["tracing-subscriber/fmt", "direct_host_utils/console"]
+otel-jaeger = ["opentelemetry", "opentelemetry-otlp", "tracing-opentelemetry", "opentelemetry-stdout", "opentelemetry_sdk"]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+fyles-core = { workspace = true, features = ["test-support"] }
+p2p = { workspace = true, features = ["test-support"] }

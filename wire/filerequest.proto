@@ -1,0 +1,730 @@
+syntax = "proto3";
+package api;
+
+// Add version messages before the FileRequestProto
+message GetVersionRequest {}
+
+message GetVersionResponse {
+    string version = 1;
+}
+
+// Design Philosophy:
+// - No implicitly optional parameters in request messages
+// - Each endpoint should have exactly one clear purpose
+// - Split endpoints instead of using optional parameters
+
+message AccessProto {
+  oneof access {
+    PublicProto public = 1;
+    SpecificUsersProto audience = 2;
+  }
+}
+
+message FileRequestProto {
+  string id = 1;
+  string title = 2;
+  string description = 3;
+  AccessProto access = 4; // Changed from inline oneof to AccessProto
+  bool is_active = 6;
+}
+
+message PublicProto {
+  // This can be empty, but including it explicitly clarifies intent
+}
+
+message SpecificUsersProto {
+  repeated string contact_ids = 1; // List of user IDs
+}
+
+message ContactProto {
+  string id = 1;
+  string name = 2;
+}
+
+message SelfContactProto {
+  string id = 1;
+  string name = 2;
+  ContactKeysProto keys = 3;
+}
+
+message CreatePeerProto {
+  string peer_id = 2;
+  string name = 3;
+}
+
+message PeerProto {
+  string id = 1;
+  string peer_id = 2;
+  string name = 3;
+}
+
+message RemoteFileRequestProto {
+  string id = 1;
+  string peer_id = 2;
+  string file_request_id = 3;
+  string name = 4;
+  string contact_id = 6;
+}
+
+message CreateRemoteFileRequestProto {
+  string peer_id = 1;
+  string file_request_id = 2;
+  string name = 3;
+  string contact_id = 5; 
+}
+
+enum SendStatusProto {
+  PENDING = 0;
+  SENDING = 1;
+  SUCCESS = 2;
+  REJECTED = 3;
+  FAILED = 4;
+  PREPARED = 5;
+  INTERRUPTED = 6;
+  PENDING_SENT = 7;
+}
+
+enum ReceiveStatusProto {
+  RECEIVE_STATUS_RECEIVING = 0;
+  RECEIVE_STATUS_INTERRUPTED = 1;
+  RECEIVE_STATUS_COMPLETED = 2;
+  RECEIVE_STATUS_FAILED = 3;
+}
+
+message TransferDataProto {
+  uint64 progress_bytes = 5;
+  string transfer_id = 6;
+  uint64 file_size_bytes = 7;
+}
+
+message PendingFileProto {
+  string id = 1;
+  string file_path = 2;
+  string target_file_request_id = 3;
+  SendStatusProto send_status = 4;
+  optional TransferDataProto transfer_data = 5;
+  optional string display_name = 6;
+  repeated string interruption_reasons = 7;
+}
+
+message FileInfoProto {
+  string path = 1;
+  optional string display_name = 2;
+}
+
+message CreatePendingFilesProto {
+  repeated FileInfoProto file_infos = 1;
+  string target_file_request_id = 2;
+  SendStatusProto send_status = 3;
+}
+
+// Add new messages for client operations
+message StoreRemoteFileRequestRequest {
+  CreateRemoteFileRequestProto remote_file_request = 1;
+}
+
+message UpdateRemoteFileRequestRequest {
+  RemoteFileRequestProto remote_file_request = 1;
+}
+
+message StoreRemoteFileRequestResponse {
+  string id = 1; // Return ID of the created remote file request instead of success boolean
+}
+
+message GetRemoteFileRequestRequest {
+  string id = 1;
+}
+
+message GetRemoteFileRequestResponse {
+  RemoteFileRequestProto remote_file_request = 1;
+}
+
+message ListRemoteFileRequestsRequest {
+  string contact_id = 1; // Now required
+}
+
+message ListRemoteFileRequestsResponse {
+  repeated RemoteFileRequestProto remote_file_requests = 1;
+}
+
+message GetAllRemoteFileRequestsRequest {
+  // Empty message as no parameters needed
+}
+
+message GetAllRemoteFileRequestsResponse {
+  repeated RemoteFileRequestProto remote_file_requests = 1;
+}
+
+message DeleteRemoteFileRequestRequest {
+  string id = 1;
+}
+
+message DeleteRemoteFileRequestResponse {
+  bool success = 1;
+}
+
+message StorePendingFileRequest {
+ CreatePendingFilesProto pending_files = 1;
+}
+
+message StorePendingFileResponse {
+ repeated string ids = 1;
+}
+
+message GetPendingFileRequest {
+  string id = 1;
+}
+
+message GetPendingFileResponse {
+  PendingFileProto pending_file = 1;
+}
+
+message ListPendingFilesRequest {
+  string target_file_request_id = 1; // Required - list files for specific request
+}
+
+message ListPendingFilesResponse {
+  repeated PendingFileProto pending_files = 1;
+}
+
+message GetAllPendingFilesRequest {
+  // Empty message as no parameters needed
+}
+
+message GetAllPendingFilesResponse {
+  repeated PendingFileProto pending_files = 1;
+}
+
+message DeletePendingFileRequest {
+  string id = 1;
+}
+
+message DeletePendingFileResponse {
+  bool success = 1;
+}
+
+message ShutdownRequest {
+  // Empty message as no parameters needed
+}
+
+message ShutdownResponse {
+  bool success = 1;
+}
+
+// Add new messages before service definition
+message GetContactNameRequest {
+  string id = 1;
+}
+
+message GetContactNameResponse {
+  string name = 1;
+}
+
+message GetContactNamesRequest {
+  repeated string ids = 1;
+}
+
+message GetContactNamesResponse {
+  map<string, string> names = 1; // map of id -> name
+}
+
+// Add new messages before the service definition
+message ListPeersRequest {
+  string contact_id = 1;
+}
+
+message ListPeersResponse {
+  repeated PeerProto peers = 1;
+}
+
+message GetPeerRequest {
+  string peer_id = 1;
+}
+
+message GetPeerResponse {
+  PeerProto peer = 1;
+}
+
+message SyncPeersRequest {
+  string contact_id = 1;
+  repeated PeerProto peers = 2;
+}
+
+message SyncPeersResponse {
+  repeated PeerProto updated_peers = 1;
+}
+
+message DeletePeerRequest {
+  string peer_id = 1;
+}
+
+message DeletePeerResponse {
+  bool success = 1;
+}
+
+// Add new messages for node peer id
+message GetNodePeerIdRequest {
+  // Empty as we just want our own peer id
+}
+
+message GetNodePeerIdResponse {
+  string peer_id = 1;
+}
+
+// New message for received-file info
+message ReceivedFileProto {
+  string id = 1;
+  optional string contact_id = 2;
+  string filerequest_id = 3;
+  string file_name = 4;
+  string file_path = 5;
+  int64 size = 6;
+  int64 received_at_ms = 7; // ms since Unix epoch
+}
+
+// Request to list received files for a remote request
+message ListReceivedFilesRequest {
+  string remote_file_request_id = 1;
+}
+
+// Response containing all received files
+message ListReceivedFilesResponse {
+  repeated ReceivedFileProto received_files = 1;
+}
+
+message DeleteReceivedFileRequest {
+  string id = 1;
+}
+
+message DeleteReceivedFileResponse {
+  bool success = 1;
+}
+
+message GetSelfContactRequest {
+  // Empty as there is only one self contact
+}
+
+message UpdateSelfContactNameRequest {
+  string name = 1;
+}
+
+message UpdateSelfContactNameResponse {
+  bool success = 1;
+}
+
+message StoreSelfPeerRequest {
+  CreatePeerProto peer = 1;
+}
+
+message StoreSelfPeerResponse {
+  string id = 1;
+}
+
+message DeleteSelfPeerRequest {
+  string peer_id = 1;
+}
+
+message DeleteSelfPeerResponse {
+  bool success = 1;
+}
+
+message UpdateSelfPeerRequest {
+  PeerProto peer = 1;
+}
+
+message UpdateSelfPeerResponse {
+  bool success = 1;
+}
+
+// Add new messages for the WaitForReady endpoint
+message WaitForReadyRequest {
+  // Empty request
+}
+
+message WaitForReadyResponse {
+  bool successfully_started = 1;
+}
+
+// Opaque settings messages
+message UpdateSettingsRequest {
+  bytes settings = 1;
+}
+
+message UpdateSettingsResponse {
+  bool success = 1;
+}
+
+message GetSettingsRequest {
+  // empty
+}
+
+message GetSettingsResponse {
+  bytes settings = 1;
+}
+
+// Define a service for the server
+service FileRequestService {
+  // Add WaitForReady RPC at the beginning of the service methods
+  rpc WaitForReady (WaitForReadyRequest) returns (WaitForReadyResponse);
+  
+  // Replace GetJoinSelfContactAuthorizationChallenge with:
+  rpc GetFullSelfContact (GetFullSelfContactRequest) returns (GetFullSelfContactResponse);
+  rpc UpdateIdentity( UpdateIdentityRequest) returns (UpdateIdentityResponse);
+  rpc SharePublicSelfContact (SharePublicSelfContactRequest) returns (SharePublicSelfContactResponse);
+  rpc RegisterContact (RegisterContactRequest) returns (RegisterContactResponse);
+  
+  // Add new methods at the beginning
+  rpc GetContactName (GetContactNameRequest) returns (GetContactNameResponse);
+  rpc GetContactNames (GetContactNamesRequest) returns (GetContactNamesResponse);
+  
+  // Add version RPC as first method
+  rpc GetVersion (GetVersionRequest) returns (GetVersionResponse);
+  rpc Shutdown (ShutdownRequest) returns (ShutdownResponse);
+  rpc GetFileRequest (FileRequestRequest) returns (FileRequestResponse);
+  rpc CreateFileRequest (CreateFileRequestRequest) returns (CreateFileRequestResponse);
+  rpc UpdateFileRequest (UpdateFileRequestRequest) returns (UpdateFileRequestResponse);
+  rpc DeleteFileRequest (DeleteFileRequestRequest) returns (DeleteFileRequestResponse);
+  rpc GetAllFileRequests (GetAllFileRequestsRequest) returns (GetAllFileRequestsResponse);
+
+  // Contact management
+  rpc GetContact (GetContactRequest) returns (GetContactResponse);
+  rpc GetAllContacts (GetAllContactsRequest) returns (GetAllContactsResponse);
+  rpc UpdateContact (UpdateContactRequest) returns (UpdateContactResponse);
+  rpc DeleteContact (DeleteContactRequest) returns (DeleteContactResponse);
+
+  rpc UpdateSelfContactName (UpdateSelfContactNameRequest) returns (UpdateSelfContactNameResponse);
+  rpc GetSelfContactDisplay(GetSelfContactDisplayRequest) returns (GetSelfContactDisplayResponse);
+
+  // Node information
+  rpc GetNodePeerId (GetNodePeerIdRequest) returns (GetNodePeerIdResponse);
+
+  // Remote file request operations
+  rpc StoreRemoteFileRequest (StoreRemoteFileRequestRequest) returns (StoreRemoteFileRequestResponse);
+  rpc UpdateRemoteFileRequest (UpdateRemoteFileRequestRequest) returns (UpdateRemoteFileRequestResponse);
+  rpc GetRemoteFileRequest (GetRemoteFileRequestRequest) returns (GetRemoteFileRequestResponse);
+  rpc ListRemoteFileRequests (ListRemoteFileRequestsRequest) returns (ListRemoteFileRequestsResponse); 
+  rpc GetAllRemoteFileRequests (GetAllRemoteFileRequestsRequest) returns (GetAllRemoteFileRequestsResponse);
+  rpc DeleteRemoteFileRequest (DeleteRemoteFileRequestRequest) returns (DeleteRemoteFileRequestResponse);
+
+  // Pending file operations
+  rpc StorePendingFile (StorePendingFileRequest) returns (StorePendingFileResponse);
+  rpc GetPendingFile (GetPendingFileRequest) returns (GetPendingFileResponse);
+  rpc ListPendingFiles (ListPendingFilesRequest) returns (ListPendingFilesResponse);
+  rpc GetAllPendingFiles (GetAllPendingFilesRequest) returns (GetAllPendingFilesResponse);
+  rpc DeletePendingFile (DeletePendingFileRequest) returns (DeletePendingFileResponse);
+
+  rpc ListReceivedFiles (ListReceivedFilesRequest) returns (ListReceivedFilesResponse);
+
+  rpc DeleteReceivedFile (DeleteReceivedFileRequest) returns (DeleteReceivedFileResponse);
+
+  rpc GetSelfContactInviteChallenge (GetSelfContactInviteChallengeRequest) returns (GetSelfContactInviteChallengeResponse);
+  rpc UnregisterSelfContactInviteChallenge (UnregisterSelfContactInviteChallengeRequest) returns (UnregisterSelfContactInviteChallengeResponse);
+  rpc UseSelfContactInvite (UseSelfContactInviteRequest) returns (UseSelfContactInviteResponse);
+
+  rpc GetContactShareChallenge (GetContactShareChallengeRequest) returns (GetContactShareChallengeResponse);
+  rpc UnregisterContactShareChallenge (UnregisterContactShareChallengeRequest) returns (UnregisterContactShareChallengeResponse);
+  rpc UseContactShareChallenge (UseContactShareChallengeRequest) returns (UseContactShareChallengeResponse);
+
+  rpc BackupData (BackupDataRequest) returns (BackupDataResponse);
+  rpc RestoreData (RestoreDataRequest) returns (RestoreDataResponse);
+
+  // Opaque settings
+  rpc UpdateSettings (UpdateSettingsRequest) returns (UpdateSettingsResponse);
+  rpc GetSettings (GetSettingsRequest) returns (GetSettingsResponse);
+
+  rpc Stream (stream ClientMessage) returns (stream ServerMessage);
+}
+
+message BackupDataRequest {
+  // empty
+}
+
+message BackupDataResponse {
+  bool success = 1;
+}
+
+message RestoreDataRequest {
+  string backup_file_path = 1;
+}
+
+message RestoreDataResponse {
+  bool success = 1;
+}
+
+message ClientMessage {
+  oneof message {
+    StoreRemoteFileRequestRequest store_remote_file_request = 1;
+  }
+}
+
+message ServerMessage {
+  oneof message {
+    ReceivedSelfContactInviteOverNetwork received_self_contact_invite_over_network = 1;
+    SelfContactInviteAcceptedOverNetwork self_contact_invite_accepted_over_network = 2;
+    ReceivedContactShareOverNetwork received_contact_share_over_network = 3;
+    DatabaseRestoredFromBackup database_restored_from_backup = 4;
+    PendingFileStatusChanged pending_file_status_changed = 5;
+    ReceivedFileStatusChanged received_file_status_changed = 6;
+  }
+}
+
+message ReceivedSelfContactInviteOverNetwork {}
+message SelfContactInviteAcceptedOverNetwork {}
+message ReceivedContactShareOverNetwork {}
+message DatabaseRestoredFromBackup {}
+
+message PendingFileStatusChanged {
+  string pending_file_id = 1;
+  SendStatusProto new_status = 2;
+  optional uint64 progress_bytes = 3;
+  optional string transfer_id = 4;
+  optional uint64 file_size_bytes = 5;
+  string target_file_request_id = 6;
+  repeated string interruption_reasons = 7;
+}
+
+message ReceivedFileStatusChanged {
+  optional string transfer_id = 1;
+  string filerequest_id = 2;
+  ReceiveStatusProto new_status = 3;
+  uint64 progress_bytes = 4;
+  uint64 file_size_bytes = 5;
+  string file_name = 6;
+}
+
+message GetSelfContactInviteChallengeRequest {
+  // Empty because the challenge is generated server-side
+} 
+
+message GetSelfContactInviteChallengeResponse {
+  bytes challenge = 1;
+}
+
+message UnregisterSelfContactInviteChallengeRequest {
+  bytes challenge = 1;
+}
+
+message UnregisterSelfContactInviteChallengeResponse {
+  // Empty response
+}
+
+message GetContactShareChallengeRequest {
+  // Empty because the challenge is generated server-side
+}
+
+message GetContactShareChallengeResponse {
+  bytes challenge = 1;
+}
+
+message UnregisterContactShareChallengeRequest {
+  bytes challenge = 1;
+}
+
+message UnregisterContactShareChallengeResponse {
+  // Empty response
+}
+
+message UseContactShareChallengeRequest {
+  bytes challenge = 1;
+  string peer_id = 2;
+}
+
+message UseContactShareChallengeResponse {
+  // empty
+}
+
+message UseSelfContactInviteRequest {
+  bytes challenge = 1;
+  string peer_id = 2;
+}
+
+message UseSelfContactInviteResponse {
+  // empty
+}
+
+message FileRequestRequest {
+  string id = 1;
+}
+
+message FileRequestResponse {
+  FileRequestProto file_request = 1;
+}
+
+message GetAllFileRequestsRequest {
+  // This message can be empty
+}
+
+message GetAllFileRequestsResponse {
+  repeated FileRequestProto file_requests = 1;
+}
+
+message CreateFileRequestRequest {
+  string title = 1;
+  string description = 2;
+  AccessProto access = 3;
+}
+
+message CreateFileRequestResponse {
+  FileRequestProto file_request = 1;
+}
+
+message UpdateFileRequestRequest {
+  FileRequestProto file_request = 1;
+}
+
+message UpdateFileRequestResponse {
+  FileRequestProto file_request = 1;
+}
+
+message DeleteFileRequestRequest {
+  string id = 1;
+}
+
+message DeleteFileRequestResponse {
+  bool success = 1;
+}
+
+message GetContactRequest {
+  string id = 1;
+}
+
+message GetContactResponse {
+  ContactProto contact = 1;
+}
+
+message GetAllContactsRequest {
+  // Empty
+}
+
+message GetAllContactsResponse {
+  repeated ContactProto contacts = 1;
+}
+
+message ContactPublicKeysProto {
+  bytes dilithium = 1;
+  bytes ed25519 = 2;
+}
+
+message ContactPrivateKeysProto {
+  bytes dilithium = 1;
+  bytes ed25519 = 2;
+}
+
+message ContactKeysProto {
+  ContactPublicKeysProto public_keys = 1;
+  ContactPrivateKeysProto private_keys = 2;
+}
+
+message CreateContactRequest {
+  string name = 1;
+  ContactPublicKeysProto public_keys = 2;
+}
+
+message CreateContactResponse {
+  ContactProto contact = 1;
+}
+
+message UpdateContactRequest {
+  ContactProto contact = 1;
+}
+
+message UpdateContactResponse {
+  bool success = 1;
+}
+
+message DeleteContactRequest {
+  string id = 1;
+}
+
+message DeleteContactResponse {
+  bool success = 1;
+}
+
+message AddPeerRequest {
+  string contact_id = 1;
+  CreatePeerProto peer = 2;
+}
+
+message AddPeerResponse {
+  string peer_id = 1;
+}
+
+message RemovePeerRequest {
+  string peer_id = 1;
+}
+
+message RemovePeerResponse {
+  bool success = 1;
+}
+
+message UpdatePeerRequest {
+  PeerProto peer = 1;
+}
+
+message UpdatePeerResponse {
+  bool success = 1;
+}
+
+message UpdateRemoteFileRequestResponse {
+  bool success = 1;
+}
+
+message GetJoinSelfContactInviteRequest {
+  // Empty because the invite is generated server-side
+}
+
+message GetFullSelfContactRequest {
+  // Empty because the self contact is unique
+}
+
+message GetFullSelfContactResponse {
+  SelfContactProto contact = 1;
+}
+
+message UpdateIdentityRequest {
+  SelfContactProto self_contact = 1;
+}
+
+message UpdateIdentityResponse {
+  bool success = 1;
+}
+
+message GetSelfContactDisplayRequest {
+  // Empty as we just want the display information
+}
+message GetSelfContactDisplayResponse {
+  ContactProto self_contact = 1; 
+}
+
+message JoinSelfContactInviteProto {
+  bytes challenge = 1;
+  bytes serialized_self_contact = 2;
+  string schema_version = 3;
+  string host = 4;
+}
+
+message JoinSelfContactResponse {
+  bool success = 1;
+}
+
+message SharePublicSelfContactRequest {
+  // Empty as we just want to share the public self contact
+}
+
+message SelfContactPublicProto {
+    string name = 1;
+  string contact_id = 2;
+  ContactPublicKeysProto public_keys = 3;
+}
+
+message SharePublicSelfContactResponse {
+ SelfContactPublicProto sharable_contact = 1;
+}
+
+message RegisterContactRequest {
+  SelfContactPublicProto sharable_contact = 1;
+}
+
+message RegisterContactResponse {
+  bool success = 1;
+}
