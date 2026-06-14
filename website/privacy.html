@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Privacy Policy — Fyles</title>
+  <meta name="description" content="Privacy policy for the Fyles peer-to-peer file-sharing app.">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="site">
+    <div class="wrap">
+      <a class="brand" href="index.html">Fyles</a>
+      <nav class="top">
+        <a href="privacy.html">Privacy</a>
+        <a href="terms.html">Terms</a>
+        <a href="support.html">Support</a>
+        <a href="impressum.html">Impressum</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <h1>Privacy Policy</h1>
+    <p class="updated">Last updated: 14 June 2026</p>
+
+    <p class="lede">
+      Fyles is built so that your data stays on your devices. There is no Fyles account,
+      no Fyles server that stores your files, and no analytics or advertising. This policy
+      explains what that means in detail.
+    </p>
+
+    <h2>1. Who is responsible</h2>
+    <p>
+      The controller responsible for the Fyles app within the meaning of the EU General
+      Data Protection Regulation (GDPR) is:
+    </p>
+    <div class="card">
+      <span class="todo">[[COMPANY NAME — TODO]]</span><br>
+      <span class="todo">[[REGISTERED ADDRESS — TODO]]</span><br>
+      Email: <a href="mailto:privacy@fyles.app">privacy@fyles.app</a>
+    </div>
+    <p>
+      We have not appointed a Data Protection Officer because the nature and scope of our
+      processing does not require one under GDPR Art. 37. See also our
+      <a href="impressum.html">Impressum</a>.
+    </p>
+
+    <h2>2. The short version</h2>
+    <div class="card">
+      <p><strong>Fyles does not collect your personal data on any server.</strong></p>
+      <ul>
+        <li>No user accounts and no sign-up.</li>
+        <li>No analytics, advertising, tracking, or profiling SDKs.</li>
+        <li>No Fyles-operated server that receives, stores, or sees your files.</li>
+        <li>Files travel directly from device to device.</li>
+        <li>Your files, contacts and cryptographic keys are stored only on your own device.</li>
+      </ul>
+    </div>
+
+    <h2>3. Data processed on your device</h2>
+    <p>
+      To do its job, Fyles stores and processes the following on your device only. This
+      data is not transmitted to us and we have no access to it.
+    </p>
+    <table>
+      <tr><th>Data</th><th>Purpose</th><th>Where it lives</th></tr>
+      <tr>
+        <td>Files you send and receive</td>
+        <td>The core function of the app</td>
+        <td>Your device storage (e.g. your chosen download folder)</td>
+      </tr>
+      <tr>
+        <td>Contacts you add (name and their public cryptographic identity)</td>
+        <td>To recognise and securely authenticate the people you exchange files with</td>
+        <td>A local database on your device</td>
+      </tr>
+      <tr>
+        <td>Your own cryptographic keys and device identity</td>
+        <td>To secure and authenticate connections</td>
+        <td>A local database on your device; private keys never leave the device</td>
+      </tr>
+      <tr>
+        <td>File-request (“inbox”) metadata</td>
+        <td>To manage the links through which others send you files</td>
+        <td>A local database on your device</td>
+      </tr>
+      <tr>
+        <td>App logs</td>
+        <td>Local diagnostics only</td>
+        <td>Your device; not transmitted by default</td>
+      </tr>
+    </table>
+
+    <h2>4. Data transmitted between devices (peer-to-peer)</h2>
+    <p>
+      When you transfer a file, it is sent directly to the recipient’s device over an
+      encrypted, authenticated connection. The connection is protected end-to-end using
+      modern, published cryptography (see our
+      <a href="export-compliance.html">Encryption &amp; Export Compliance</a> page).
+    </p>
+    <p>
+      Fyles works in two networking modes:
+    </p>
+    <ul>
+      <li>
+        <strong>Local network (e.g. your Wi-Fi):</strong> devices discover each other
+        directly on the local network. No external servers are involved.
+      </li>
+      <li>
+        <strong>Internet:</strong> to find peers across the internet, Fyles uses the
+        public, third-party <a href="https://libp2p.io/">libp2p</a> bootstrap and
+        discovery infrastructure. These are independent public nodes operated by the
+        libp2p project, <em>not</em> by Fyles. They help two devices locate one another;
+        your file contents remain end-to-end encrypted and are not readable by them.
+        Establishing a connection necessarily reveals network information such as your IP
+        address to the peer and to the discovery infrastructure, as is inherent to any
+        internet communication.
+      </li>
+    </ul>
+
+    <h2>5. What we do NOT collect</h2>
+    <p>
+      We do not collect, store, sell, or share: your name, email, contacts, files,
+      location, advertising identifiers, usage analytics, or any behavioural data. Fyles
+      contains no advertising and no third-party tracking SDKs.
+    </p>
+    <p>
+      The app’s backend includes optional diagnostic tracing (OpenTelemetry) that is
+      <strong>disabled by default</strong> and only emits data if you explicitly configure
+      a tracing endpoint of your own. We do not operate or receive data from any such
+      endpoint.
+    </p>
+
+    <h2>6. Device permissions</h2>
+    <p>Fyles requests only the permissions it needs to function:</p>
+    <table>
+      <tr><th>Permission</th><th>Why</th></tr>
+      <tr><td>Internet / network</td><td>To establish peer-to-peer connections and transfer files</td></tr>
+      <tr><td>Camera</td><td>To scan a QR code when adding a contact or pairing a device</td></tr>
+      <tr><td>Photos / Documents</td><td>So you can choose photos or files to send, and save received files</td></tr>
+      <tr><td>Storage</td><td>To read files you send and write files you receive</td></tr>
+      <tr><td>Notifications</td><td>To let you know about file-transfer activity</td></tr>
+      <tr><td>Run in background / foreground service (Android)</td><td>To keep transfers running reliably while the app is not in the foreground</td></tr>
+    </table>
+
+    <h2>7. Cookies and web tracking</h2>
+    <p>
+      This website and the app do not use cookies, web beacons, or any tracking
+      technologies.
+    </p>
+
+    <h2>8. Children</h2>
+    <p>
+      Fyles is not directed at children under the age of 13 (or the equivalent minimum age
+      in your jurisdiction, e.g. 16 in parts of the EU). We do not knowingly collect data
+      from children. Because the app collects no personal data on any server, it does not
+      build profiles of any user, including children.
+    </p>
+
+    <h2>9. Data retention</h2>
+    <p>
+      Data stored by Fyles remains on your device for as long as you keep the app
+      installed and choose to keep it. Uninstalling the app, or using the in-app delete
+      functions, removes the corresponding local data. See
+      <a href="data-deletion.html">Data Deletion</a>.
+    </p>
+
+    <h2>10. Your rights</h2>
+    <p>
+      Under the GDPR and similar laws you have rights of access, rectification, erasure,
+      restriction, portability, and objection regarding your personal data. Because Fyles
+      stores your data only on your own device and we hold none of it on a server, you
+      exercise these rights directly: the data is in your possession at all times and can
+      be viewed, exported, or deleted by you on the device. If you believe we nonetheless
+      process your personal data, contact us at
+      <a href="mailto:privacy@fyles.app">privacy@fyles.app</a>. You also have the right to
+      lodge a complaint with a data protection supervisory authority.
+    </p>
+
+    <h2>11. Changes to this policy</h2>
+    <p>
+      We may update this policy as the app evolves. Material changes will be reflected by
+      the “last updated” date above and, where appropriate, announced in the app or on this
+      site.
+    </p>
+
+    <h2>12. Contact</h2>
+    <p>
+      Questions about privacy: <a href="mailto:privacy@fyles.app">privacy@fyles.app</a>.
+    </p>
+
+    <p class="note">
+      This document is provided as accurate information about how the app works. It is not
+      a substitute for individual legal advice and should be reviewed by qualified counsel
+      before publication for store submission.
+    </p>
+  </main>
+
+  <footer class="site">
+    <div class="wrap">
+      <a href="privacy.html">Privacy</a>
+      <a href="terms.html">Terms</a>
+      <a href="support.html">Support</a>
+      <a href="impressum.html">Impressum</a>
+      <a href="export-compliance.html">Export</a>
+      <p>© 2026 <span class="todo">[[COMPANY NAME — TODO]]</span>. Fyles.</p>
+    </div>
+  </footer>
+</body>
+</html>

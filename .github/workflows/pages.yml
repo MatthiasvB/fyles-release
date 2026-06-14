@@ -1,0 +1,52 @@
+# Deploy the Fyles legal/compliance site to GitHub Pages.
+#
+# This file is the SOURCE of the workflow. It is authored in the monorepo at
+# fyles_service/public-site/github-pages.yml and copied by the export tool to
+# .github/workflows/pages.yml in the PUBLIC (source-available) repository, which is
+# where the site is actually hosted. Do not edit the copy in the public repo by hand.
+#
+# One-time setup in the public repo:
+#   - Settings → Pages → Build and deployment → Source: "GitHub Actions".
+#   - Settings → Pages → Custom domain: fyles.app (the website/CNAME file pins this).
+
+name: Deploy site to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "website/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow one concurrent deployment; don't cancel an in-progress run.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload site artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: website
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

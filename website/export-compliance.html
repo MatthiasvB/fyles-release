@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Encryption &amp; Export Compliance — Fyles</title>
+  <meta name="description" content="Cryptography used by Fyles and its US export classification.">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="site">
+    <div class="wrap">
+      <a class="brand" href="index.html">Fyles</a>
+      <nav class="top">
+        <a href="privacy.html">Privacy</a>
+        <a href="terms.html">Terms</a>
+        <a href="support.html">Support</a>
+        <a href="impressum.html">Impressum</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="wrap">
+    <h1>Encryption &amp; Export Compliance</h1>
+    <p class="updated">Last updated: 14 June 2026</p>
+
+    <p class="lede">
+      Fyles uses strong, standard, publicly-published cryptography to protect file transfers
+      between devices. This page documents the cryptography it contains and its
+      classification under United States export-control law (the Export Administration
+      Regulations, “EAR”).
+    </p>
+
+    <h2>Summary</h2>
+    <div class="card">
+      <ul>
+        <li>Fyles uses encryption for the security of its own peer-to-peer communications.</li>
+        <li>All algorithms are <strong>standard, published</strong> primitives — there is no
+          proprietary or “home-grown” cryptographic algorithm.</li>
+        <li>Self-classification: <strong>ECCN 5D002</strong> (and corresponding 5D992 for the
+          mass-market form), eligible for <strong>License Exception ENC</strong>.</li>
+        <li>Because the app implements encryption beyond what the operating system provides
+          and beyond mere authentication, it is <strong>not exempt</strong> from the relevant
+          encryption reporting/notification requirements.</li>
+      </ul>
+    </div>
+
+    <h2>Cryptography inventory</h2>
+    <table>
+      <tr><th>Purpose</th><th>Algorithm</th><th>Notes</th></tr>
+      <tr>
+        <td>Authenticated symmetric encryption (session confidentiality)</td>
+        <td>ChaCha20-Poly1305 (AEAD)</td>
+        <td>256-bit key; encrypts all peer-to-peer session traffic</td>
+      </tr>
+      <tr>
+        <td>Key agreement (classical)</td>
+        <td>X25519 (ECDH on Curve25519)</td>
+        <td>Ephemeral per session</td>
+      </tr>
+      <tr>
+        <td>Key encapsulation (post-quantum)</td>
+        <td>ML-KEM / Kyber-1024</td>
+        <td>NIST-standardised; combined with X25519 in a hybrid scheme</td>
+      </tr>
+      <tr>
+        <td>Digital signatures (classical)</td>
+        <td>Ed25519 (EdDSA)</td>
+        <td>Identity authentication of session messages</td>
+      </tr>
+      <tr>
+        <td>Digital signatures (post-quantum)</td>
+        <td>ML-DSA / Dilithium-5</td>
+        <td>NIST-standardised; combined with Ed25519 in a hybrid scheme</td>
+      </tr>
+      <tr>
+        <td>Key derivation</td>
+        <td>HKDF-SHA256</td>
+        <td>Derives the session key from the hybrid shared secret</td>
+      </tr>
+      <tr>
+        <td>Hashing</td>
+        <td>SHA-256</td>
+        <td>Used by HKDF and internal validation</td>
+      </tr>
+      <tr>
+        <td>Transport security</td>
+        <td>Noise protocol (via libp2p)</td>
+        <td>Link-level security beneath the application’s own session layer</td>
+      </tr>
+    </table>
+    <p>
+      The cryptographic primitives are provided by well-known open-source libraries
+      (the RustCrypto and PQClean/PQCrypto projects and the libp2p networking stack).
+    </p>
+
+    <h2>US export classification (EAR)</h2>
+    <p>
+      Fyles is a mass-market application whose primary function is file sharing, secured by
+      the encryption described above. We self-classify the software under
+      <strong>ECCN 5D002</strong> (encryption software), using
+      <strong>License Exception ENC</strong> under 15 CFR § 740.17. The encryption serves the
+      app’s own communications security and uses only standard published algorithms.
+    </p>
+
+    <h2>Apple App Store export-compliance answer</h2>
+    <p>
+      For Apple App Store submissions, Fyles answers <strong>“Yes”</strong> to “Does your app
+      use encryption?”, and — because it implements its own encryption rather than relying
+      only on the operating system, and is not limited to authentication — answers that it
+      uses <strong>non-exempt encryption</strong>. The relevant
+      <code>ITSAppUsesNonExemptEncryption</code> declaration is set accordingly.
+    </p>
+
+    <p class="note">
+      This page documents our good-faith self-classification for transparency. It is not
+      legal advice and it does not by itself satisfy any government filing obligation (such
+      as an annual self-classification report to the U.S. Bureau of Industry and Security).
+      Export-control obligations should be confirmed with qualified counsel before
+      distribution.
+    </p>
+  </main>
+
+  <footer class="site">
+    <div class="wrap">
+      <a href="privacy.html">Privacy</a>
+      <a href="terms.html">Terms</a>
+      <a href="support.html">Support</a>
+      <a href="impressum.html">Impressum</a>
+      <a href="export-compliance.html">Export</a>
+      <p>© 2026 <span class="todo">[[COMPANY NAME — TODO]]</span>. Fyles.</p>
+    </div>
+  </footer>
+</body>
+</html>
