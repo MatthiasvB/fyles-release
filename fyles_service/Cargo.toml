@@ -20,85 +20,89 @@ panic = "abort" # no unwinding code. This may be a bit drastic
 # unused code, but I'm not going that far, yet
 
 [patch.crates-io]
-libp2p = { git = "ssh://git@github.com/MatthiasvB/rust-libp2p.git", branch = "experiment/manual-dcutr-sniper-machine-gun-sans-dcutr-event-changes-rebased-upstream" }
-libp2p-core = { git = "ssh://git@github.com/MatthiasvB/rust-libp2p.git", branch = "experiment/manual-dcutr-sniper-machine-gun-sans-dcutr-event-changes-rebased-upstream" }
-libp2p-swarm = { git = "ssh://git@github.com/MatthiasvB/rust-libp2p.git", branch = "experiment/manual-dcutr-sniper-machine-gun-sans-dcutr-event-changes-rebased-upstream" }
-libp2p-request-response = { git = "ssh://git@github.com/MatthiasvB/rust-libp2p.git", branch = "experiment/manual-dcutr-sniper-machine-gun-sans-dcutr-event-changes-rebased-upstream" }
-libp2p-yamux = { git = "ssh://git@github.com/MatthiasvB/rust-libp2p.git", branch = "experiment/manual-dcutr-sniper-machine-gun-sans-dcutr-event-changes-rebased-upstream" }
-libp2p-swarm-test = { git = "ssh://git@github.com/MatthiasvB/rust-libp2p.git", branch = "experiment/manual-dcutr-sniper-machine-gun-sans-dcutr-event-changes-rebased-upstream" }
+libp2p = { git = "ssh://git@github.com/MatthiasvB/rust-libp2p.git", branch = "master" }
+libp2p-core = { git = "ssh://git@github.com/MatthiasvB/rust-libp2p.git", branch = "master" }
+libp2p-swarm = { git = "ssh://git@github.com/MatthiasvB/rust-libp2p.git", branch = "master" }
+libp2p-request-response = { git = "ssh://git@github.com/MatthiasvB/rust-libp2p.git", branch = "master" }
+libp2p-yamux = { git = "ssh://git@github.com/MatthiasvB/rust-libp2p.git", branch = "master" }
+libp2p-swarm-test = { git = "ssh://git@github.com/MatthiasvB/rust-libp2p.git", branch = "master" }
 
 [workspace.dependencies]
-rand = "0.8.5"
-tokio = "1.48.0"
+rand = "0.10.1"
+# ed25519-dalek/x25519-dalek and libp2p are still on rand_core 0.6; its OsRng
+# satisfies their CryptoRng bounds (rand 0.10 dropped OsRng in favor of SysRng).
+rand_core = { version = "0.6", features = ["getrandom"] }
+tokio = "1.52.3"
 aes-gcm = "0.10.3"
-async-std = "1.13.1"
 async-trait = "0.1.89"
-automerge = "0.6.1"
-autosurgeon = "0.8.7"
-bincode = "2.0.1"
+automerge = "0.10.0"
+autosurgeon = "0.12.0"
+bincode = { version = "2.0.1", features = ["serde"] }
 bs58 = "0.5.1"
-cbindgen = "0.29.0"
+cbindgen = "0.29.4"
 chacha20poly1305 = "0.10.1"
-clap = "4.5.47"
+clap = "4.6.1"
 crypto = { path = "crypto" }
 direct_host_utils = { path = "direct_host_utils" }
-derive_more = "2.1.0"
+derive_more = "2.1.1"
 ed25519-dalek = "2.2.0"
 expiringmap = "0.1.2"
 fluent = "0.17.0"
-futures = "0.3.31"
-grpc = "0.8.3"
-hkdf = "0.12.4"
-include-flate = "0.3.1"
-itertools = "0.14.0"
-jni = "0.21.1"
-libc = "0.2.177"
-libp2p = "0.56.1"
-libp2p-swarm-test = "0.6.0"
-log = "0.4.28"
-notify-rust = "4.11.7"
-opentelemetry = "0.30.0"
-opentelemetry-otlp = "0.30.0"
-opentelemetry-stdout = "0.30.0"
-opentelemetry_sdk = "0.30.0"
+futures = "0.3.32"
+hkdf = "0.13.0"
+include-flate = "0.3.3"
+itertools = "0.15.0"
+jni = "0.22.4"
+libc = "0.2.186"
+libp2p = "0.57.0"
+libp2p-swarm-test = "0.7.0"
+log = "0.4.32"
+notify-rust = "4.17.0"
+opentelemetry = "0.32.0"
+opentelemetry-otlp = "0.32.0"
+opentelemetry-stdout = "0.32.0"
+opentelemetry_sdk = "0.32.1"
 p2p = { path = "p2p" }
-pqc_kyber = "0.7.1"
-pqcrypto-dilithium = "0.5.0"
-pqcrypto-traits = "0.3.5"
-prost = "0.13.4"
-protobuf = "=3.5.0"
-rusqlite = "0.33.0"
+prost = "0.14.4"
+protobuf = "=3.7.2"
+rusqlite = "0.40.1"
 sanitize-filename = "0.6.0"
-semver = "1.0.26"
+semver = "1.0.28"
 serde = "1.0.228"
 serde_bytes = "0.11.19"
-serde_json = "1.0.140"
-sha2 = "0.10.9"
-shellexpand = "3.1.1"
+serde_json = "1.0.150"
+sha2 = "0.11.0"
+shellexpand = "3.1.2"
 sys-locale = "0.3.2"
 tap = "1.0.1"
-tempfile = "3.23.0"
-test-log = { version = "0.2.19", default-features = false }
-thiserror = "2.0.17"
-tokio-stream = "0.1.17"
-tonic = "0.12.3"
-tonic-build = "0.12.3"
-tracing = "0.1.43"
+tempfile = "3.27.0"
+test-log = { version = "0.2.21", default-features = false }
+thiserror = "2.0.18"
+tokio-stream = "0.1.18"
+tonic = "0.14.5"
+tonic-build = "0.14.5"
+tonic-prost = "0.14.5"
+tonic-prost-build = "0.14.5"
+tracing = "0.1.44"
 tracing-android = "0.2.0"
-tracing-opentelemetry = "0.31.0"
+tracing-opentelemetry = "0.33.0"
 tracing-oslog = "0.3.0"
 tracing-panic = "0.1.2"
-tracing-subscriber = "0.3.20"
-uds_windows = "1.1.0"
+tracing-subscriber = "0.3.23"
+uds_windows = "1.2.1"
 unic-langid = "0.9.6"
-uuid = "1.19.0"
+uuid = "1.23.3"
 x25519-dalek = "2.0.1"
 zip_clone = "0.1.5"
 fyles-core = { path = "core" }
-chrono = "0.4.42"
-tokio-util = "0.7.17"
+chrono = "0.4.45"
+tokio-util = "0.7.18"
 zstd = "0.13.3"
 async-io = "2.6.0"
 base64 = "0.22.1"
-futures-util = "0.3.31"
+futures-util = "0.3.32"
 subtle = "2.6.1"
+hashbrown = "0.17.1"
+ml-dsa = "0.1.1"
+ml-kem = { version = "0.3.2", features = ["getrandom", "zeroize"] }
+zeroize = "1.9.0"

@@ -40,6 +40,18 @@ InternetBehaviour
 └── DCUtR                      ← direct connection upgrade
 ```
 
+### Protocol Versions
+
+Each request-response behaviour is registered under a versioned protocol string such as
+`/session-establishment/0.1.0`. libp2p treats these as **opaque**: `StreamProtocol`'s `PartialEq` is
+byte-for-byte string comparison and nothing parses the version, so there is no major/minor
+compatibility. Any change to the string means multistream-select finds no mutual protocol and the dial
+fails with `UnsupportedProtocols`. Supporting two versions at once means registering both and handling
+both.
+
+The version number is therefore a signal to humans about the size of the change, not something libp2p
+acts on.
+
 ---
 
 ## 3. P2pClient Façade

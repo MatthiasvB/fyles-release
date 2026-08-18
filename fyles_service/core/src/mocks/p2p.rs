@@ -1,12 +1,18 @@
 use async_trait::async_trait;
 use crypto::ContactKeys;
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
+
+use crate::core::sync::DocKind;
 
 use crate::{
     core::{
         brain::types::{ContactShareChallenge, SelfContactInviteChallenge},
         domain_models::{ContactId, FylesId, PeerIdWrapper},
-        p2p::{FileToSend, NetworkNode, NodeStatusInfo, P2pError, P2pResult, Runnable},
+        p2p::{
+            FileToSend, NetworkNode, NodeStatusInfo, P2pError, P2pResult, Runnable,
+        },
+        sync::SyncRequest,
     },
     library::util::{duration_ext::DurationExt, util::generate_random_bytes},
 };
@@ -22,6 +28,13 @@ pub struct MockP2pNode {
 
     // Add slower responses to simulate network lag if needed
     response_delay_ms: Arc<Mutex<u64>>,
+
+    /// Every announcement the brain pushed, in order.
+    sync_with_reachable_calls: Arc<Mutex<Vec<(Vec<PeerIdWrapper>, DocKind)>>>,
+    /// How many sweeps the brain has asked for.
+    sweep_calls: Arc<Mutex<usize>>,
+    /// Every sync frame the brain handed to the network, in order.
+    sync_messages: Arc<Mutex<VecDeque<(PeerIdWrapper, SyncRequest)>>>,
 }
 
 impl MockP2pNode {
@@ -32,7 +45,30 @@ impl MockP2pNode {
             node_info: Arc::new(Mutex::new(node_info)),
             should_fail: Arc::new(Mutex::new(false)),
             response_delay_ms: Arc::new(Mutex::new(0)),
+            sync_with_reachable_calls: Arc::new(Mutex::new(Vec::new())),
+            sweep_calls: Arc::new(Mutex::new(0)),
+            sync_messages: Arc::new(Mutex::new(VecDeque::new())),
         }
+    }
+
+    /// Every announcement pushed so far, in order.
+    pub fn sync_with_reachable_calls(&self) -> Vec<(Vec<PeerIdWrapper>, DocKind)> {
+        self.sync_with_reachable_calls.lock().unwrap().clone()
+    }
+
+    pub fn take_sync_with_reachable_calls(&self) -> Vec<(Vec<PeerIdWrapper>, DocKind)> {
+        std::mem::take(&mut self.sync_with_reachable_calls.lock().unwrap())
+    }
+
+    /// How many sweeps have been asked for so far.
+    pub fn sweep_calls(&self) -> usize {
+        *self.sweep_calls.lock().unwrap()
+    }
+
+    /// Takes the oldest sync frame, leaving any later ones queued.
+    pub fn pop_sync_message(&self) -> Option<(PeerIdWrapper, SyncRequest)> {
+        let mut queued = self.sync_messages.lock().unwrap();
+        queued.pop_front()
     }
 
     async fn maybe_delay(&self) {
@@ -114,7 +150,11 @@ impl NetworkNode for MockP2pNode {
         // TODO: Could add more sophisticated mocking if needed for testing edge cases
     }
 
-    async fn cancel_files_for_remote_filerequest(&self, _: FylesId, _peer_id: PeerIdWrapper) -> P2pResult<bool> {
+    async fn cancel_files_for_remote_filerequest(
+        &self,
+        _: FylesId,
+        _peer_id: PeerIdWrapper,
+    ) -> P2pResult<bool> {
         self.maybe_delay().await;
 
         if *self.should_fail.lock().unwrap() {
@@ -145,7 +185,27 @@ impl NetworkNode for MockP2pNode {
         // Convenience function which the mock doesn't currently support
     }
 
-    async fn apply_settings(&self, _settings: &[u8]) -> P2pResult<()> {
-        Ok(())
+    async fn send_sync_message(&self, peer: PeerIdWrapper, wire: SyncRequest) {
+        self.sync_messages.lock().unwrap().push_back((peer, wire));
+    }
+
+    async fn fetch_contact_keys(&self, _: PeerIdWrapper, _: Vec<ContactId>) {
+        // The mock performs no networking.
+    }
+
+    async fn process_settings_request(&self, _request: &[u8]) -> P2pResult<Vec<u8>> {
+        // The mock has no schema knowledge; return an empty response.
+        Ok(Vec::new())
+    }
+
+    async fn trigger_interactions_with_visible_peers(&self) {
+        *self.sweep_calls.lock().unwrap() += 1;
+    }
+
+    async fn sync_docs_with_reachable(&self, devices: Vec<PeerIdWrapper>, kind: DocKind) {
+        self.sync_with_reachable_calls
+            .lock()
+            .unwrap()
+            .push((devices, kind));
     }
 }

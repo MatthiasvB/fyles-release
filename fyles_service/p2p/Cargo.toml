@@ -15,18 +15,18 @@ tokio = { workspace = true, features = ["test-util"] }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 rand.workspace = true
+rand_core.workspace = true
 crypto = { workspace = true }
-bincode = { workspace = true, features = ["serde"] }
+ml-dsa = { workspace = true }
+ml-kem = { workspace = true }
+bincode = { workspace = true }
 x25519-dalek = { workspace = true, features = ["serde"] }
-pqc_kyber = { workspace = true }
-serde_bytes = { workspace = true }
 ed25519-dalek = { workspace = true, features = ["serde"] }
-pqcrypto-traits = { workspace = true }
-pqcrypto-dilithium = { workspace = true, features = ["serialization"] }
 thiserror = { workspace = true }
 tap = { workspace = true }
 chacha20poly1305 = { workspace = true }
 hkdf = { workspace = true }
+zeroize = { workspace = true }
 sha2 = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 itertools = { workspace = true }
@@ -35,9 +35,9 @@ test-log = { workspace = true, features = ["trace"] }
 tempfile = { workspace = true }
 bs58.workspace = true
 derive_more = { workspace = true, features = ["deref"] }
-tokio-util = { workspace = true, features = ["time"] }
-log = "0.4.28"
-hashbrown = "0.17.0"
+tokio-util = { workspace = true, features = ["rt", "time"] }
+log = { workspace = true }
+hashbrown = { workspace = true }
 
 [dev-dependencies]
 libp2p-swarm-test = { workspace = true, features = ["tokio"] }
@@ -46,5 +46,4 @@ fyles-core = { workspace = true, features = ["test-support"] }
 crypto = { workspace = true, features = ["test-support"] }
 
 [features]
-test-with-prod-db = []
 test-support = []

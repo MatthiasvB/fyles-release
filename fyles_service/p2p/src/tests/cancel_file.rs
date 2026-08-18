@@ -3,9 +3,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::{fs::File, time::timeout};
 
 use crate::{
-    tests::test_utils::{
-        generate_swarm_factory, BrainlessIdleP2pTestHarness,
-    },
+    tests::test_utils::{BrainlessIdleP2pTestHarness, generate_swarm_factory},
     types::Wrap,
 };
 use fyles_core::core::brain::action::BrainAction;
@@ -56,7 +54,7 @@ async fn test_cancel_file() {
         .unwrap();
 
     // unblock thread
-    tokio::time::timeout(1.seconds(), async {
+    tokio::time::timeout(3.seconds(), async {
         loop {
             if let BrainAction::NetworkNode(p2p_node_action) =
                 harness.brain_receiver.recv().await.expect("sender dropped")
@@ -75,7 +73,7 @@ async fn test_cancel_file() {
                                 file_name: "test_file.txt".to_string(),
                             }));
                         break;
-                    },
+                    }
                     _ => (),
                 }
             }

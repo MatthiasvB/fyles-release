@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 use hashbrown::{
-    hash_map::{Entry, OccupiedEntry, VacantEntry},
     HashMap,
+    hash_map::{Entry, OccupiedEntry, VacantEntry},
 };
 use std::hash::Hash;
 
@@ -12,7 +12,6 @@ use tokio::time::Instant;
 use std::time::Instant;
 
 use std::time::Duration;
-
 
 #[derive(Debug)]
 struct TimedEntry<V> {
@@ -74,6 +73,7 @@ where
         }
     }
 
+    #[must_use = "The displaced value is returned, which means `on_expire` never runs on it. Destruct it yourself or use `insert_destruct` instead"]
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         let now = Instant::now();
         self.cleanup_if_due(now);
@@ -81,6 +81,21 @@ where
         self.entries
             .insert(key, TimedEntry::new(value, now))
             .map(|entry| entry.value)
+    }
+
+    /// Insert, running `on_expire` on the value this displaces — *that* value, not the one being
+    /// inserted. Returns whether a live value was displaced; an already-expired one is destructed
+    /// too, but reported as absent, since every other method here treats expired as gone.
+    pub fn insert_destruct(&mut self, key: K, value: V) -> bool {
+        let now = Instant::now();
+        self.cleanup_if_due(now);
+
+        let Some(displaced) = self.entries.insert(key, TimedEntry::new(value, now)) else {
+            return false;
+        };
+        let was_live = !displaced.is_expired(self.idle_ttl, now);
+        (self.on_expire)(displaced.value);
+        was_live
     }
 
     pub fn get(&mut self, key: &K) -> Option<&V> {
@@ -105,18 +120,36 @@ where
         Some(&mut entry.value)
     }
 
+    #[must_use = "The removed value is returned, which means `on_expire` never runs on it. Destruct it yourself or use `destruct` instead"]
     pub fn remove(&mut self, key: &K) -> Option<V> {
-        self.entries.remove(key).and_then(|entry| {
-            if entry.is_expired(self.idle_ttl, Instant::now()) {
-                None
-            } else {
-                Some(entry.value)
-            }
-        })
+        let entry = self.entries.remove(key)?;
+        if entry.is_expired(self.idle_ttl, Instant::now()) {
+            // Swallowed rather than handed back, so this is the last chance to destruct it.
+            (self.on_expire)(entry.value);
+            return None;
+        }
+        Some(entry.value)
+    }
+
+    /// Remove and destruct in one step. Returns whether a live entry was removed; an expired one is
+    /// destructed too, but reported as absent.
+    pub fn destruct(&mut self, key: &K) -> bool {
+        let now = Instant::now();
+        self.cleanup_if_due(now);
+
+        let Some(entry) = self.entries.remove(key) else {
+            return false;
+        };
+        let was_live = !entry.is_expired(self.idle_ttl, now);
+        (self.on_expire)(entry.value);
+        was_live
     }
 
     pub fn clear(&mut self) {
-        self.entries.clear();
+        let on_expire = &mut self.on_expire;
+        self.entries
+            .drain()
+            .for_each(|(_, entry)| on_expire(entry.value));
         self.last_cleanup = Instant::now();
     }
 
@@ -145,7 +178,11 @@ where
         }
 
         match entry {
-            Entry::Occupied(entry) => IdleEntry::Occupied(OccupiedIdleEntry { entry, timeout: self.idle_ttl, on_expire: self.on_expire.clone() }),
+            Entry::Occupied(entry) => IdleEntry::Occupied(OccupiedIdleEntry {
+                entry,
+                timeout: self.idle_ttl,
+                on_expire: self.on_expire.clone(),
+            }),
             Entry::Vacant(entry) => IdleEntry::Vacant(VacantIdleEntry { entry }),
         }
     }
@@ -157,7 +194,6 @@ where
 
         self.last_cleanup = now;
         let idle_ttl = self.idle_ttl;
-
 
         self.entries
             .extract_if(|_, v| v.is_expired(idle_ttl, now))
@@ -182,7 +218,6 @@ where
     entry: OccupiedEntry<'a, K, TimedEntry<V>>,
     timeout: Duration,
     on_expire: F,
-
 }
 
 pub struct VacantIdleEntry<'a, K, V>
@@ -195,7 +230,7 @@ where
 impl<'a, K, V, F> OccupiedIdleEntry<'a, K, V, F>
 where
     K: Eq + Hash,
-    F: FnMut(V)
+    F: FnMut(V),
 {
     pub fn get(&mut self) -> Option<&V> {
         let now = Instant::now();
@@ -244,10 +279,17 @@ where
         }
     }
 
-    #[must_use = "The old value is returned, which means the destructor cannot run on it. You need to take care to correctly destruct the old value"]
+    #[must_use = "The old value is returned, which means the destructor cannot run on it. You need to take care to correctly destruct the old value or use `insert_destruct` instead"]
     pub fn insert(&mut self, value: V) -> V {
         let old = std::mem::replace(self.entry.get_mut(), TimedEntry::new(value, Instant::now()));
         old.value
+    }
+
+    /// Replace the value, running `on_expire` on the one displaced — *that* value, not the one
+    /// being inserted.
+    pub fn insert_destruct(&mut self, value: V) {
+        let old = std::mem::replace(self.entry.get_mut(), TimedEntry::new(value, Instant::now()));
+        (self.on_expire)(old.value);
     }
 
     #[must_use = "The removed value is returned, which means the destructor cannot run on it. You need to take care to correctly destruct the old value or use `destruct` instead"]
@@ -265,7 +307,10 @@ where
     K: Eq + Hash,
 {
     pub fn insert(self, value: V) -> &'a mut V {
-        &mut self.entry.insert(TimedEntry::new(value, Instant::now())).value
+        &mut self
+            .entry
+            .insert(TimedEntry::new(value, Instant::now()))
+            .value
     }
 }
 
@@ -273,12 +318,29 @@ impl<'a, K, V, F: FnMut(V)> IdleEntry<'a, K, V, F>
 where
     K: Eq + Hash,
 {
+    #[must_use = "The displaced value is returned, which means `on_expire` never runs on it. Destruct it yourself or use `insert_destruct` instead"]
     pub fn insert(self, value: V) -> Option<V> {
         match self {
             IdleEntry::Occupied(mut entry) => Some(entry.insert(value)),
             IdleEntry::Vacant(entry) => {
                 entry.insert(value);
                 None
+            }
+        }
+    }
+
+    /// Insert, running `on_expire` on the value this displaces — *that* value, not the one being
+    /// inserted. Returns whether one was displaced. An entry that had already expired is never seen
+    /// here: [`IdleExpiryMap::entry`] destructs it and hands back `Vacant`.
+    pub fn insert_destruct(self, value: V) -> bool {
+        match self {
+            IdleEntry::Occupied(mut entry) => {
+                entry.insert_destruct(value);
+                true
+            }
+            IdleEntry::Vacant(entry) => {
+                entry.insert(value);
+                false
             }
         }
     }
@@ -315,11 +377,34 @@ where
             idle => idle,
         }
     }
+
+    #[must_use = "The removed value is returned, which means the destructor cannot run on it. You need to take care to correctly destruct the old value or use `destruct` instead"]
+    pub fn remove(self) -> Option<V> {
+        match self {
+            IdleEntry::Occupied(occupied_idle_entry) => Some(occupied_idle_entry.remove()),
+            IdleEntry::Vacant(_vacant_idle_entry) => None,
+        }
+
+    }
+
+    /// Returns whether something was destroyed
+    pub fn destruct(self) -> bool {
+        match self {
+            IdleEntry::Occupied(occupied_idle_entry) =>  {
+                occupied_idle_entry.destruct();
+                true
+            },
+            IdleEntry::Vacant(_vacant_idle_entry) => false,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     #[cfg(test)]
     use tokio::time::advance;
@@ -332,7 +417,7 @@ mod tests {
     fn insert_then_get_returns_value() {
         let mut map = IdleExpiryMap::<u32, String, _>::new(ms(1_000), ms(1_000), |_| {});
 
-        map.insert(1, "hello".to_string());
+        map.insert_destruct(1, "hello".to_string());
 
         assert_eq!(map.get(&1).map(|s| s.as_str()), Some("hello"));
     }
@@ -341,7 +426,7 @@ mod tests {
     fn get_mut_allows_mutation() {
         let mut map = IdleExpiryMap::<u32, String, _>::new(ms(1_000), ms(1_000), |_| {});
 
-        map.insert(1, "hello".to_string());
+        map.insert_destruct(1, "hello".to_string());
 
         map.get_mut(&1).unwrap().push_str(" world");
 
@@ -352,7 +437,7 @@ mod tests {
     async fn get_touches_entry_and_extends_lifetime() {
         let mut map = IdleExpiryMap::<u32, String, _>::new(ms(100), ms(1_000), |_| {});
 
-        map.insert(1, "a".to_string());
+        map.insert_destruct(1, "a".to_string());
 
         advance(ms(60)).await;
         assert_eq!(map.get(&1).map(|s| s.as_str()), Some("a"));
@@ -365,7 +450,7 @@ mod tests {
     async fn expired_entry_is_hidden_on_get_even_before_cleanup() {
         let mut map = IdleExpiryMap::<u32, String, _>::new(ms(50), ms(1_000), |_| {});
 
-        map.insert(1, "a".to_string());
+        map.insert_destruct(1, "a".to_string());
 
         advance(ms(60)).await;
 
@@ -377,7 +462,7 @@ mod tests {
     async fn expired_entry_remains_stored_until_cleanup_runs() {
         let mut map = IdleExpiryMap::<u32, String, _>::new(ms(50), ms(1_000), |_| {});
 
-        map.insert(1, "a".to_string());
+        map.insert_destruct(1, "a".to_string());
 
         advance(ms(60)).await;
 
@@ -392,7 +477,7 @@ mod tests {
     async fn cleanup_removes_expired_entries_once_due() {
         let mut map = IdleExpiryMap::<u32, String, _>::new(ms(50), ms(40), |_| {});
 
-        map.insert(1, "a".to_string());
+        map.insert_destruct(1, "a".to_string());
 
         assert!(map.entries.contains_key(&1));
         assert!(map.get(&1).is_some());
@@ -403,14 +488,14 @@ mod tests {
         assert!(!map.entries.contains_key(&1));
 
         advance(ms(50)).await;
-        map.insert(2, "b".to_string());
+        map.insert_destruct(2, "b".to_string());
     }
 
     #[test]
     fn remove_returns_previous_value() {
         let mut map = IdleExpiryMap::<u32, String, _>::new(ms(1_000), ms(1_000), |_| {});
 
-        map.insert(1, "a".to_string());
+        map.insert_destruct(1, "a".to_string());
 
         assert_eq!(map.remove(&1), Some("a".to_string()));
         assert!(map.get(&1).is_none());
@@ -420,8 +505,8 @@ mod tests {
     fn clear_removes_everything() {
         let mut map = IdleExpiryMap::<u32, String, _>::new(ms(1_000), ms(1_000), |_| {});
 
-        map.insert(1, "a".to_string());
-        map.insert(2, "b".to_string());
+        map.insert_destruct(1, "a".to_string());
+        map.insert_destruct(2, "b".to_string());
 
         map.clear();
 
@@ -448,7 +533,7 @@ mod tests {
     #[test]
     fn entry_occupied_get_and_get_mut_touch_value() {
         let mut map = IdleExpiryMap::<u32, String, _>::new(ms(1_000), ms(1_000), |_| {});
-        map.insert(1, "a".to_string());
+        map.insert_destruct(1, "a".to_string());
 
         match map.entry(1) {
             IdleEntry::Occupied(mut entry) => {
@@ -464,7 +549,7 @@ mod tests {
     #[test]
     fn occupied_entry_can_be_read_then_modified_then_read_again_without_being_consumed() {
         let mut map = IdleExpiryMap::<u32, String, _>::new(ms(1_000), ms(1_000), |_| {});
-        map.insert(1, "a".to_string());
+        map.insert_destruct(1, "a".to_string());
 
         match map.entry(1) {
             IdleEntry::Occupied(mut entry) => {
@@ -481,7 +566,7 @@ mod tests {
     #[test]
     fn occupied_entry_into_mut_returns_mutable_reference() {
         let mut map = IdleExpiryMap::<u32, String, _>::new(ms(1_000), ms(1_000), |_| {});
-        map.insert(1, "a".to_string());
+        map.insert_destruct(1, "a".to_string());
 
         match map.entry(1) {
             IdleEntry::Occupied(entry) => {
@@ -497,7 +582,7 @@ mod tests {
     #[test]
     fn entry_occupied_insert_replaces_and_returns_old_value() {
         let mut map = IdleExpiryMap::<u32, String, _>::new(ms(1_000), ms(1_000), |_| {});
-        map.insert(1, "old".to_string());
+        map.insert_destruct(1, "old".to_string());
 
         match map.entry(1) {
             IdleEntry::Occupied(mut entry) => {
@@ -513,7 +598,7 @@ mod tests {
     #[test]
     fn entry_occupied_remove_removes_value() {
         let mut map = IdleExpiryMap::<u32, String, _>::new(ms(1_000), ms(1_000), |_| {});
-        map.insert(1, "old".to_string());
+        map.insert_destruct(1, "old".to_string());
 
         match map.entry(1) {
             IdleEntry::Occupied(entry) => {
@@ -538,7 +623,7 @@ mod tests {
     #[test]
     fn idle_entry_insert_on_occupied_returns_old_value_and_replaces_it() {
         let mut map = IdleExpiryMap::<u32, String, _>::new(ms(1_000), ms(1_000), |_| {});
-        map.insert(1, "old".to_string());
+        map.insert_destruct(1, "old".to_string());
 
         let old = map.entry(1).insert("new".to_string());
 
@@ -549,7 +634,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn idle_entry_insert_on_expired_entry_behaves_like_vacant() {
         let mut map = IdleExpiryMap::<u32, String, _>::new(ms(50), ms(1_000), |_| {});
-        map.insert(1, "old".to_string());
+        map.insert_destruct(1, "old".to_string());
 
         advance(ms(60)).await;
 
@@ -572,7 +657,7 @@ mod tests {
     #[test]
     fn or_insert_does_not_replace_when_occupied() {
         let mut map = IdleExpiryMap::<u32, String, _>::new(ms(1_000), ms(1_000), |_| {});
-        map.insert(1, "existing".to_string());
+        map.insert_destruct(1, "existing".to_string());
 
         let value = map.entry(1).or_insert(|| "default".to_string());
         assert_eq!(value, "existing");
@@ -597,7 +682,7 @@ mod tests {
     #[test]
     fn or_insert_with_does_not_run_when_occupied() {
         let mut map = IdleExpiryMap::<u32, String, _>::new(ms(1_000), ms(1_000), |_| {});
-        map.insert(1, "existing".to_string());
+        map.insert_destruct(1, "existing".to_string());
 
         let mut called = false;
         let value = map.entry(1).or_insert_with(|| {
@@ -612,7 +697,7 @@ mod tests {
     #[test]
     fn and_modify_updates_occupied_entry() {
         let mut map = IdleExpiryMap::<u32, String, _>::new(ms(1_000), ms(1_000), |_| {});
-        map.insert(1, "a".to_string());
+        map.insert_destruct(1, "a".to_string());
 
         map.entry(1).and_modify(|value| value.push('b'));
 
@@ -632,7 +717,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn entry_treats_expired_value_as_vacant() {
         let mut map = IdleExpiryMap::<u32, String, _>::new(ms(50), ms(1_000), |_| {});
-        map.insert(1, "old".to_string());
+        map.insert_destruct(1, "old".to_string());
 
         advance(ms(60)).await;
 
@@ -650,21 +735,21 @@ mod tests {
     async fn cleanup_interval_throttles_vacuuming() {
         let mut map = IdleExpiryMap::<u32, String, _>::new(ms(50), ms(100), |_| {});
 
-        map.insert(1, "a".to_string());
+        map.insert_destruct(1, "a".to_string());
 
         advance(ms(60)).await;
         assert!(map.get(&1).is_none());
         assert!(map.entries.contains_key(&1));
 
         advance(ms(30)).await;
-        map.insert(2, "b".to_string());
+        map.insert_destruct(2, "b".to_string());
         assert!(
             map.entries.contains_key(&1),
             "cleanup should still be throttled"
         );
 
         advance(ms(20)).await;
-        map.insert(3, "c".to_string());
+        map.insert_destruct(3, "c".to_string());
         assert!(
             !map.entries.contains_key(&1),
             "cleanup should run once interval has elapsed"
@@ -683,13 +768,13 @@ mod tests {
             expired_clone.borrow_mut().push(v);
         });
 
-        map.insert(1, "a".to_string());
-        map.insert(2, "b".to_string());
+        map.insert_destruct(1, "a".to_string());
+        map.insert_destruct(2, "b".to_string());
 
         advance(ms(60)).await;
         // Entries expired but cleanup not yet due (last cleanup was at insert time ~0ms,
         // cleanup_interval is 40ms, we're at 60ms now, so next mutating op triggers cleanup)
-        map.insert(3, "c".to_string());
+        map.insert_destruct(3, "c".to_string());
 
         let mut expired_values = expired.borrow().clone();
         expired_values.sort();
@@ -708,7 +793,7 @@ mod tests {
             expired_clone.borrow_mut().push(v);
         });
 
-        map.insert(1, "old".to_string());
+        map.insert_destruct(1, "old".to_string());
 
         advance(ms(60)).await;
 
@@ -731,14 +816,16 @@ mod tests {
             expired_clone.borrow_mut().push(v);
         });
 
-        map.insert(1, "a".to_string());
-        map.remove(&1);
+        map.insert_destruct(1, "a".to_string());
+        let removed = map.remove(&1);
 
+        // Handed back rather than destructed — that is the whole point of the `must_use`.
+        assert_eq!(removed, Some("a".to_string()));
         assert!(expired.borrow().is_empty());
     }
 
     #[tokio::test(start_paused = true)]
-    async fn on_expire_not_called_for_clear() {
+    async fn clear_destructs_every_value() {
         use std::cell::RefCell;
         use std::rc::Rc;
 
@@ -749,11 +836,15 @@ mod tests {
             expired_clone.borrow_mut().push(v);
         });
 
-        map.insert(1, "a".to_string());
-        map.insert(2, "b".to_string());
+        map.insert_destruct(1, "a".to_string());
+        map.insert_destruct(2, "b".to_string());
         map.clear();
 
-        assert!(expired.borrow().is_empty());
+        // `clear` hands nothing back, so unless it destructs here the values are gone unflushed
+        // with no way for the caller to have intervened.
+        let mut destructed = expired.borrow().clone();
+        destructed.sort();
+        assert_eq!(destructed, vec!["a".to_string(), "b".to_string()]);
     }
 
     #[tokio::test(start_paused = true)]
@@ -768,10 +859,121 @@ mod tests {
             expired_clone.borrow_mut().push(v);
         });
 
-        map.insert(1, "old".to_string());
+        map.insert_destruct(1, "old".to_string());
         let overwritten = map.insert(1, "new".to_string());
 
         assert_eq!(overwritten, Some("old".to_string()));
         assert!(expired.borrow().is_empty());
+    }
+
+    /// Recorder for the tests below: every value handed to `on_expire` lands in the returned vec.
+    fn recording_map() -> (
+        Rc<RefCell<Vec<String>>>,
+        IdleExpiryMap<u32, String, impl FnMut(String) + Clone>,
+    ) {
+        let destructed = Rc::new(RefCell::new(Vec::new()));
+        let sink = destructed.clone();
+        let map = IdleExpiryMap::new(ms(50), ms(1_000), move |v: String| {
+            sink.borrow_mut().push(v);
+        });
+        (destructed, map)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn destruct_runs_the_destructor_on_a_live_value_and_reports_removal() {
+        let (destructed, mut map) = recording_map();
+
+        map.insert_destruct(1, "a".to_string());
+
+        assert!(map.destruct(&1));
+        assert_eq!(*destructed.borrow(), vec!["a".to_string()]);
+        assert!(map.get(&1).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn destruct_on_missing_key_reports_false_and_destructs_nothing() {
+        let (destructed, mut map) = recording_map();
+
+        assert!(!map.destruct(&1));
+        assert!(destructed.borrow().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn destruct_on_expired_entry_still_destructs_but_reports_absent() {
+        let (destructed, mut map) = recording_map();
+
+        map.insert_destruct(1, "a".to_string());
+        advance(ms(60)).await;
+
+        // Expired means gone as far as callers are concerned, but the value is real and still
+        // needs its destructor.
+        assert!(!map.destruct(&1));
+        assert_eq!(*destructed.borrow(), vec!["a".to_string()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn remove_destructs_the_expired_value_it_swallows() {
+        let (destructed, mut map) = recording_map();
+
+        map.insert_destruct(1, "a".to_string());
+        advance(ms(60)).await;
+
+        // `remove` reports `None` for an expired entry, so the caller never gets the chance to
+        // destruct it themselves.
+        assert!(map.remove(&1).is_none());
+        assert_eq!(*destructed.borrow(), vec!["a".to_string()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn insert_destruct_destroys_the_displaced_value_only() {
+        let (destructed, mut map) = recording_map();
+
+        map.insert_destruct(1, "old".to_string());
+        map.insert_destruct(2, "bystander".to_string());
+
+        assert!(map.insert_destruct(1, "new".to_string()));
+        assert_eq!(*destructed.borrow(), vec!["old".to_string()]);
+        assert_eq!(map.get(&1).map(|s| s.as_str()), Some("new"));
+        assert_eq!(map.get(&2).map(|s| s.as_str()), Some("bystander"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn insert_destruct_on_vacant_key_reports_false() {
+        let (destructed, mut map) = recording_map();
+
+        assert!(!map.insert_destruct(1, "a".to_string()));
+        assert!(destructed.borrow().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn insert_destruct_over_expired_entry_destructs_it_but_reports_absent() {
+        let (destructed, mut map) = recording_map();
+
+        map.insert_destruct(1, "old".to_string());
+        advance(ms(60)).await;
+
+        assert!(!map.insert_destruct(1, "new".to_string()));
+        assert_eq!(*destructed.borrow(), vec!["old".to_string()]);
+        assert_eq!(map.get(&1).map(|s| s.as_str()), Some("new"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn insert_destruct_through_the_entry_api_destroys_the_displaced_value() {
+        let (destructed, mut map) = recording_map();
+
+        map.insert_destruct(1, "old".to_string());
+
+        assert!(map.entry(1).insert_destruct("new".to_string()));
+        assert_eq!(*destructed.borrow(), vec!["old".to_string()]);
+        assert_eq!(map.get(&1).map(|s| s.as_str()), Some("new"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn insert_destruct_through_the_entry_api_on_vacant_reports_false() {
+        let (destructed, mut map) = recording_map();
+
+        assert!(!map.entry(1).insert_destruct("a".to_string()));
+        assert!(destructed.borrow().is_empty());
+        assert_eq!(map.get(&1).map(|s| s.as_str()), Some("a"));
     }
 }

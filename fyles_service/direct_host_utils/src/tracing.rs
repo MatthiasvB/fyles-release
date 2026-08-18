@@ -1,6 +1,6 @@
 #[cfg(any(feature = "console", feature = "otel-jaeger"))]
 use tracing_subscriber::filter::EnvFilter;
-use tracing_subscriber::{util::SubscriberInitExt, Registry};
+use tracing_subscriber::{Registry, util::SubscriberInitExt};
 
 pub struct TracingConfig {
     pub with_target: bool,
@@ -65,9 +65,9 @@ pub fn init_tracing(
     let (subscriber, provider_opt) = {
         use opentelemetry::global;
         use opentelemetry::trace::TracerProvider;
-        use opentelemetry_otlp::{ExportConfig, Protocol, WithExportConfig};
+        use opentelemetry_otlp::{Protocol, WithExportConfig};
         use opentelemetry_sdk::trace::Sampler;
-        use opentelemetry_sdk::{propagation::TraceContextPropagator, Resource};
+        use opentelemetry_sdk::{Resource, propagation::TraceContextPropagator};
         use tracing_subscriber::Layer;
         use tracing_subscriber::filter::{LevelFilter, Targets};
         use tracing_subscriber::prelude::__tracing_subscriber_SubscriberExt;

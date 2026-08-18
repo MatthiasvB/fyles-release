@@ -1,8 +1,8 @@
 use libp2p::PeerId;
+use rand::{Rng, RngExt};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Formatter};
 use std::{path::PathBuf, str::FromStr};
-use rand::{Rng, RngCore};
 use tokio::fs::File;
 
 use fyles_core::core::domain_models::{FylesId, PeerIdWrapper};
@@ -22,7 +22,6 @@ pub struct FileReceiveState {
     pub bytes_received: u64,
     pub total_size: u64,
 }
-
 
 /// File transfer requests.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,8 +127,8 @@ pub enum FileResponse {
 
 impl FileResponse {
     pub fn random() -> Self {
-        let mut rng = rand::thread_rng();
-        match rng.gen_range(1..=13) {
+        let mut rng = rand::rng();
+        match rng.random_range(1..=13) {
             1 => Self::AcceptNewTransfer,
             2 => Self::RejectNewTransfer,
             3 => Self::AcceptContinueTransfer {

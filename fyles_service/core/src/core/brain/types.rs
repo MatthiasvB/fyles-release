@@ -1,11 +1,12 @@
 use derive_more::{Deref, DerefMut};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{Mutex, oneshot};
 
-use crate::core::domain_models::FylesId;
+use crate::core::domain_models::{ContactId, FylesId};
 
 use super::error::FilerequestError;
+use crypto::ContactPublicKeys;
 
 pub type FilerequestResult<T> = Result<T, FilerequestError>;
 
@@ -55,4 +56,24 @@ impl From<ByteChallenge> for ContactShareChallenge {
     fn from(value: ByteChallenge) -> Self {
         Self(value)
     }
+}
+
+/// Batched request for several contacts' public keys in one round trip.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PubkeyFetchRequest {
+    pub contact_ids: Vec<ContactId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FetchedContactKeys {
+    pub contact_id: ContactId,
+    pub keys: ContactPublicKeys,
+}
+
+/// The requester MUST verify each entry's `fingerprint(keys)` against its own synced
+/// fingerprint before trusting it — so a lying responder is harmless. Only contacts the
+/// responder actually holds keys for are included.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PubkeyFetchResponse {
+    pub keys: Vec<FetchedContactKeys>,
 }

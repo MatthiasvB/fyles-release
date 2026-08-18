@@ -18,6 +18,9 @@ pub trait BitStore {
     /// Return the amount of bits that fit into this bit store
     fn size(&self) -> usize;
 
+    /// Return the truth value located at `index` without changing it
+    fn get_at(&self, index: usize) -> bool;
+
     /// Return the truth value located at `index` while setting it to `false` for future access
     fn get_invalidate_at(&mut self, index: usize) -> bool;
 
@@ -37,7 +40,11 @@ pub enum BitStoreError {
 pub trait NonceValidator {
     fn is_in_bounds(&self, nonce: u64) -> bool;
 
-    fn is_valid(&mut self, nonce: u64) -> Result<(), BitStoreError>;
+    /// Whether `nonce` would be accepted right now, without recording it as seen.
+    fn is_acceptable(&self, nonce: u64) -> Result<(), BitStoreError>;
+
+    /// Record `nonce` as seen, so a later payload carrying it is rejected as a replay.
+    fn consume(&mut self, nonce: u64) -> Result<(), BitStoreError>;
 }
 
 /// The idea of the rolling nonce window is to allocate a limited size buffer to track
@@ -55,13 +62,13 @@ pub struct RollingNonceWindow<T: BitStore = Vec<bool>> {
 
 impl<T: BitStore> NonceValidator for RollingNonceWindow<T> {
     fn is_in_bounds(&self, nonce: u64) -> bool {
-        nonce >= u64::try_from(self.lower_bound).expect(WINDOW_SIZE_CONVERSION_ERROR)
+        nonce >= self.lower_bound
             && nonce
                 < self.lower_bound
                     + u64::try_from(self.window.size()).expect(WINDOW_SIZE_CONVERSION_ERROR)
     }
 
-    fn is_valid(&mut self, mut nonce: u64) -> Result<(), BitStoreError> {
+    fn is_acceptable(&self, nonce: u64) -> Result<(), BitStoreError> {
         if !self.is_in_bounds(nonce) {
             return Err(BitStoreError::OutOfBoundsAccess {
                 tried: nonce,
@@ -69,14 +76,18 @@ impl<T: BitStore> NonceValidator for RollingNonceWindow<T> {
                 max: self.lower_bound + self.window.size() as u64,
             });
         }
-        trace!("In bounds: {nonce}");
-
-        let is_valid = self
-            .window
-            .get_invalidate_at(modulo(nonce, self.window.size()));
-        if !is_valid {
+        if !self.window.get_at(modulo(nonce, self.window.size())) {
             return Err(BitStoreError::RepeatedAccess(nonce));
         }
+        Ok(())
+    }
+
+    fn consume(&mut self, mut nonce: u64) -> Result<(), BitStoreError> {
+        self.is_acceptable(nonce)?;
+        trace!("In bounds: {nonce}");
+
+        self.window
+            .get_invalidate_at(modulo(nonce, self.window.size()));
 
         if nonce == self.lower_bound {
             // In a perfect world where all nonces arrive in order, we could just increase the lower
@@ -111,6 +122,11 @@ pub enum NonceGenerationError {
 pub enum NonceValidationError {
     #[error("Nonce was invalid or could not be validated: {0}")]
     NonceValidationError(#[from] BitStoreError),
+    /// The nonce sits on our own half of the space, so it was produced by a session with
+    /// the same initiator/responder role as us — i.e. it belongs to the opposite session of
+    /// a pair, and this is simply the wrong session to decrypt this payload with.
+    #[error("Nonce belongs to a session with the inverse role; wrong session for this payload")]
+    WrongSessionForDecryption,
 }
 
 impl<T: NonceValidator> NonceGeneratorValidator<T> {
@@ -128,21 +144,40 @@ impl<T: NonceValidator> NonceGeneratorValidator<T> {
         }
     }
 
-    pub fn validate(&mut self, nonce: u64) -> Result<(), NonceValidationError> {
-        self.validator
-            .is_valid(if self.is_initiator_session {
-                // responder nonces are shifted by half of u64::MAX
-                nonce - U64_HALF
-            } else {
-                nonce
-            })
-            .map_err(Into::into)
+    /// Whether `nonce` may be decrypted, translated into this validator's space for
+    /// [`Self::commit`]. Records nothing: nonces are sent in the clear and run consecutively, so
+    /// recording here would let an injected packet spend the slot of a message yet to arrive.
+    pub fn check(&self, nonce: u64) -> Result<u64, NonceValidationError> {
+        // The nonce's half encodes the sender's role: initiators draw from [0, U64_HALF),
+        // responders from [U64_HALF, u64::MAX). A session only ever decrypts payloads from
+        // the *opposite* role, so a nonce on our own half means this is the wrong session for
+        // this payload — a recoverable "try another session", not an error to blow up on.
+        let local_nonce = if self.is_initiator_session {
+            nonce
+                .checked_sub(U64_HALF)
+                .ok_or(NonceValidationError::WrongSessionForDecryption)?
+        } else if nonce < U64_HALF {
+            nonce
+        } else {
+            return Err(NonceValidationError::WrongSessionForDecryption);
+        };
+        self.validator.is_acceptable(local_nonce)?;
+        Ok(local_nonce)
+    }
+
+    /// Spend the slot for an authenticated payload, taking the nonce [`Self::check`] returned.
+    pub fn commit(&mut self, local_nonce: u64) -> Result<(), NonceValidationError> {
+        self.validator.consume(local_nonce).map_err(Into::into)
     }
 }
 
 impl BitStore for Vec<bool> {
     fn size(&self) -> usize {
         self.len()
+    }
+
+    fn get_at(&self, index: usize) -> bool {
+        self.get(index).copied().unwrap_or(false)
     }
 
     fn get_invalidate_at(&mut self, index: usize) -> bool {
@@ -193,4 +228,89 @@ pub fn new_nonce_generator_validator_for_session_responder() -> NonceGeneratorVa
 }
 
 // TODO: Implement based on packed value (-> bitvec?!)
-// TODO: Write tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matched_roles_validate_each_others_nonces() {
+        let mut initiator = new_nonce_generator_validator_for_session_initiator();
+        let mut responder = new_nonce_generator_validator_for_session_responder();
+        let init_nonce = initiator.get_next_send_nonce().unwrap();
+        let resp_nonce = responder.get_next_send_nonce().unwrap();
+        assert!(init_nonce < U64_HALF, "initiator draws from the lower half");
+        assert!(
+            resp_nonce >= U64_HALF,
+            "responder draws from the upper half"
+        );
+        assert!(responder.check(init_nonce).is_ok());
+        assert!(initiator.check(resp_nonce).is_ok());
+    }
+
+    #[test]
+    fn checking_a_nonce_does_not_spend_it() {
+        let mut initiator = new_nonce_generator_validator_for_session_initiator();
+        let mut responder = new_nonce_generator_validator_for_session_responder();
+        // The second nonce, so the lower bound cannot roll past it while the first is unreceived.
+        let _first = initiator.get_next_send_nonce().unwrap();
+        let second = initiator.get_next_send_nonce().unwrap();
+
+        for _ in 0..3 {
+            assert!(
+                responder.check(second).is_ok(),
+                "a check must be repeatable — nothing was received yet"
+            );
+        }
+
+        let local = responder.check(second).unwrap();
+        responder.commit(local).unwrap();
+        assert!(
+            matches!(
+                responder.check(second),
+                Err(NonceValidationError::NonceValidationError(
+                    BitStoreError::RepeatedAccess(_)
+                ))
+            ),
+            "once committed, the same nonce is a replay"
+        );
+    }
+
+    #[test]
+    fn committing_out_of_order_still_rolls_the_window() {
+        let mut initiator = new_nonce_generator_validator_for_session_initiator();
+        let mut responder = new_nonce_generator_validator_for_session_responder();
+        let first = initiator.get_next_send_nonce().unwrap();
+        let second = initiator.get_next_send_nonce().unwrap();
+
+        let local_second = responder.check(second).unwrap();
+        responder.commit(local_second).unwrap();
+        let local_first = responder.check(first).unwrap();
+        responder.commit(local_first).unwrap();
+
+        // Refused as out of bounds rather than as replays, the window having rolled past both.
+        for nonce in [first, second] {
+            assert!(
+                responder.check(nonce).is_err(),
+                "both nonces stay spent after the window rolls"
+            );
+        }
+    }
+
+    #[test]
+    fn same_role_nonce_is_reported_as_wrong_session_not_paniced() {
+        // A nonce from a session with our own role means the payload belongs to the opposite
+        // session of the pair. This must be a recoverable error (the decrypt loop skips it and
+        // tries the next candidate), never the `nonce - U64_HALF` underflow panic.
+        let initiator = new_nonce_generator_validator_for_session_initiator();
+        let responder = new_nonce_generator_validator_for_session_responder();
+        assert!(matches!(
+            initiator.check(5),
+            Err(NonceValidationError::WrongSessionForDecryption)
+        ));
+        assert!(matches!(
+            responder.check(U64_HALF + 5),
+            Err(NonceValidationError::WrongSessionForDecryption)
+        ));
+    }
+}

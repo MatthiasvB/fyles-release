@@ -1,26 +1,20 @@
 use crypto::Encrypted;
 use libp2p::request_response::{self, Event};
-use tracing::{debug, error, instrument, trace, warn, Instrument};
+use tracing::{Instrument, debug, error, instrument, trace, warn};
 
 use fyles_core::core::{
-        brain::{
-            action::BrainAction,
-            action_p2p::NetworkNodeAction,
-            types::SelfContactInviteChallenge,
-        },
-        domain_models::SelfContact,
-    };
+    brain::{
+        action::BrainAction, action_p2p::NetworkNodeAction, types::SelfContactInviteChallenge,
+    },
+    domain_models::SelfContact,
+};
 
 use crate::{
     behaviour::SessionErrorResponse,
-    event_loop::{
-        with_swarm::WithSwarm, FileTracker, LocalNetworkSwarm, RefCountEventLoopData,
-    },
+    event_loop::{FileTracker, LocalNetworkSwarm, RefCountEventLoopData, with_swarm::WithSwarm},
     send_receive_traits::{
         session_responder::SessionResponder,
-        session_send_receive::{
-            ReceiveError, ReceivePayload, RemoteReceiveError, SessionReceive,
-        },
+        session_send_receive::{ReceiveError, ReceivePayload, RemoteReceiveError, SessionReceive},
     },
 };
 
@@ -64,7 +58,7 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
                                 } else {
                                     trace!("Not sending a response");
                                 }
-                            });
+                            }.in_current_span());
                         }
                         request_response::Message::Response {
                             response,

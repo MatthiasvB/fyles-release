@@ -31,8 +31,7 @@ fyles/                              ← project root
 ├── wire/                           ← Protobuf IDL (shared contract)
 │   ├── filerequest.proto
 │   ├── nodestatus.proto
-│   ├── internet_settings.proto
-│   └── pingpong.proto
+│   └── internet_settings.proto
 │
 ├── fyles/                          ← Flutter frontend
 │   ├── lib/
@@ -109,7 +108,7 @@ Each sub-document covers one major area in depth:
 
 | Document | Covers |
 |----------|--------|
-| [Backend Architecture](architecture/backend.md) | Rust workspace, Brain orchestrator, database, domain models, entrypoint / DI |
+| [Backend Architecture](architecture/backend.md) | Rust workspace, Brain orchestrator, database, domain models, entrypoint / DI, multi-device CRDT sync |
 | [Frontend Architecture](architecture/frontend.md) | Flutter app structure, BLoC state management, Wire boundary, platform-specific services |
 | [Networking & P2P](architecture/networking.md) | libp2p integration, local vs internet modes, file transfer protocol, session management |
 | [Deployment & Platform Integration](architecture/deployment.md) | Build targets, FFI bridges (C/Swift, JNI/Kotlin), daemon variants, IPC schemes |

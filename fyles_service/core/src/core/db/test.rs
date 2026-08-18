@@ -1,5 +1,5 @@
-use std::ops::Deref;
 use crate::library::util::epoch::unix_epoch_millis;
+use std::ops::Deref;
 
 use crate::{
     core::{
@@ -9,15 +9,13 @@ use crate::{
             FilerequestAccess, InProgress, InProgressSendStatus, PeerIdWrapper, TransferData,
         },
     },
-    library::sqlite::{Sqlite, SqliteConfig},
-    mocks::db::MockDb,
+    library::sqlite::{Sqlite, SqliteConfig, SqlitePath},
 };
 
 use super::*;
-use rand::RngCore;
-use tempfile::{tempdir, TempDir};
-use tracing::{debug, instrument};
 use crate::core::domain_models::FileInfo;
+use rand::Rng;
+use tracing::{debug, instrument};
 // --------------------------- Helpers ---------------------------
 
 async fn helper_register_contact<D>(db: &D) -> Contact
@@ -25,7 +23,7 @@ where
     D: Deref<Target = dyn FilerequestDb>,
 {
     let c = Contact::for_test();
-    db.register_contact(c.clone()).await.unwrap();
+    let _ = db.update_contact_projection(c.clone()).await.unwrap();
     c
 }
 
@@ -33,15 +31,18 @@ async fn helper_create_public_filerequest<D>(db: &D, title: &str) -> (FylesId, F
 where
     D: Deref<Target = dyn FilerequestDb>,
 {
-    let id = db
-        .create_filerequest(&CreateFilerequest {
+    let id = FylesId::new();
+    db.create_filerequest(
+        &id,
+        &CreateFilerequest {
             title: title.into(),
             description: "Desc".into(),
             is_active: true,
             access: FilerequestAccess::Public,
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await
+    .unwrap();
     let fr = db.get_filerequest(&id).await.unwrap();
     (id, fr)
 }
@@ -54,40 +55,33 @@ async fn helper_create_audience_filerequest<D>(
 where
     D: Deref<Target = dyn FilerequestDb>,
 {
-    let id = db
-        .create_filerequest(&CreateFilerequest {
+    let id = FylesId::new();
+    db.create_filerequest(
+        &id,
+        &CreateFilerequest {
             title: title.into(),
             description: "Desc".into(),
             is_active: true,
             access: FilerequestAccess::Audience { contact_ids },
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await
+    .unwrap();
     let fr = db.get_filerequest(&id).await.unwrap();
     (id, fr)
 }
 
-pub struct DbWrapper {
-    pub db: Arc<dyn FilerequestDb>,
-    pub _db_dir: Option<TempDir>,
-}
+pub type DbRef = Arc<dyn FilerequestDb>;
 
+/// Spins up a fresh, isolated in-memory SQLite database for a test. The generic `test_*`
+/// functions below take any `Deref<Target = dyn FilerequestDb>`, so a future alternative
+/// backend can be tested by adding a sibling setup function and reusing them.
 #[instrument(skip_all, level = "trace")]
-pub async fn setup_test_db(node_keys: Option<NodeInfo>, use_memory_db: bool) -> DbWrapper {
-    let (db, temp_dir) = if use_memory_db {
-        let db = MockDb::new();
-        (Arc::new(db) as Arc<dyn FilerequestDb>, None)
-    } else {
-        let temp_dir = tempdir().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-
-        let config = SqliteConfig { path: db_path };
-        let db = Arc::new(Sqlite::with_config(config));
-        let db_clone = db.clone();
-        debug!("Running test db");
-        tokio::spawn(async move { db_clone.run().await });
-        (db as Arc<dyn FilerequestDb>, Some(temp_dir))
-    };
+pub async fn setup_test_db(node_keys: Option<NodeInfo>) -> DbRef {
+    debug!("Running in-memory test db");
+    let db = Sqlite::spawn(SqliteConfig {
+        path: SqlitePath::Memory,
+    }) as Arc<dyn FilerequestDb>;
 
     if let Some(node_keys) = node_keys {
         db.store_node_keys(node_keys)
@@ -95,10 +89,7 @@ pub async fn setup_test_db(node_keys: Option<NodeInfo>, use_memory_db: bool) -> 
             .expect("Failed to store node keys");
     };
 
-    DbWrapper {
-        db,
-        _db_dir: temp_dir,
-    }
+    db
 }
 
 // ---------------------- Consolidated Tests ---------------------
@@ -198,7 +189,7 @@ where
 {
     // Create a contact for audience
     let contact = Contact::for_test();
-    db.register_contact(contact.clone()).await.unwrap();
+    let _ = db.update_contact_projection(contact.clone()).await.unwrap();
 
     // Create filerequest
     let create_request = CreateFilerequest {
@@ -209,7 +200,10 @@ where
             contact_ids: vec![contact.id.clone()],
         },
     };
-    let fr_id = db.create_filerequest(&create_request).await.unwrap();
+    let fr_id = FylesId::new();
+    db.create_filerequest(&fr_id, &create_request)
+        .await
+        .unwrap();
 
     // Create some received files (simulate incoming transfer + completion)
     let transfer_id = FylesId::new();
@@ -220,12 +214,14 @@ where
         transfer_id: transfer_id.clone(),
         contact_id: Some(contact.id.clone()),
         peer_id: "test-peer-id".to_string(),
+        persisted_as_name: "test.txt".to_string(),
         started_at_ms: 0,
     };
     db.create_incoming_file(&incoming).await.unwrap();
     db.complete_received_file(&CompleteReceivedFile {
         transfer_id,
         file_path: "/tmp/test.txt".to_string(),
+        persisted_as_name: "test.txt".to_string(),
         received_at_ms: 12345,
     })
     .await
@@ -295,7 +291,7 @@ where
 
     // Random final overwrite
     let mut random = [0u8; 64];
-    rand::thread_rng().fill_bytes(&mut random);
+    rand::rng().fill_bytes(&mut random);
     write_and_check(&db, random.to_vec()).await;
 }
 
@@ -308,7 +304,10 @@ where
     let bogus_remote = FylesId::new();
     let bad = db
         .create_pending_files(&CreatePendingFiles {
-            file_infos: vec![FileInfo { path: "/x".into(), display_name: Some("x".into()) }],
+            file_infos: vec![FileInfo {
+                path: "/x".into(),
+                display_name: Some("x".into()),
+            }],
             target_filerequest_id: bogus_remote.clone(),
         })
         .await;
@@ -317,7 +316,7 @@ where
     // Normal flow
     let peer_id = PeerIdWrapper::for_test();
     let contact = helper_register_contact(&db).await;
-    let remote_id = db
+    let (remote_id, _) = db
         .create_remote_filerequest(&CreateRemoteFilerequest {
             peer_id: peer_id.clone(),
             filerequest_id: "remote-fr-123".into(),
@@ -329,13 +328,18 @@ where
 
     let pending_ids = db
         .create_pending_files(&CreatePendingFiles {
-            file_infos: vec![FileInfo { path: "/path/to/file.txt".into(), display_name: Some("file.txt".into()) }],
+            file_infos: vec![FileInfo {
+                path: "/path/to/file.txt".into(),
+                display_name: Some("file.txt".into()),
+            }],
             target_filerequest_id: remote_id.clone(),
         })
         .await
         .unwrap();
     let first = db.get_pending_file(&pending_ids[0]).await.unwrap();
     assert_eq!(first.status, SendStatus::Pending);
+    // contact_id is resolved from the synced remote-fr document (no local projection table).
+    assert_eq!(first.contact_id, contact.id);
 
     db.handle_update_pending_file_status(
         &pending_ids[0],
@@ -359,15 +363,23 @@ where
     // Additional pending
     let _ = db
         .create_pending_files(&CreatePendingFiles {
-            file_infos: vec![FileInfo { path: "/path/to/another.txt".into(), display_name: Some("another.txt".into()) }],
+            file_infos: vec![FileInfo {
+                path: "/path/to/another.txt".into(),
+                display_name: Some("another.txt".into()),
+            }],
             target_filerequest_id: remote_id.clone(),
         })
         .await
         .unwrap();
-    assert_eq!(db.get_all_pending_files().await.unwrap().len(), 2);
+    let all_pending = db.get_all_pending_files().await.unwrap();
+    assert_eq!(all_pending.len(), 2);
+    assert!(
+        all_pending.iter().all(|p| p.contact_id == contact.id),
+        "get_all_pending_files should resolve every contact_id from the document"
+    );
 
     // Cascade delete
-    db.delete_remote_filerequest(&remote_id).await.unwrap();
+    let _ = db.delete_remote_filerequest(&remote_id).await.unwrap();
     assert_eq!(db.get_all_pending_files().await.unwrap().len(), 0);
     assert!(db.get_pending_file(&pending_ids[0]).await.is_err());
 }
@@ -380,17 +392,20 @@ where
     // Create contact and filerequest first
     let contact = Contact::for_test();
 
-    db.register_contact(contact.clone()).await.unwrap();
+    let _ = db.update_contact_projection(contact.clone()).await.unwrap();
 
-    let filerequest_id = db
-        .create_filerequest(&CreateFilerequest {
+    let filerequest_id = FylesId::new();
+    db.create_filerequest(
+        &filerequest_id,
+        &CreateFilerequest {
             title: "Test Request".to_string(),
             description: "Test Description".to_string(),
             is_active: true,
             access: FilerequestAccess::Public,
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await
+    .unwrap();
 
     // Test storing a received file (create incoming, then complete)
     let transfer_id = FylesId::new();
@@ -401,6 +416,7 @@ where
         peer_id: "test-peer-id".to_string(),
         file_name: "test.txt".to_string(),
         file_size_bytes: 1234,
+        persisted_as_name: "test.txt".to_string(),
         started_at_ms: 0,
     };
     db.create_incoming_file(&incoming).await.unwrap();
@@ -408,6 +424,7 @@ where
         .complete_received_file(&CompleteReceivedFile {
             transfer_id,
             file_path: "/tmp/test.txt".to_string(),
+            persisted_as_name: "test.txt".to_string(),
             received_at_ms: unix_epoch_millis().unwrap(),
         })
         .await
@@ -425,18 +442,21 @@ where
 {
     // Create required contact and filerequest first
     let contact = Contact::for_test();
-    db.register_contact(contact.clone()).await.unwrap();
+    let _ = db.update_contact_projection(contact.clone()).await.unwrap();
 
     // Create filerequest
-    let filerequest_id = db
-        .create_filerequest(&CreateFilerequest {
+    let filerequest_id = FylesId::new();
+    db.create_filerequest(
+        &filerequest_id,
+        &CreateFilerequest {
             title: "Test Request".to_string(),
             description: "Test Description".to_string(),
             is_active: true,
             access: FilerequestAccess::Public,
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await
+    .unwrap();
 
     // Store a received file (create incoming, then complete)
     let transfer_id = FylesId::new();
@@ -447,6 +467,7 @@ where
         peer_id: "test-peer-id".to_string(),
         file_name: "test.txt".into(),
         file_size_bytes: 100,
+        persisted_as_name: "test.txt".to_string(),
         started_at_ms: 0,
     };
     db.create_incoming_file(&incoming).await.unwrap();
@@ -454,6 +475,7 @@ where
         .complete_received_file(&CompleteReceivedFile {
             transfer_id,
             file_path: "/tmp/test.txt".into(),
+            persisted_as_name: "test.txt".into(),
             received_at_ms: 12345,
         })
         .await
@@ -482,31 +504,34 @@ where
     // Two contacts in audience
     let c1 = Contact::for_test();
     let c2 = Contact::for_test();
-    db.register_contact(c1.clone()).await.unwrap();
-    db.register_contact(c2.clone()).await.unwrap();
-    let fr_id = db
-        .create_filerequest(&CreateFilerequest {
+    let _ = db.update_contact_projection(c1.clone()).await.unwrap();
+    let _ = db.update_contact_projection(c2.clone()).await.unwrap();
+    let fr_id = FylesId::new();
+    db.create_filerequest(
+        &fr_id,
+        &CreateFilerequest {
             title: "Cascade Test".into(),
             description: "Test".into(),
             is_active: true,
             access: FilerequestAccess::Audience {
                 contact_ids: vec![c1.id.clone(), c2.id.clone()],
             },
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await
+    .unwrap();
     let fr = db.get_filerequest(&fr_id).await.unwrap();
     match &fr.access {
         FilerequestAccess::Audience { contact_ids } => assert_eq!(contact_ids.len(), 2),
         _ => panic!("Expected audience"),
     }
-    db.delete_contact(&c1.id).await.unwrap();
+    let _ = db.delete_contact(&c1.id).await.unwrap();
     let fr = db.get_filerequest(&fr_id).await.unwrap();
     if let FilerequestAccess::Audience { contact_ids } = fr.access {
         assert!(!contact_ids.contains(&c1.id));
         assert!(contact_ids.contains(&c2.id));
     }
-    db.delete_contact(&c2.id).await.unwrap();
+    let _ = db.delete_contact(&c2.id).await.unwrap();
     let fr = db.get_filerequest(&fr_id).await.unwrap();
     if let FilerequestAccess::Audience { contact_ids } = fr.access {
         assert!(contact_ids.is_empty());
@@ -543,9 +568,9 @@ where
     D: Deref<Target = dyn FilerequestDb>,
 {
     let contact = Contact::for_test();
-    db.register_contact(contact.clone()).await.unwrap();
+    let _ = db.update_contact_projection(contact.clone()).await.unwrap();
     let peer = PeerIdWrapper::for_test();
-    let remote_id = db
+    let (remote_id, _) = db
         .create_remote_filerequest(&CreateRemoteFilerequest {
             peer_id: peer.clone(),
             filerequest_id: "remote-1".into(),
@@ -575,7 +600,7 @@ where
 {
     let contact = Contact::for_test();
     let unknown = Contact::for_test().id;
-    db.register_contact(contact.clone()).await.unwrap();
+    let _ = db.update_contact_projection(contact.clone()).await.unwrap();
 
     let some = db
         .get_contact_public_keys(contact.id.clone())
@@ -593,6 +618,81 @@ where
     assert!(none.is_none(), "Expected None for unknown contact id");
 }
 
+/// Contacts and remote filerequests are stored in the synced CRDT documents (the
+/// document is authoritative for name/membership; the contacts table is only a local
+/// key-bytes cache; remote filerequests have no local SQL table at all — the send pipeline
+/// resolves each pending file's contact_id from the document).
+/// This exercises the full read/write path through those documents.
+pub async fn test_contacts_and_remote_fr_doc_roundtrip<D>(db: D)
+where
+    D: Deref<Target = dyn FilerequestDb>,
+{
+    let a = Contact::for_test();
+    let b = Contact::for_test();
+    let _ = db.update_contact_projection(a.clone()).await.unwrap();
+    let _ = db.update_contact_projection(b.clone()).await.unwrap();
+
+    // Listed from the document.
+    let all = db.get_contacts().await.unwrap();
+    assert_eq!(all.len(), 2);
+    assert!(all.iter().any(|c| c.id == a.id && c.name == a.name));
+
+    // get_contact: name from the document, keys from the local cache.
+    let got = db.get_contact(&a.id).await.unwrap();
+    assert_eq!(got.name, a.name);
+    assert_eq!(got.public_keys.ed25519, a.public_keys.ed25519);
+
+    assert_eq!(db.get_contact_name(&a.id).await.unwrap(), a.name);
+    let names = db
+        .get_contact_names(&[a.id.clone(), b.id.clone()])
+        .await
+        .unwrap();
+    assert_eq!(names.len(), 2);
+
+    // Rename propagates through the document.
+    let _ = db.update_contact(&DisplayContact {
+        id: a.id.clone(),
+        name: "Renamed".into(),
+    })
+    .await
+    .unwrap();
+    assert_eq!(db.get_contact_name(&a.id).await.unwrap(), "Renamed");
+
+    // Remote filerequests: create -> read (from the document) -> delete.
+    let (rid, _) = db
+        .create_remote_filerequest(&CreateRemoteFilerequest {
+            peer_id: PeerIdWrapper("peer-1".into()),
+            filerequest_id: "fr-remote".into(),
+            name: "drop".into(),
+            contact_id: a.id.clone(),
+        })
+        .await
+        .unwrap();
+
+    let one = db.get_remote_filerequest(&rid).await.unwrap();
+    assert_eq!(one.contact_id, a.id);
+    assert_eq!(one.peer_id, PeerIdWrapper("peer-1".into()));
+    assert_eq!(one.filerequest_id.0, "fr-remote");
+    assert_eq!(db.get_all_remote_filerequests().await.unwrap().len(), 1);
+    assert_eq!(
+        db.get_remote_filerequests_by_contact(&a.id)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let _ = db.delete_remote_filerequest(&rid).await.unwrap();
+    assert!(db.get_remote_filerequest(&rid).await.is_err());
+    assert_eq!(db.get_all_remote_filerequests().await.unwrap().len(), 0);
+
+    // Deleting a contact removes it from the document.
+    let _ = db.delete_contact(&a.id).await.unwrap();
+    let after = db.get_contacts().await.unwrap();
+    assert_eq!(after.len(), 1);
+    assert!(after.iter().all(|c| c.id != a.id));
+}
+
 /// DB initialization & self contact lifecycle:
 /// - Before node keys: all getters error
 /// - After store_node_keys: node keys & self contact accessible
@@ -607,8 +707,7 @@ where
         Err(DbError::DataNotYetInitialized)
     ));
 
-    // Sqlite returns a generic database error for absent self_contact (row missing),
-    // MockDb returns DataNotYetInitialized. We only assert "is_err" for parity.
+    // Absent self_contact yields a database error (row missing). We only assert "is_err".
     assert!(db.get_self_contact().await.is_err());
     assert!(db.get_self_contact_for_display().await.is_err());
     assert!(db.get_sharable_public_self_contact().await.is_err());

@@ -2,12 +2,13 @@ use std::io::{Error, SeekFrom};
 
 use tokio::io::AsyncSeekExt;
 use tokio::{fs::File, io::AsyncReadExt, task::JoinHandle};
-use tracing::{error, instrument, span, Instrument, Level, Span};
+use tracing::{Instrument, Level, Span, error, instrument, span};
 
-use crate::{chunk, Chunk};
+use crate::{Chunk, chunk};
 
 pub(super) struct FileReader {
     pub(super) lazy_buffer: Box<Chunk>,
+    #[allow(clippy::type_complexity)]
     pub(super) pending_read: Option<JoinHandle<(File, Box<Chunk>, Result<usize, Error>)>>,
     read_index: usize,
 }

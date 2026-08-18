@@ -23,11 +23,11 @@ pub fn parse_part_file_started_at_ms(filename: &str) -> Option<i64> {
     if !filename.ends_with(".part") {
         return None;
     }
-    
+
     let parts: Vec<&str> = filename.split('_').collect();
     if parts.is_empty() {
         return None;
     }
-    
+
     parts[0].parse::<i64>().ok()
 }

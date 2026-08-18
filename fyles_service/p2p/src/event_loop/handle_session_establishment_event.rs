@@ -1,19 +1,16 @@
-
 use libp2p::request_response::{self, Event};
-use tracing::{error, instrument, trace, warn, Instrument};
-
+use tracing::{Instrument, error, instrument, trace, warn};
 
 use crate::{
     crypto::{
         AuthWireRequest, AuthWireResponse, KeyExchangeResponseMessage,
         ResponderSessionEstablishmentError, SessionInitiationRequest,
     },
-    event_loop::{
-        with_swarm::WithSwarm, FileTracker, LocalNetworkSwarm, RefCountEventLoopData,
-    },
+    event_loop::{FileTracker, LocalNetworkSwarm, RefCountEventLoopData, with_swarm::WithSwarm},
 };
 
 impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoopData<T, S> {
+    #[allow(clippy::type_complexity)]
     #[instrument(skip_all)]
     pub fn handle_session_establishment_event(
         self,
@@ -61,7 +58,9 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
                             ?request_id,
                             "Session establishment outbound failure"
                         );
-                        self.session_manager.handle_session_establishment_failure(peer).await;
+                        self.session_manager
+                            .handle_session_establishment_failure(peer)
+                            .await;
                     }
                     Event::InboundFailure {
                         peer,
@@ -76,7 +75,9 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
                             ?request_id,
                             "Session establishment inbound failure"
                         );
-                        self.session_manager.handle_session_establishment_failure(peer).await;
+                        self.session_manager
+                            .handle_session_establishment_failure(peer)
+                            .await;
                     }
                     Event::ResponseSent { peer, .. } => {
                         trace!(?peer, "Response sent");

@@ -8,7 +8,7 @@ use tracing::{error, warn};
 
 use crate::{
     core::domain_models::Filerequest,
-    io_controller::{FileNamespace, HostController},
+    io_controller::{FileNamespace, HostController, OwnershipOutcome, RenameOutcome},
 };
 
 #[derive(Debug, Error)]
@@ -27,6 +27,8 @@ pub enum GetFileError {
     UniqueFileNameVariantNotFound { base: PathBuf },
     #[error("File already exists")]
     FileExists,
+    #[error("Filerequest directory is owned by another filerequest ({other_id})")]
+    Claimed { other_id: String },
     #[error("IO error at {path}: {source}")]
     Io {
         path: PathBuf,
@@ -39,9 +41,26 @@ pub enum GetFileError {
 
 type GetFileResult<T> = Result<T, GetFileError>;
 
+/// Outcome of attempting to rename a filerequest's directory.
+#[derive(Debug, Error)]
+pub enum RenameFilerequestError {
+    /// The destination directory is already claimed by another filerequest;
+    /// renaming onto it would risk mixing files, so it is refused. Surfaced to
+    /// the user as a clean folder-collision error.
+    #[error("Destination folder is already claimed by another filerequest")]
+    DestinationOccupied,
+    /// The rename failed for any other reason (empty title, lost ownership of
+    /// the source, IO error, …).
+    #[error("Failed to rename filerequest directory")]
+    Failed,
+}
+
 pub struct FilerequestDriveHandler {
     dir_handler: Arc<dyn HostController>,
     safe_dir_name: String,
+    /// The owning filerequest's id. Stamped into the directory's `.fyles-owner`
+    /// marker so no other filerequest can write into this directory.
+    owner_id: String,
 }
 
 impl Debug for FilerequestDriveHandler {
@@ -65,6 +84,43 @@ impl FilerequestDriveHandler {
         Self {
             dir_handler,
             safe_dir_name: safe,
+            owner_id: filerequest.id.to_string(),
+        }
+    }
+
+    /// The sanitized directory name (with id fallback) this handler writes into,
+    /// relative to the host's drop directory. Used to resolve on-disk locations
+    /// for the UI without re-implementing the sanitization/fallback logic.
+    pub fn safe_dir_name(&self) -> &str {
+        &self.safe_dir_name
+    }
+
+    fn dir_namespace(&self) -> FileNamespace {
+        FileNamespace::Namespace {
+            namespace: self.safe_dir_name.clone(),
+            child: None,
+        }
+    }
+
+    /// Guard run before any operation that touches this filerequest's directory:
+    /// ensures the directory carries our ownership marker, adopting it if
+    /// unclaimed, and refusing with [`GetFileError::Claimed`] if another
+    /// filerequest owns it.
+    async fn ensure_owned(&self) -> GetFileResult<()> {
+        match self
+            .dir_handler
+            .ensure_exists_and_is_owned(self.dir_namespace(), &self.owner_id, false)
+            .await
+            .map_err(GetFileError::FilerequestDir)?
+        {
+            OwnershipOutcome::Owned | OwnershipOutcome::Adopted => Ok(()),
+            OwnershipOutcome::Conflict { other_id } => {
+                warn!(
+                    "Refusing operation on directory '{}' owned by filerequest {other_id}",
+                    self.safe_dir_name
+                );
+                Err(GetFileError::Claimed { other_id })
+            }
         }
     }
 
@@ -76,16 +132,30 @@ impl FilerequestDriveHandler {
         sanitize(name)
     }
 
-    pub async fn rename_filerquest(&mut self, new_title: &String) -> Result<(), ()> {
+    pub async fn rename_filerquest(
+        &mut self,
+        new_title: &String,
+    ) -> Result<(), RenameFilerequestError> {
         let safe = Self::get_name_from_string(new_title);
         if safe.is_empty() {
             warn!(
                 "Cannot rename {} based filerequest to {new_title}",
                 self.safe_dir_name
             );
-            return Err(());
+            return Err(RenameFilerequestError::Failed);
         }
 
+        // Ensure we still own the source directory before moving it. The marker
+        // travels inside the directory, so after a successful rename the new
+        // location remains ours.
+        if let Err(e) = self.ensure_owned().await {
+            warn!(?e, "Refusing to rename filerequest directory we do not own");
+            return Err(RenameFilerequestError::Failed);
+        }
+
+        // The rename atomically refuses to overwrite an existing directory and
+        // reports that as `DestinationOccupied` (the no-mixing guarantee), the
+        // same way creation reports a folder collision.
         match self
             .dir_handler
             .rename_resource(
@@ -100,10 +170,17 @@ impl FilerequestDriveHandler {
             )
             .await
         {
-            Ok(_) => {}
+            Ok(RenameOutcome::Renamed) => {}
+            Ok(RenameOutcome::DestinationOccupied) => {
+                warn!(
+                    "Refusing to rename '{}' onto already-claimed folder '{safe}'",
+                    self.safe_dir_name
+                );
+                return Err(RenameFilerequestError::DestinationOccupied);
+            }
             Err(e) => {
                 error!(?e, "Failed to rename filerequest");
-                return Err(());
+                return Err(RenameFilerequestError::Failed);
             }
         }
 
@@ -134,6 +211,7 @@ impl FilerequestDriveHandler {
 
     pub async fn get_file_for_writing(&self, filename: &str) -> GetFileResult<(String, File)> {
         let safe_name = Self::sanitize_filename(filename)?;
+        self.ensure_owned().await?;
 
         self.dir_handler
             .create_file_for_writing(FileNamespace::Namespace {
@@ -148,6 +226,7 @@ impl FilerequestDriveHandler {
     /// No deduplication on the file system
     pub async fn get_exact_file_for_writing(&self, filename: &str) -> GetFileResult<File> {
         let safe_name = Self::sanitize_filename(filename)?;
+        self.ensure_owned().await?;
 
         self.dir_handler
             .get_exact_file_for_writing(FileNamespace::Namespace {
@@ -174,21 +253,26 @@ impl FilerequestDriveHandler {
             .map_err(GetFileError::FilerequestDir)
     }
 
-    pub async fn finalize_partial_file(&self, partial_filename: &str, final_filename: &str) -> GetFileResult<String> {
+    pub async fn finalize_partial_file(
+        &self,
+        partial_filename: &str,
+        final_filename: &str,
+    ) -> GetFileResult<String> {
         let safe_part_name = Self::sanitize_filename(partial_filename)?;
         let safe_final_name = Self::sanitize_filename(final_filename)?;
+        self.ensure_owned().await?;
 
         let final_namespace = FileNamespace::Namespace {
             namespace: self.safe_dir_name.clone(),
-            child: Some(Box::new(FileNamespace::Filename(safe_final_name.clone()))),
+            child: Some(Box::new(FileNamespace::Filename(safe_final_name))),
         };
 
+        // The host layer deduplicates the target, so the actual on-disk name may
+        // differ from `safe_final_name`. Return the real persisted basename.
         self.dir_handler
             .finalize_partial_file(&safe_part_name, final_namespace)
             .await
-            .map_err(GetFileError::FilerequestDir)?;
-
-        Ok(safe_final_name)
+            .map_err(GetFileError::FilerequestDir)
     }
 
     fn sanitize_filename(filename: &str) -> GetFileResult<String> {
@@ -220,6 +304,7 @@ impl FilerequestDriveHandler {
         if *filename != safe_name {
             warn!("File to remove was sanitized from {filename} to {safe_name}");
         }
+        self.ensure_owned().await?;
 
         self.dir_handler
             .remove_file(FileNamespace::Namespace {
@@ -233,8 +318,12 @@ impl FilerequestDriveHandler {
     pub async fn rename_file(&self, from: &str, to: &str) -> GetFileResult<String> {
         let safe_from = Self::sanitize_filename(from)?;
         let safe_to = Self::sanitize_filename(to)?;
+        self.ensure_owned().await?;
 
-        self.dir_handler
+        // File renames deduplicate the target, so the result is always `Renamed`;
+        // `DestinationOccupied` only applies to directory renames.
+        match self
+            .dir_handler
             .rename_resource(
                 FileNamespace::Namespace {
                     namespace: self.safe_dir_name.clone(),
@@ -246,9 +335,11 @@ impl FilerequestDriveHandler {
                 },
             )
             .await
-            .map_err(GetFileError::FilerequestDir)?;
-
-        Ok(safe_to)
+            .map_err(GetFileError::FilerequestDir)?
+        {
+            RenameOutcome::Renamed => Ok(safe_to),
+            RenameOutcome::DestinationOccupied => Err(GetFileError::FileExists),
+        }
     }
 }
 
@@ -317,5 +408,72 @@ mod tests {
                 "Expected FileNameStartsWithDot for '{bad}', got {res:?}"
             );
         }
+    }
+
+    /// Two filerequests whose titles sanitize to the same directory name must not
+    /// share it: the first to write claims it, the second is refused.
+    #[tokio::test]
+    async fn colliding_directory_is_not_shared() {
+        let host = Arc::new(TestHostController::new(None)) as Arc<dyn HostController>;
+
+        // Same title → same sanitized directory, but different ids.
+        let a = FilerequestDriveHandler::new(host.clone(), make_filerequest("Shared Name"));
+        let b = FilerequestDriveHandler::new(host.clone(), make_filerequest("Shared Name"));
+        assert_ne!(a.owner_id, b.owner_id);
+        assert_eq!(a.safe_dir_name, b.safe_dir_name);
+
+        // A claims the directory by writing into it.
+        a.get_file_for_writing("from_a.txt")
+            .await
+            .expect("A should claim and write");
+        // A can keep writing (idempotent ownership).
+        a.get_file_for_writing("from_a_again.txt")
+            .await
+            .expect("A still owns its directory");
+
+        // B is refused because A owns the directory.
+        let res = b.get_file_for_writing("from_b.txt").await;
+        assert!(
+            matches!(&res, Err(GetFileError::Claimed { other_id }) if *other_id == a.owner_id),
+            "Expected Claimed by A, got {res:?}"
+        );
+    }
+
+    /// An unclaimed (markerless) directory gets adopted by the first writer.
+    #[tokio::test]
+    async fn ensure_owned_adopts_then_owns() {
+        let (_tmp, _root, frh) = setup("Adoptable").await;
+        // First call adopts.
+        frh.ensure_owned().await.expect("adopt");
+        // Subsequent calls are no-ops (Owned).
+        frh.ensure_owned().await.expect("own");
+    }
+
+    /// Renaming a filerequest onto a folder owned by another is refused with
+    /// `DestinationOccupied` (the atomic, no-mixing guarantee), while renaming
+    /// onto a free name succeeds and carries the marker along.
+    #[tokio::test]
+    async fn rename_onto_claimed_folder_is_refused() {
+        let host = Arc::new(TestHostController::new(None)) as Arc<dyn HostController>;
+
+        // "Alpha" is claimed by request A.
+        let a = FilerequestDriveHandler::new(host.clone(), make_filerequest("Alpha"));
+        a.ensure_owned().await.expect("A claims Alpha");
+
+        // B (originally "Beta") tries to rename onto "Alpha" → refused.
+        let mut b = FilerequestDriveHandler::new(host.clone(), make_filerequest("Beta"));
+        let res = b.rename_filerquest(&"Alpha".to_string()).await;
+        assert!(
+            matches!(res, Err(RenameFilerequestError::DestinationOccupied)),
+            "Expected DestinationOccupied, got {res:?}"
+        );
+        // The failed rename left B pointed at its original folder.
+        assert_eq!(b.safe_dir_name, "Beta");
+
+        // Renaming onto a free name succeeds and moves B's directory.
+        b.rename_filerquest(&"Gamma".to_string())
+            .await
+            .expect("rename onto free name");
+        assert_eq!(b.safe_dir_name, "Gamma");
     }
 }

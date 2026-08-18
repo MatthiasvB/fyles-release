@@ -5,31 +5,44 @@ use crate::core::domain_models::{
     CreatePendingFiles, CreateRemoteFilerequest, DisplayContact, Filerequest, FylesId, PendingFile,
     ReceiveStatus, ReceivedFile, RemoteFilerequest, SelfContact, SendStatus,
 };
+use crate::core::p2p::NodeKeyPairBinary;
+use crate::core::sync::{DocKind, LocalDocWrite};
 use crate::library::util::util::TimeoutLock;
 use actor::SqliteActor;
 use async_trait::async_trait;
 use command::SqliteMsg;
-use crypto::ContactPublicKeys;
+use crypto::{ContactKeys, ContactPublicKeys};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
-use tokio::sync::{oneshot, Mutex};
-use tracing::{error, trace, Span};
+use std::sync::Arc;
+use tokio::sync::mpsc::{Receiver, Sender, channel};
+use tokio::sync::{Mutex, oneshot};
+use tracing::{Span, trace};
 
 mod actor;
 mod command;
 mod migrations;
+#[cfg(test)]
+pub mod schema;
+#[cfg(not(test))]
 mod schema;
 mod util;
 
+/// Where a [`Sqlite`] database lives. `Memory` opens a private in-memory database
+/// (`Connection::open_in_memory`), used by tests; `File` opens/creates a file on disk.
+pub enum SqlitePath {
+    Memory,
+    File(PathBuf),
+}
+
 pub struct SqliteConfig {
-    pub path: PathBuf,
+    pub path: SqlitePath,
 }
 
 impl Default for SqliteConfig {
     fn default() -> Self {
         Self {
-            path: "filerequest.db".to_string().into(),
+            path: SqlitePath::File("filerequest.db".into()),
         }
     }
 }
@@ -50,21 +63,30 @@ impl Sqlite {
             config,
         }
     }
+
+    /// Construct a database and start its actor on a detached task, returning the
+    /// handle. The actor outlives any single [`Brain`], so a restarted brain reuses
+    /// the same live database. This is the only way the actor is started.
+    pub fn spawn(config: SqliteConfig) -> Arc<Self> {
+        let db = Arc::new(Self::with_config(config));
+        let actor = db.clone();
+        tokio::spawn(async move { actor.run().await });
+        db
+    }
+
+    async fn run(&self) {
+        let receiver = self
+            .prepared_receiver
+            .timeout_lock()
+            .await
+            .take()
+            .expect("Sqlite actor started once via Sqlite::spawn");
+        SqliteActor::new(receiver, &self.config.path).run().await;
+    }
 }
 
 #[async_trait]
 impl FilerequestDb for Sqlite {
-    async fn run(&self) {
-        let mut prepared_receiver = self.prepared_receiver.timeout_lock().await;
-        if let Some(receiver) = prepared_receiver.take() {
-            let actor = SqliteActor::new(receiver, &self.config.path);
-            drop(prepared_receiver);
-            actor.run().await;
-        } else {
-            error!("Trying to run a Sqlite that had already been started");
-        }
-    }
-
     async fn get_filerequest(&self, id: &FylesId) -> DatabaseResult<Filerequest> {
         let (sender, receiver) = oneshot::channel();
         self.sender
@@ -86,11 +108,19 @@ impl FilerequestDb for Sqlite {
         receiver.await?
     }
 
-    async fn create_filerequest(&self, filerequest: &CreateFilerequest) -> DatabaseResult<FylesId> {
+    async fn create_filerequest(
+        &self,
+        id: &FylesId,
+        filerequest: &CreateFilerequest,
+    ) -> DatabaseResult<()> {
         let (sender, receiver) = oneshot::channel();
         let _ = self
             .sender
-            .send(SqliteMsg::CreateFilerequest(filerequest.clone(), sender))
+            .send(SqliteMsg::CreateFilerequest(
+                id.clone(),
+                filerequest.clone(),
+                sender,
+            ))
             .await?;
         receiver.await?
     }
@@ -133,6 +163,25 @@ impl FilerequestDb for Sqlite {
         receiver.await?
     }
 
+    async fn keyless_synced_contacts(&self) -> DatabaseResult<Vec<ContactId>> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(SqliteMsg::KeylessSyncedContacts(sender))
+            .await?;
+        receiver.await?
+    }
+
+    async fn get_contacts_public_keys(
+        &self,
+        contact_ids: Vec<ContactId>,
+    ) -> DatabaseResult<Vec<(ContactId, ContactPublicKeys)>> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(SqliteMsg::GetContactsPublicKeys(contact_ids, sender))
+            .await?;
+        receiver.await?
+    }
+
     async fn get_contact_names(
         &self,
         ids: &[ContactId],
@@ -160,22 +209,24 @@ impl FilerequestDb for Sqlite {
         receiver.await?
     }
 
-    async fn update_contact(&self, contact: &DisplayContact) -> DatabaseResult<()> {
+    async fn update_contact(&self, contact: &DisplayContact) -> DatabaseResult<LocalDocWrite> {
         let (sender, receiver) = oneshot::channel();
         let _ = self
             .sender
             .send(SqliteMsg::UpdateContact(contact.clone(), sender))
             .await?;
-        receiver.await?
+        receiver.await??;
+        Ok(LocalDocWrite::new(DocKind::Contacts))
     }
 
-    async fn delete_contact(&self, id: &ContactId) -> DatabaseResult<()> {
+    async fn delete_contact(&self, id: &ContactId) -> DatabaseResult<LocalDocWrite> {
         let (sender, receiver) = oneshot::channel();
         let _ = self
             .sender
             .send(SqliteMsg::DeleteContact(id.clone(), sender))
             .await?;
-        receiver.await?
+        receiver.await??;
+        Ok(LocalDocWrite::new(DocKind::Contacts))
     }
 
     async fn store_node_keys(&self, keys: NodeInfo) -> DatabaseResult<()> {
@@ -192,7 +243,30 @@ impl FilerequestDb for Sqlite {
         receiver.await?
     }
 
-    // Implement the missing remote filerequest methods
+    async fn get_node_and_self_contact_id(&self) -> DatabaseResult<(NodeKeyPairBinary, ContactId)> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(SqliteMsg::GetNodeAndSelfContactId(sender))
+            .await?;
+        receiver.await?
+    }
+
+    async fn get_self_contact_id(&self) -> DatabaseResult<ContactId> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(SqliteMsg::GetSelfContactId(sender))
+            .await?;
+        receiver.await?
+    }
+
+    async fn store_signing_keys(&self, keys: ContactKeys) -> DatabaseResult<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(SqliteMsg::StoreSigningKeys(keys, sender))
+            .await?;
+        receiver.await?
+    }
+
     async fn get_remote_filerequest(&self, id: &FylesId) -> DatabaseResult<RemoteFilerequest> {
         let (sender, receiver) = oneshot::channel();
         self.sender
@@ -226,7 +300,7 @@ impl FilerequestDb for Sqlite {
     async fn create_remote_filerequest(
         &self,
         remote_fr: &CreateRemoteFilerequest,
-    ) -> DatabaseResult<FylesId> {
+    ) -> DatabaseResult<(FylesId, LocalDocWrite)> {
         let (sender, receiver) = oneshot::channel();
         self.sender
             .send(SqliteMsg::CreateRemoteFilerequest(
@@ -234,23 +308,30 @@ impl FilerequestDb for Sqlite {
                 sender,
             ))
             .await?;
-        receiver.await?
+        let id = receiver.await??;
+        Ok((id, LocalDocWrite::new(DocKind::RemoteFilerequests)))
     }
 
-    async fn delete_remote_filerequest(&self, id: &FylesId) -> DatabaseResult<()> {
+    async fn delete_remote_filerequest(&self, id: &FylesId) -> DatabaseResult<LocalDocWrite> {
         let (sender, receiver) = oneshot::channel();
         self.sender
             .send(SqliteMsg::DeleteRemoteFilerequest(id.clone(), sender))
             .await?;
-        receiver.await?
+        receiver.await??;
+        Ok(LocalDocWrite::new(DocKind::RemoteFilerequests))
     }
 
-    async fn update_remote_filerequest(&self, id: FylesId, name: String) -> DatabaseResult<()> {
+    async fn update_remote_filerequest(
+        &self,
+        id: FylesId,
+        name: String,
+    ) -> DatabaseResult<LocalDocWrite> {
         let (sender, receiver) = oneshot::channel();
         self.sender
             .send(SqliteMsg::UpdateRemoteFilerequest(id, name, sender))
             .await?;
-        receiver.await?
+        receiver.await??;
+        Ok(LocalDocWrite::new(DocKind::RemoteFilerequests))
     }
 
     // Implement the missing pending file methods
@@ -311,11 +392,7 @@ impl FilerequestDb for Sqlite {
         receiver.await?
     }
 
-    async fn add_interruption_reason(
-        &self,
-        id: &FylesId,
-        reason: String,
-    ) -> DatabaseResult<()> {
+    async fn add_interruption_reason(&self, id: &FylesId, reason: String) -> DatabaseResult<()> {
         let (sender, receiver) = oneshot::channel();
         self.sender
             .send(SqliteMsg::AddInterruptionReason(
@@ -334,10 +411,16 @@ impl FilerequestDb for Sqlite {
         receiver.await?
     }
 
-    async fn count_non_terminal_pending_files_for_path(&self, id: &FylesId) -> DatabaseResult<usize> {
+    async fn count_non_terminal_pending_files_for_path(
+        &self,
+        id: &FylesId,
+    ) -> DatabaseResult<usize> {
         let (sender, receiver) = oneshot::channel();
         self.sender
-            .send(SqliteMsg::CountNonTerminalPendingFilesForPath(id.clone(), sender))
+            .send(SqliteMsg::CountNonTerminalPendingFilesForPath(
+                id.clone(),
+                sender,
+            ))
             .await?;
         receiver.await?
     }
@@ -412,7 +495,10 @@ impl FilerequestDb for Sqlite {
         receiver.await?
     }
 
-    async fn get_stale_received_files(&self, older_than_ms: i64) -> DatabaseResult<Vec<ReceivedFile>> {
+    async fn get_stale_received_files(
+        &self,
+        older_than_ms: i64,
+    ) -> DatabaseResult<Vec<ReceivedFile>> {
         let (sender, receiver) = oneshot::channel();
         self.sender
             .send(SqliteMsg::GetStaleReceivedFiles(older_than_ms, sender))
@@ -457,11 +543,28 @@ impl FilerequestDb for Sqlite {
             .await?;
         receiver.await?
     }
-    async fn register_contact(&self, contact: Contact) -> DatabaseResult<()> {
+    async fn update_contact_projection(&self, contact: Contact) -> DatabaseResult<LocalDocWrite> {
         trace!("Registering contact: {:?}", contact);
         let (sender, receiver) = oneshot::channel();
         self.sender
-            .send(SqliteMsg::RegisterContact(contact, sender))
+            .send(SqliteMsg::UpdateContactProjection(contact, sender))
+            .await?;
+        receiver.await??;
+        Ok(LocalDocWrite::new(DocKind::Contacts))
+    }
+
+    async fn prune_contact_key_cache(&self) -> DatabaseResult<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(SqliteMsg::PruneContactKeyCache(sender))
+            .await?;
+        receiver.await?
+    }
+
+    async fn prune_orphaned_pending_files(&self) -> DatabaseResult<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(SqliteMsg::PruneOrphanedPendingFiles(sender))
             .await?;
         receiver.await?
     }
@@ -506,6 +609,34 @@ impl FilerequestDb for Sqlite {
             .await?;
         receiver.await?
     }
+
+    async fn get_sync_doc(&self, kind: DocKind) -> DatabaseResult<Vec<u8>> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(SqliteMsg::GetSyncDoc(kind, sender))
+            .await?;
+        receiver.await?
+    }
+
+    async fn save_sync_doc(&self, kind: DocKind, blob: Vec<u8>) -> DatabaseResult<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(SqliteMsg::SaveSyncDoc(kind, blob, sender))
+            .await?;
+        receiver.await?
+    }
+
+    async fn mutate_sync_doc(
+        &self,
+        kind: DocKind,
+        transform: Box<dyn FnOnce(Vec<u8>) -> DatabaseResult<Vec<u8>> + Send>,
+    ) -> DatabaseResult<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(SqliteMsg::MutateSyncDoc(kind, transform, sender))
+            .await?;
+        receiver.await?
+    }
 }
 
 #[cfg(test)]
@@ -514,75 +645,81 @@ mod tests {
 
     #[tokio::test]
     async fn test_filerequest_crud_and_access() {
-        let db = setup_test_db(None, false).await;
-        crate::core::db::test::test_filerequest_crud_and_access(db.db).await;
+        let db = setup_test_db(None).await;
+        crate::core::db::test::test_filerequest_crud_and_access(db).await;
     }
 
     #[tokio::test]
     async fn test_filerequest_deletion() {
-        let db = setup_test_db(None, false).await;
-        crate::core::db::test::test_filerequest_deletion(db.db).await;
+        let db = setup_test_db(None).await;
+        crate::core::db::test::test_filerequest_deletion(db).await;
     }
 
     #[tokio::test]
     async fn test_node_keys_integrity() {
-        let db = setup_test_db(None, false).await;
-        crate::core::db::test::test_node_keys_integrity(db.db).await;
+        let db = setup_test_db(None).await;
+        crate::core::db::test::test_node_keys_integrity(db).await;
     }
 
     #[tokio::test]
     async fn test_pending_files() {
-        let db = setup_test_db(None, false).await;
-        crate::core::db::test::test_pending_files(db.db).await;
+        let db = setup_test_db(None).await;
+        crate::core::db::test::test_pending_files(db).await;
     }
 
     #[tokio::test]
     async fn test_received_files() {
-        let db = setup_test_db(None, false).await;
-        crate::core::db::test::test_received_files(db.db).await;
+        let db = setup_test_db(None).await;
+        crate::core::db::test::test_received_files(db).await;
     }
 
     #[tokio::test]
     async fn test_delete_received_file() {
-        let db = setup_test_db(None, false).await;
-        crate::core::db::test::test_delete_received_file(db.db).await;
+        let db = setup_test_db(None).await;
+        crate::core::db::test::test_delete_received_file(db).await;
     }
 
     #[tokio::test]
     async fn test_delete_nonexistent_received_file() {
-        let db = setup_test_db(None, false).await;
-        crate::core::db::test::test_delete_nonexistent_received_file(db.db).await;
+        let db = setup_test_db(None).await;
+        crate::core::db::test::test_delete_nonexistent_received_file(db).await;
     }
 
     #[tokio::test]
     #[ignore = "DB should error when deleting unknown contact; current implementation returns Ok"]
     async fn test_contact_deletion_cascade() {
-        let db = setup_test_db(None, false).await;
-        crate::core::db::test::test_contact_deletion_cascade(db.db).await;
+        let db = setup_test_db(None).await;
+        crate::core::db::test::test_contact_deletion_cascade(db).await;
     }
 
     #[tokio::test]
     #[ignore = "DB should error when updating unknown filerequest; current implementation returns Ok"]
     async fn test_update_nonexistent_filerequest() {
-        let db = setup_test_db(None, false).await;
-        crate::core::db::test::test_update_nonexistent_filerequest(db.db).await;
+        let db = setup_test_db(None).await;
+        crate::core::db::test::test_update_nonexistent_filerequest(db).await;
     }
 
     #[tokio::test]
     async fn test_remote_filerequests_unknown_contact_query() {
-        let db = setup_test_db(None, false).await;
-        crate::core::db::test::test_remote_filerequests_unknown_contact_query(db.db).await;
+        let db = setup_test_db(None).await;
+        crate::core::db::test::test_remote_filerequests_unknown_contact_query(db).await;
     }
 
     #[tokio::test]
     async fn test_contact_public_keys() {
-        let db = setup_test_db(None, false).await;
-        crate::core::db::test::test_contact_public_keys(db.db).await;
+        let db = setup_test_db(None).await;
+        crate::core::db::test::test_contact_public_keys(db).await;
+    }
+
+    #[tokio::test]
+    async fn test_contacts_and_remote_fr_doc_roundtrip() {
+        let db = setup_test_db(None).await;
+        crate::core::db::test::test_contacts_and_remote_fr_doc_roundtrip(db).await;
     }
 
     #[tokio::test]
     async fn test_db_initialization() {
-        let db = setup_test_db(None, false).await;
-        crate::core::db::test::test_db_initialization(db.db).await;
+        let db = setup_test_db(None).await;
+        crate::core::db::test::test_db_initialization(db).await;
     }
 }

@@ -2,7 +2,7 @@ use fyles_core::library::util::duration_ext::DurationExt;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
-use tracing::{span, trace, Instrument, Level};
+use tracing::{Instrument, Level, span, trace};
 
 use fyles_core::core::brain::action::BrainAction;
 use fyles_core::core::brain::action_client::ClientAction;
@@ -105,6 +105,8 @@ async fn always_accept_files_from_self() {
 
     sender_harness
         .p2p_client
+        .read()
+        .await
         .send_files(vec![allowed_file])
         .instrument(sender_manual)
         .await
@@ -127,8 +129,4 @@ async fn always_accept_files_from_self() {
     let file_send_res = file_send_request.await;
 
     file_send_res.expect("File should be sent in time");
-
-    // Clean up
-    owner_harness.abort();
-    sender_harness.abort();
 }

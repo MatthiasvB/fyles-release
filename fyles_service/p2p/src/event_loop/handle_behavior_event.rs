@@ -25,6 +25,12 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
             CoreBehaviourEvent::ContactShare(event) => {
                 self.handle_contact_share_event(event);
             }
+            CoreBehaviourEvent::Sync(event) => {
+                self.handle_sync_event(event);
+            }
+            CoreBehaviourEvent::PubkeyFetch(event) => {
+                self.handle_pubkey_fetch_event(event);
+            }
         }
     }
 }

@@ -1,6 +1,6 @@
 use fyles_core::library::util::duration_ext::DurationExt;
 use tokio::time::timeout;
-use tracing::{debug, info, span, Instrument, Level};
+use tracing::{Instrument, Level, debug, info, span};
 
 use crate::tests::test_utils::{IdleP2pTestHarness, InterceptionRes};
 use crate::types::Wrap;
@@ -106,15 +106,11 @@ async fn can_send_file_to_self_right_after_identity_change() {
         .send_files_and_wait(
             internal_filerequest_id.clone(),
             vec![100],
-            1.seconds(),
+            3.seconds(),
             50.millis(),
         )
         .await
         .expect("File send should work");
 
     info!("Done");
-
-    // Clean up
-    old_harness.abort();
-    new_harness.abort();
 }

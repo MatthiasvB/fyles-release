@@ -1,13 +1,15 @@
 [package]
 name = "fyles-core"
-version = "0.4.2"
+version = "0.6.0"
 edition.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
 bs58 = { workspace = true }
+# CRATE-HYGIENE EXCEPTION: only for core::p2p::peer_id_from_node_keypair, so the seed_sync_docs
+# migration can derive this device's PeerId from the stored node keypair. See that function.
+libp2p = { workspace = true, features = ["ed25519"] }
 futures = { workspace = true }
-grpc = { workspace = true }
 itertools = { workspace = true }
 prost = { workspace = true }
 protobuf = { workspace = true }
@@ -19,17 +21,18 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "sync", "rt", "rt-multi-thread", "fs", "time"] }
 tokio-stream = { workspace = true }
 tonic = { workspace = true }
+tonic-prost = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 semver = { workspace = true, features = ["serde"] }
+sha2 = { workspace = true }
 shellexpand = { workspace = true }
 autosurgeon = { workspace = true }
 automerge = { workspace = true }
 expiringmap = { workspace = true }
 serde_bytes = { workspace = true }
-bincode = { workspace = true, features = ["serde"] }
+bincode = { workspace = true }
 tracing = { workspace = true }
 test-log = { workspace = true, features = ["trace"] }
-async-std = { workspace = true }
 sanitize-filename = { workspace = true }
 rand = { workspace = true }
 zip_clone = { workspace = true }
@@ -42,20 +45,20 @@ subtle = { workspace = true, features = ["const-generics"] }
 base64 = { workspace = true }
 zstd = { workspace = true }
 libc.workspace = true
-tokio-util = { workspace = true, features = ["compat", "time"] }
+tokio-util = { workspace = true, features = ["compat", "rt", "time"] }
 derive_more = { workspace = true, features = ["as_ref", "deref", "deref_mut", "display", "from", "from_str"] }
 
 [build-dependencies]
 tonic-build = { workspace = true }
+tonic-prost-build = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-async-std = { workspace = true, features = ["attributes"] }
 crypto = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 default = []
-test-with-prod-db = []
 otel-jaeger = []
 test-support = ["tempfile", "crypto/test-support"]
 

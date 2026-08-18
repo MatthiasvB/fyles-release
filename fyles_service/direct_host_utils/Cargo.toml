@@ -30,6 +30,9 @@ opentelemetry-otlp = { workspace = true, optional = true }
 tempfile.workspace = true
 test-log.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [features]
 otel-jaeger = ["opentelemetry", "opentelemetry-otlp", "tracing-opentelemetry", "opentelemetry-stdout", "opentelemetry_sdk"]
 console = []

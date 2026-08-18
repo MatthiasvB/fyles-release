@@ -1,29 +1,27 @@
 use async_trait::async_trait;
 use crypto::{ContactKeys, DeSerCryptError, SerCryptError};
-use fyles_core::core::brain::types::{ContactShareChallenge, SelfContactInviteChallenge};
+use fyles_core::core::brain::types::{
+    ContactShareChallenge, PubkeyFetchRequest, PubkeyFetchResponse, SelfContactInviteChallenge,
+};
+use fyles_core::core::sync::{SyncRequest, SyncResponse};
 use libp2p::{
-    identity::Keypair, noise, request_response::ResponseChannel, swarm::DialError, tcp,
-    yamux, Swarm, TransportError,
+    Swarm, TransportError, identity::Keypair, noise, request_response::ResponseChannel,
+    swarm::DialError, tcp, yamux,
 };
+use std::collections::HashSet;
 use std::sync::Arc;
-use std::{
-    collections::HashMap,
-    error::Error,
-    io,
-    time::SystemTime,
-};
+use std::{collections::HashMap, error::Error, io, time::SystemTime};
 use thiserror::Error;
-use tracing::{
-    debug, error, info, instrument, span, trace, warn, Instrument, Level, Span,
-};
+use tokio_util::sync::CancellationToken;
+use tracing::{Instrument, Level, Span, debug, error, info, instrument, span, trace, warn};
 
 use crate::types::{Unwrap, Wrap};
 use libp2p::{
-    core::transport::ListenerId, multiaddr::Protocol, request_response::OutboundRequestId, swarm::SwarmEvent,
-    Multiaddr, PeerId,
+    Multiaddr, PeerId, core::transport::ListenerId, multiaddr::Protocol,
+    request_response::OutboundRequestId, swarm::SwarmEvent,
 };
 use tokio::{
-    sync::{mpsc, oneshot, Mutex, SetOnce},
+    sync::{Mutex, SetOnce, mpsc, oneshot},
     time::sleep,
 };
 
@@ -40,18 +38,15 @@ use fyles_core::{
         domain_models::{ContactId, PendingFile, SendStatus},
         p2p::NodeStatusInfo,
     },
-    library::util::{
-        duration_ext::DurationExt,
-        error_handling::ToArcedDynError,
-        util::TimeoutLock,
-    },
+    library::util::{error_handling::ToArcedDynError, util::TimeoutLock},
 };
 
 pub use crate::{
+    SwarmFactory,
     behaviour::{
         ContactShareBehaviour, FilerequestBehaviour, LocalNetworkBehaviour,
-        LocalNetworkBehaviourEvent, SelfContactInviteBehaviour, SessionErrorResponse,
-        SessionEstablishmentBehaviour,
+        LocalNetworkBehaviourEvent, PubkeyFetchBehaviour, SelfContactInviteBehaviour,
+        SessionErrorResponse, SessionEstablishmentBehaviour, SyncBehaviour,
     },
     crypto::{
         AuthWireResponse, InitiatorSessionCreation, InitiatorSessionEstablishmentError,
@@ -67,17 +62,17 @@ pub use crate::{
     file_encryptor::ReadCryptResult,
     send_receive_traits::request_sender::RequestSender,
     types::FileResponse,
-    utils::{decode_stored_keys, W},
-    SwarmFactory,
+    utils::{W, decode_stored_keys},
 };
 
-use super::command::P2pCommand;
+use super::command::{DataCommand, LoopCommand, P2pCommand};
+use crate::constants::{BRAIN_READY_POLL_INTERVAL, REQUEST_TIMEOUT};
 use crate::event_loop::filerequest::file_tracker::new_core_file_tracker;
 use crate::event_loop::filerequest::receive_manager::FilerequestReceiver;
 use crate::event_loop::with_swarm::GetInnerEventSender;
-use crate::send_receive_traits::get_session::SessionManager;
 #[cfg(test)]
 use crate::send_receive_traits::get_session::GetSession;
+use crate::send_receive_traits::get_session::SessionManager;
 use crate::send_receive_traits::request_registry::{
     TimeoutRequestRegistry, TimeoutRequestRegistryWorker,
 };
@@ -87,17 +82,17 @@ use crate::send_receive_traits::session_send_receive::{
 };
 use crate::types::FileRequest;
 use futures::StreamExt;
-use fyles_core::core::domain_models::{Contact, SelfContact};
-#[cfg(target_os = "android")]
-use libp2p::dns::ResolverConfig;
+use fyles_core::core::domain_models::{Contact, PeerIdWrapper, SelfContact};
 
 pub mod filerequest;
 mod handle_behavior_event;
 mod handle_contact_invite_event;
 mod handle_file_request_event;
 mod handle_mdns_event;
+mod handle_pubkey_fetch_event;
 mod handle_self_contact_invite_event;
 mod handle_session_establishment_event;
+mod handle_sync_event;
 mod trait_impls;
 pub mod with_swarm;
 
@@ -139,7 +134,7 @@ pub enum InnerAsyncEvent<T: FileTracker> {
     //     >,
     // },
     ConnectOtherSwarm {
-        other: Swarm<LocalNetworkBehaviour>,
+        other: Box<Swarm<LocalNetworkBehaviour>>,
         return_connected_sender: oneshot::Sender<Swarm<LocalNetworkBehaviour>>,
     },
     GetEventLoop(oneshot::Sender<RefCountEventLoopData<T>>),
@@ -190,8 +185,11 @@ pub struct LocalEventLoop<T: FileTracker> {
     filerequest_request_timeouts: TimeoutRequestRegistryWorker<usize, PeerId>,
     contact_share_request_timeouts: TimeoutRequestRegistryWorker<usize, PeerId>,
     self_contact_invite_request_timeouts: TimeoutRequestRegistryWorker<usize, PeerId>,
+    sync_request_timeouts: TimeoutRequestRegistryWorker<usize, PeerId>,
+    pubkey_fetch_request_timeouts: TimeoutRequestRegistryWorker<usize, PeerId>,
     command_receiver: tokio::sync::mpsc::Receiver<P2pCommand>,
     inner_event_receiver: EventLoopReceiver<Swarm<LocalNetworkBehaviour>>,
+    shutdown: CancellationToken,
     #[cfg(test)]
     inner_async_event_receiver: AsyncEventLoopReceiver<T>,
     #[cfg(test)]
@@ -226,6 +224,25 @@ pub trait LocalNetworkSwarm {
     fn listeners<'a>(&'a self) -> Box<dyn Iterator<Item = &'a Multiaddr> + 'a>;
 
     fn connected_peers<'a>(&'a self) -> Box<dyn Iterator<Item = &'a PeerId> + 'a>;
+
+    /// A set, because `discovered_nodes` yields one entry per (peer, address).
+    fn mdns_discovered_peers(&self) -> std::collections::HashSet<PeerId>;
+
+    /// mDNS-only: an owned device is unlikely to be reachable only over the internet, and file
+    /// sends over that path are already swept by the kademlia file tracker.
+    fn sweepable_peers(&self) -> std::collections::HashSet<PeerId> {
+        self.mdns_discovered_peers()
+    }
+
+    /// Wider than [`Self::sweepable_peers`], because sync frames, unlike file transfers, are fine
+    /// over a relay.
+    fn sync_reachable_peers(&self) -> std::collections::HashSet<PeerId> {
+        self.mdns_discovered_peers()
+            .into_iter()
+            .chain(self.connected_peers().copied())
+            .collect()
+    }
+
     fn listen_on(&mut self, addr: Multiaddr) -> Result<ListenerId, TransportError<io::Error>>;
 
     fn get_filerequest_behaviour(&mut self) -> &mut FilerequestBehaviour;
@@ -235,6 +252,10 @@ pub trait LocalNetworkSwarm {
     fn get_contact_share_behaviour(&mut self) -> &mut ContactShareBehaviour;
 
     fn get_session_establishment_behaviour(&mut self) -> &mut SessionEstablishmentBehaviour;
+
+    fn get_sync_behaviour(&mut self) -> &mut SyncBehaviour;
+
+    fn get_pubkey_fetch_behaviour(&mut self) -> &mut PubkeyFetchBehaviour;
 }
 
 impl LocalNetworkSwarm for Swarm<LocalNetworkBehaviour> {
@@ -258,6 +279,10 @@ impl LocalNetworkSwarm for Swarm<LocalNetworkBehaviour> {
         Box::new(self.connected_peers())
     }
 
+    fn mdns_discovered_peers(&self) -> std::collections::HashSet<PeerId> {
+        self.behaviour().mdns.discovered_nodes().copied().collect()
+    }
+
     fn listen_on(&mut self, addr: Multiaddr) -> Result<ListenerId, TransportError<io::Error>> {
         self.listen_on(addr)
     }
@@ -277,6 +302,14 @@ impl LocalNetworkSwarm for Swarm<LocalNetworkBehaviour> {
     fn get_session_establishment_behaviour(&mut self) -> &mut SessionEstablishmentBehaviour {
         &mut self.behaviour_mut().core.session_establishment
     }
+
+    fn get_sync_behaviour(&mut self) -> &mut SyncBehaviour {
+        &mut self.behaviour_mut().core.sync
+    }
+
+    fn get_pubkey_fetch_behaviour(&mut self) -> &mut PubkeyFetchBehaviour {
+        &mut self.behaviour_mut().core.pubkey_fetch
+    }
 }
 
 impl<T: FileTracker> LocalNetworkSwarm for LocalEventLoop<T> {
@@ -294,6 +327,10 @@ impl<T: FileTracker> LocalNetworkSwarm for LocalEventLoop<T> {
 
     fn connected_peers<'a>(&'a self) -> Box<dyn Iterator<Item = &'a PeerId> + 'a> {
         Box::new(self.swarm.connected_peers())
+    }
+
+    fn mdns_discovered_peers(&self) -> std::collections::HashSet<PeerId> {
+        self.swarm.mdns_discovered_peers()
     }
 
     fn listen_on(&mut self, addr: Multiaddr) -> Result<ListenerId, TransportError<io::Error>> {
@@ -316,6 +353,14 @@ impl<T: FileTracker> LocalNetworkSwarm for LocalEventLoop<T> {
         self.swarm.get_session_establishment_behaviour()
     }
 
+    fn get_sync_behaviour(&mut self) -> &mut SyncBehaviour {
+        self.swarm.get_sync_behaviour()
+    }
+
+    fn get_pubkey_fetch_behaviour(&mut self) -> &mut PubkeyFetchBehaviour {
+        self.swarm.get_pubkey_fetch_behaviour()
+    }
+
     fn dial(&mut self, opts: &PeerId) -> Result<(), DialError> {
         self.swarm.dial(*opts)
     }
@@ -325,7 +370,11 @@ pub struct EventLoopData<T: FileTracker, S: LocalNetworkSwarm = Swarm<LocalNetwo
     /// Timestamp of when the node started
     pub start_timestamp: u128,
     pub brain_action_sender: tokio::sync::mpsc::Sender<BrainAction>,
+    /// Cancelled before the brain is torn down, so unsolicited work started by the loop is dropped
+    /// rather than left to send into a receiver that has gone away.
+    pub shutdown: CancellationToken,
     // not sure if this is needed
+    #[allow(clippy::type_complexity)]
     pub pending_dial:
         Mutex<HashMap<PeerId, oneshot::Sender<Result<(), Arc<dyn Error + Send + Sync>>>>>,
     pub file_tracker: T,
@@ -353,6 +402,22 @@ pub struct EventLoopData<T: FileTracker, S: LocalNetworkSwarm = Swarm<LocalNetwo
         OutboundRequestId,
         usize,
         ContactShareChallenge,
+        ContactId,
+        W<Arc<CryptoSession>>,
+    >,
+    pub sync_request_registry: TimeoutRequestRegistry<
+        PeerId,
+        OutboundRequestId,
+        usize,
+        SyncRequest,
+        ContactId,
+        W<Arc<CryptoSession>>,
+    >,
+    pub pubkey_fetch_request_registry: TimeoutRequestRegistry<
+        PeerId,
+        OutboundRequestId,
+        usize,
+        PubkeyFetchRequest,
         ContactId,
         W<Arc<CryptoSession>>,
     >,
@@ -419,6 +484,7 @@ impl LocalEventLoop<CoreFileTracker> {
     pub async fn new(
         command_receiver: tokio::sync::mpsc::Receiver<P2pCommand>,
         brain_action_sender: tokio::sync::mpsc::Sender<BrainAction>,
+        shutdown: CancellationToken,
         swarm_factory: SwarmFactory<Swarm<LocalNetworkBehaviour>>,
         #[cfg(any(test, feature = "test-support"))]
         inner_async_event_receiver: AsyncEventLoopReceiver<CoreFileTracker>,
@@ -432,7 +498,7 @@ impl LocalEventLoop<CoreFileTracker> {
         // Get keys through brain action
         let node_info_result = loop {
             // Wait for brain to be ready
-            sleep(100.millis()).await;
+            sleep(BRAIN_READY_POLL_INTERVAL).await;
             let (request, receiver) = BrainRequest::with_receiver(());
             brain_action_sender
                 .send(BrainAction::NetworkNode(NetworkNodeAction::GetNodeInfo(
@@ -492,11 +558,14 @@ impl LocalEventLoop<CoreFileTracker> {
         let future_event_loop_data_clone_1 = future_event_loop_data.clone();
         let future_event_loop_data_clone_2 = future_event_loop_data_clone_1.clone();
         let (filerequest_request_registry, filerequest_timeouts) =
-            TimeoutRequestRegistry::new(15.seconds());
+            TimeoutRequestRegistry::new(REQUEST_TIMEOUT);
         let (self_contact_invite_request_registry, self_contact_invite_timeouts) =
-            TimeoutRequestRegistry::new(15.seconds());
+            TimeoutRequestRegistry::new(REQUEST_TIMEOUT);
         let (contact_share_request_registry, contact_share_timeouts) =
-            TimeoutRequestRegistry::new(15.seconds());
+            TimeoutRequestRegistry::new(REQUEST_TIMEOUT);
+        let (sync_request_registry, sync_timeouts) = TimeoutRequestRegistry::new(REQUEST_TIMEOUT);
+        let (pubkey_fetch_request_registry, pubkey_fetch_timeouts) =
+            TimeoutRequestRegistry::new(REQUEST_TIMEOUT);
         let data = RefCountEventLoopData(Arc::new(EventLoopData {
             start_timestamp: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -505,6 +574,8 @@ impl LocalEventLoop<CoreFileTracker> {
             filerequest_request_registry,
             self_contact_invite_challenge_request_registry: self_contact_invite_request_registry,
             contact_invite_challenge_request_registry: contact_share_request_registry,
+            sync_request_registry,
+            pubkey_fetch_request_registry,
             file_tracker: new_core_file_tracker(
                 brain_action_sender.clone(),
                 Box::new(move |peer, contact_id, request| {
@@ -533,6 +604,7 @@ impl LocalEventLoop<CoreFileTracker> {
             ),
             receive_manager: FilerequestReceiver::new(brain_action_sender.clone()).into(),
             brain_action_sender,
+            shutdown: shutdown.clone(),
             inner_event_sender: inner_sender,
         }));
         if let Err(_e) = future_event_loop_data.set(data.clone()) {
@@ -548,6 +620,9 @@ impl LocalEventLoop<CoreFileTracker> {
             filerequest_request_timeouts: filerequest_timeouts,
             contact_share_request_timeouts: contact_share_timeouts,
             self_contact_invite_request_timeouts: self_contact_invite_timeouts,
+            sync_request_timeouts: sync_timeouts,
+            pubkey_fetch_request_timeouts: pubkey_fetch_timeouts,
+            shutdown,
         })
     }
 
@@ -577,6 +652,7 @@ impl LocalEventLoop<CoreFileTracker> {
         contact_keys: ContactKeys,
         command_receiver: tokio::sync::mpsc::Receiver<P2pCommand>,
         brain_action_sender: tokio::sync::mpsc::Sender<BrainAction>,
+        shutdown: CancellationToken,
         inner_async_event_receiver: AsyncEventLoopReceiver<CoreFileTracker>,
     ) -> Result<Self, EventLoopError> {
         brain_action_sender
@@ -588,11 +664,14 @@ impl LocalEventLoop<CoreFileTracker> {
         info!("Starting P2P event loop");
         let (inner_sender, inner_receiver) = mpsc::unbounded_channel();
         let (filerequest_request_registry, filerequest_timeouts) =
-            TimeoutRequestRegistry::new(15.seconds());
+            TimeoutRequestRegistry::new(REQUEST_TIMEOUT);
         let (self_contact_invite_request_registry, self_contact_invite_timeouts) =
-            TimeoutRequestRegistry::new(15.seconds());
+            TimeoutRequestRegistry::new(REQUEST_TIMEOUT);
         let (contact_share_request_registry, contact_share_timeouts) =
-            TimeoutRequestRegistry::new(15.seconds());
+            TimeoutRequestRegistry::new(REQUEST_TIMEOUT);
+        let (sync_request_registry, sync_timeouts) = TimeoutRequestRegistry::new(REQUEST_TIMEOUT);
+        let (pubkey_fetch_request_registry, pubkey_fetch_timeouts) =
+            TimeoutRequestRegistry::new(REQUEST_TIMEOUT);
         let future_event_loop_data: SetOnce<RefCountEventLoopData<CoreFileTracker>> =
             tokio::sync::SetOnce::new();
         let future_event_loop_data_clone_1 = Arc::new(future_event_loop_data.clone());
@@ -605,6 +684,8 @@ impl LocalEventLoop<CoreFileTracker> {
             filerequest_request_registry: filerequest_request_registry,
             contact_invite_challenge_request_registry: contact_share_request_registry,
             self_contact_invite_challenge_request_registry: self_contact_invite_request_registry,
+            sync_request_registry,
+            pubkey_fetch_request_registry,
             file_tracker: new_core_file_tracker(
                 brain_action_sender.clone(),
                 Box::new(move |peer, contact_id, request| {
@@ -632,6 +713,7 @@ impl LocalEventLoop<CoreFileTracker> {
             ),
             receive_manager: FilerequestReceiver::new(brain_action_sender.clone()).into(),
             brain_action_sender,
+            shutdown: shutdown.clone(),
             pending_dial: Default::default(),
             inner_event_sender: inner_sender,
         }));
@@ -648,19 +730,48 @@ impl LocalEventLoop<CoreFileTracker> {
             filerequest_request_timeouts: filerequest_timeouts,
             contact_share_request_timeouts: contact_share_timeouts,
             self_contact_invite_request_timeouts: self_contact_invite_timeouts,
+            sync_request_timeouts: sync_timeouts,
+            pubkey_fetch_request_timeouts: pubkey_fetch_timeouts,
+            shutdown,
         })
     }
 }
 
 impl LocalEventLoop<CoreFileTracker> {
+    /// Cheap by construction: no queued files is a map lookup, and a peer that is not one of our
+    /// devices stops at one indexed database read.
+    fn run_sweep(&mut self) {
+        let peers = self.swarm.sweepable_peers();
+        trace!(count = peers.len(), "Sweeping visible peers");
+        if peers.is_empty() {
+            return;
+        }
+        for peer in peers {
+            self.data.clone().trigger_interaction_with_peer(peer);
+        }
+    }
+
+    async fn handle_loop_command(&mut self, command: LoopCommand) {
+        match command {
+            LoopCommand::TriggerVisiblePeerInteractions => self.run_sweep(),
+            // The base crate has no settings schema; the frontend renders an empty response as a
+            // default view. `p2p_internet` overrides this.
+            LoopCommand::ProcessSettingsRequest { request: _, sender } => {
+                let _ = sender.send(Ok(Vec::new()));
+            }
+        }
+    }
+
     pub async fn run(mut self) -> Result<(), ()> {
         loop {
             #[cfg(not(test))]
             tokio::select! {
                 event = self.swarm.select_next_some() => { tokio::spawn(self.data.clone().handle_local_event(event).in_current_span()); },
+                _ = self.shutdown.cancelled() => return Ok(()),
                 command = self.command_receiver.recv() => match command {
-                    Some(c) => self.data.clone().handle_command(c),
-                    // Command channel closed, thus shutting down the network event loop.
+                    Some(P2pCommand::Loop(c)) => self.handle_loop_command(c).await,
+                    Some(P2pCommand::Data(c)) => self.data.clone().handle_command(c),
+                    // Closed without a cancellation: the brain went away unexpectedly.
                     None => return Err(()),
                 },
                 inner_event = self.inner_event_receiver.recv() => { self.handle_inner_event(inner_event.expect("Channel to be open")); },
@@ -678,6 +789,16 @@ impl LocalEventLoop<CoreFileTracker> {
                     let (request_id, peer_id) = self_contact_invite_timeout.unwrap();
                     let data = self.data.clone();
                     tokio::spawn(async move { <RefCountEventLoopData<_> as ResponseReceiver<SelfContact>>::handle_receive_error(&data, peer_id, Ok(request_id), ReceiveError::LocalError(LocalReceiveError::Timeout)).await });
+                },
+                sync_timeout = self.sync_request_timeouts.next() => {
+                    let (request_id, peer_id) = sync_timeout.unwrap();
+                    let data = self.data.clone();
+                    tokio::spawn(async move { <RefCountEventLoopData<_> as ResponseReceiver<SyncResponse>>::handle_receive_error(&data, peer_id, Ok(request_id), ReceiveError::LocalError(LocalReceiveError::Timeout)).await });
+                },
+                pubkey_fetch_timeout = self.pubkey_fetch_request_timeouts.next() => {
+                    let (request_id, peer_id) = pubkey_fetch_timeout.unwrap();
+                    let data = self.data.clone();
+                    tokio::spawn(async move { <RefCountEventLoopData<_> as ResponseReceiver<PubkeyFetchResponse>>::handle_receive_error(&data, peer_id, Ok(request_id), ReceiveError::LocalError(LocalReceiveError::Timeout)).await });
                 }
             }
 
@@ -686,9 +807,11 @@ impl LocalEventLoop<CoreFileTracker> {
                 event = {
                     self.swarm.select_next_some()
                 } => { tokio::spawn(self.data.clone().handle_local_event(event).in_current_span()); },
+                _ = self.shutdown.cancelled() => return Ok(()),
                 command = self.command_receiver.recv() => match command {
-                    Some(c) => self.data.clone().handle_command(c),
-                    // Command channel closed, thus shutting down the network event loop.
+                    Some(P2pCommand::Loop(c)) => self.handle_loop_command(c).await,
+                    Some(P2pCommand::Data(c)) => self.data.clone().handle_command(c),
+                    // Closed without a cancellation: the brain went away unexpectedly.
                     None => return Err(()),
                 },
                 inner_event = self.inner_event_receiver.recv() => { self.handle_inner_event(inner_event.expect("Channel to be open")); }
@@ -709,6 +832,16 @@ impl LocalEventLoop<CoreFileTracker> {
                     let (request_id, peer_id) = self_contact_invite_timeout.unwrap();
                     let data = self.data.clone();
                     tokio::spawn(async move { <RefCountEventLoopData<_> as ResponseReceiver<SelfContact>>::handle_receive_error(&data, peer_id, Ok(request_id), ReceiveError::LocalError(LocalReceiveError::Timeout)).await });
+                },
+                sync_timeout = self.sync_request_timeouts.next() => {
+                    let (request_id, peer_id) = sync_timeout.unwrap();
+                    let data = self.data.clone();
+                    tokio::spawn(async move { <RefCountEventLoopData<_> as ResponseReceiver<SyncResponse>>::handle_receive_error(&data, peer_id, Ok(request_id), ReceiveError::LocalError(LocalReceiveError::Timeout)).await });
+                },
+                pubkey_fetch_timeout = self.pubkey_fetch_request_timeouts.next() => {
+                    let (request_id, peer_id) = pubkey_fetch_timeout.unwrap();
+                    let data = self.data.clone();
+                    tokio::spawn(async move { <RefCountEventLoopData<_> as ResponseReceiver<PubkeyFetchResponse>>::handle_receive_error(&data, peer_id, Ok(request_id), ReceiveError::LocalError(LocalReceiveError::Timeout)).await });
                 }
             }
         }
@@ -725,7 +858,7 @@ impl LocalEventLoop<CoreFileTracker> {
                 use libp2p_swarm_test::SwarmExt;
 
                 self.swarm.connect(&mut other).await;
-                if return_connected_sender.send(other).is_err() {
+                if return_connected_sender.send(*other).is_err() {
                     panic!("Failed to send the swarm back to the event loop");
                 }
             }
@@ -814,7 +947,7 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
     }
 
     #[instrument(skip(self))]
-    fn handle_discovered_peer(mut self, peer_id: PeerId, addr: Multiaddr) {
+    fn handle_discovered_peer(self, peer_id: PeerId, addr: Multiaddr) {
         if addr.iter().any(|p| p == Protocol::P2pCircuit) {
             trace!("Discovered relay peer {peer_id} at addr {addr}");
             return;
@@ -823,8 +956,23 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
         self.trigger_interaction_with_peer(peer_id);
     }
 
-    fn trigger_interaction_with_peer(&mut self, peer_id: PeerId) {
-        tokio::spawn(self.clone().send_files_to_peer(peer_id).in_current_span());
+    pub fn trigger_interaction_with_peer(&self, peer_id: PeerId) {
+        let shutdown = self.shutdown.clone();
+        let sender = self.brain_action_sender.clone();
+        let data = self.clone();
+        tokio::spawn(
+            shutdown
+                .run_until_cancelled_owned(async move {
+                    sender
+                        .send(BrainAction::NetworkNode(
+                            NetworkNodeAction::SyncOnPeerConnect(peer_id.wrap()),
+                        ))
+                        .await
+                        .expect("Sending to work");
+                    data.send_files_to_peer(peer_id).await;
+                })
+                .in_current_span(),
+        );
     }
 
     async fn handle_local_event(self, event: SwarmEvent<LocalNetworkBehaviourEvent>) {
@@ -868,16 +1016,8 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
                         .in_current_span(),
                 );
             }
-            SwarmEvent::ConnectionClosed {
-                peer_id,
-                cause,
-                num_established,
-                ..
-            } => {
+            SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
                 handle_connection_closed(peer_id, cause);
-                if num_established == 0 {
-                    self.file_tracker.reset_for_disconnected_peer(peer_id).await;
-                }
             }
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                 tokio::spawn(
@@ -952,6 +1092,13 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
             if let Some(sender) = self.pending_dial.timeout_lock().await.remove(&peer_id) {
                 let _ = sender.send(Ok(()));
             }
+            // If this is one of our own devices, the brain opportunistically syncs.
+            let _ = self
+                .brain_action_sender
+                .send(BrainAction::NetworkNode(
+                    NetworkNodeAction::SyncOnPeerConnect(peer_id.wrap()),
+                ))
+                .await;
         }
         if self.file_tracker.has_pending_files_for(&peer_id).await {
             self.send_files_to_peer(peer_id).await;
@@ -997,9 +1144,9 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
     }
 
     #[instrument(skip(self))]
-    pub fn handle_command(self, command: P2pCommand) {
+    pub fn handle_command(self, command: DataCommand) {
         match command {
-            P2pCommand::StartListening { addr, sender } => {
+            DataCommand::StartListening { addr, sender } => {
                 self.with_swarm(|swarm| {
                     match swarm.listen_on(addr) {
                         Ok(_) => sender.send(Ok(())).expect("Sending value going okay"),
@@ -1009,7 +1156,7 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
                     };
                 });
             }
-            P2pCommand::SendFiles {
+            DataCommand::SendFiles {
                 files_to_send,
                 sender,
             } => {
@@ -1041,7 +1188,7 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
                     .in_current_span(),
                 );
             }
-            P2pCommand::InitialFilesToSend {
+            DataCommand::InitialFilesToSend {
                 files_to_send,
                 sender,
             } => {
@@ -1050,21 +1197,18 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
                         for file_to_send in files_to_send {
                             let peer_id = file_to_send.peer_id.unwrap_thing();
                             let pending_file = PendingFile {
-                                        id: file_to_send.id,
-                                        contact_id: file_to_send.contact_id,
-                                        target_filerequest_id: file_to_send.filerequest_id,
-                                        file_path: file_to_send.file_path,
-                                        status: file_to_send.status,
-                                        retry_count: file_to_send.retry_count,
-                                        display_name: None,
-                                        interruption_reasons: vec![],
-                                    };
+                                id: file_to_send.id,
+                                contact_id: file_to_send.contact_id,
+                                target_filerequest_id: file_to_send.filerequest_id,
+                                file_path: file_to_send.file_path,
+                                status: file_to_send.status,
+                                retry_count: file_to_send.retry_count,
+                                display_name: None,
+                                interruption_reasons: vec![],
+                            };
                             trace!(?pending_file, "Adding initial file to file tracker");
                             self.file_tracker
-                                .add_pending_file(
-                                    peer_id,
-                                    pending_file,
-                                )
+                                .add_pending_file(peer_id, pending_file)
                                 .await;
                         }
                         sender.send(Ok(())).expect("Sending value going okay");
@@ -1072,7 +1216,7 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
                     .in_current_span(),
                 );
             }
-            P2pCommand::GetNodeInfo { sender } => {
+            DataCommand::GetNodeInfo { sender } => {
                 tokio::spawn(
                     async move {
                         let node_info = self.get_node_info().await;
@@ -1089,7 +1233,30 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
                     .in_current_span(),
                 );
             }
-            P2pCommand::CancelFile { file_id, sender } => {
+            DataCommand::SyncDocsWithReachable { devices, kind } => {
+                tokio::spawn(
+                    async move {
+                        let reachable: HashSet<PeerIdWrapper> = self
+                            .with_swarm_res(|swarm| {
+                                swarm.sync_reachable_peers()
+                                    .into_iter()
+                                    .map(|p| p.wrap())
+                                    .collect()
+                            })
+                            .await;
+                        for peer in devices.into_iter().filter(|d| reachable.contains(d)) {
+                            self.brain_action_sender
+                                .send(BrainAction::NetworkNode(
+                                    NetworkNodeAction::SyncDocWithPeer { peer, kind },
+                                ))
+                                .await
+                                .expect("Sending to work");
+                        }
+                    }
+                    .in_current_span(),
+                );
+            }
+            DataCommand::CancelFile { file_id, sender } => {
                 tokio::spawn(
                     async move {
                         let was_cancelled = self.file_tracker.cancel_file(file_id).await;
@@ -1101,7 +1268,7 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
                     .in_current_span(),
                 );
             }
-            P2pCommand::CancelFilesForRemoteFilerequest {
+            DataCommand::CancelFilesForRemoteFilerequest {
                 target_filerequest_id,
                 peer_id,
                 sender,
@@ -1120,7 +1287,7 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
                     .in_current_span(),
                 );
             }
-            P2pCommand::UpdateIdentity { contact_id, keys } => {
+            DataCommand::UpdateIdentity { contact_id, keys } => {
                 tokio::spawn(
                     async move {
                         self.update_identity(contact_id, keys).await;
@@ -1128,7 +1295,7 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
                     .in_current_span(),
                 );
             }
-            P2pCommand::UseSelfContactInviteChallenge {
+            DataCommand::UseSelfContactInviteChallenge {
                 invite_code,
                 peer_id,
             } => {
@@ -1144,7 +1311,7 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
                     error!("Invalid peer ID provided for self contact invite: {peer_id}");
                 }
             }
-            P2pCommand::UseContactShareChallenge {
+            DataCommand::UseContactShareChallenge {
                 share_code,
                 peer_id,
             } => {
@@ -1160,12 +1327,45 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
                     error!("Invalid peer ID provided for contact share: {peer_id}");
                 }
             }
-            P2pCommand::ApplySettings {
-                settings: _,
-                sender,
+            DataCommand::SendSyncMessage { peer_id, wire } => {
+                debug!(kind = wire.doc_kind(), sync_id = %wire.sync_id(), "Sending sync request to owned device {peer_id}");
+                if let Ok(peer_id) = peer_id.parse() {
+                    tokio::spawn(
+                        async move {
+                            let contact_id = self.session_manager.self_contact_id().await;
+                            let _ = self.send_request(peer_id, Some(contact_id), wire).await;
+                        }
+                        .in_current_span(),
+                    );
+                } else {
+                    error!("Invalid peer ID provided for sync: {peer_id}");
+                }
+            }
+            DataCommand::FetchContactKeys {
+                peer_id,
+                contact_ids,
             } => {
-                // Base p2p crate does not interpret settings. No-op.
-                let _ = sender.send(Ok(()));
+                debug!(
+                    "Fetching public keys for {} contacts from {peer_id}",
+                    contact_ids.len()
+                );
+                if let Ok(peer_id) = peer_id.parse() {
+                    tokio::spawn(
+                        async move {
+                            let self_contact_id = self.session_manager.self_contact_id().await;
+                            let _ = self
+                                .send_request(
+                                    peer_id,
+                                    Some(self_contact_id),
+                                    PubkeyFetchRequest { contact_ids },
+                                )
+                                .await;
+                        }
+                        .in_current_span(),
+                    );
+                } else {
+                    error!("Invalid peer ID provided for pubkey fetch: {peer_id}");
+                }
             }
         }
     }

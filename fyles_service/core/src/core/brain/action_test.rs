@@ -1,5 +1,5 @@
 #[cfg(any(test, feature = "test-support"))]
-use crate::core::brain::{types::BrainRequest, ActionInterceptor};
+use crate::core::brain::{ActionInterceptor, types::BrainRequest};
 
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]

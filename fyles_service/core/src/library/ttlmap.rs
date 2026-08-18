@@ -21,13 +21,9 @@ where
 
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         self.map.vacuum_if_needed();
-        self.map.insert(key, value, self.ttl).and_then(|it| {
-            if it.expired() {
-                None
-            } else {
-                Some(it.value())
-            }
-        })
+        self.map
+            .insert(key, value, self.ttl)
+            .and_then(|it| if it.expired() { None } else { Some(it.value()) })
     }
 
     pub fn get(&self, key: &K) -> Option<&V> {

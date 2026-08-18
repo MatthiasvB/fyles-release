@@ -9,8 +9,8 @@ use crate::send_receive_traits::session::Session;
 use async_trait::async_trait;
 use crypto::{Encrypt, Encrypted};
 use fyles_core::core::domain_models::ContactId;
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::error;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -180,7 +180,6 @@ where
             NodeId = NodeId,
         >,
     DecryptError: error::Error + Send + Sync + 'static,
-    // TransportError: error::Error + Send + Sync + 'static,
     EncryptError: error::Error + Send + Sync + 'static,
     GetSessionError: error::Error + Send + Sync + 'static,
     T: Send + Sync,
@@ -411,7 +410,9 @@ where
                             ?local_error,
                             "Resending idempotent request after local error"
                         );
-                        warn!("Perhaps we should check the retry count here. If this ever appears in a \"loop\", check this code section again");
+                        warn!(
+                            "Perhaps we should check the retry count here. If this ever appears in a \"loop\", check this code section again"
+                        );
                         match self
                             .send_internal(
                                 node_id.clone(),
@@ -464,7 +465,8 @@ where
                 Ok(decrypted) => decrypted,
             };
 
-            self.receive_response(node_id, session.get_contact_id(), external_id, decrypted).await;
+            self.receive_response(node_id, session.get_contact_id(), external_id, decrypted)
+                .await;
             return;
         }
         match decrypt_errors.len() {
@@ -508,8 +510,12 @@ trait SessionSendReceiveInternal<R: Encrypt + Clone, Reg: RequestRegistry<R>> {
 }
 
 enum SendInternalConfig<RequestId> {
-    Register { idempotent: bool },
-    Update { old_request_id: RequestId },
+    Register {
+        idempotent: bool,
+    },
+    Update {
+        old_request_id: RequestId,
+    },
     #[allow(dead_code)] // we may need this in the future
     RegisterOnlyId,
 }
@@ -608,9 +614,7 @@ where
                             ?old_request_id,
                             "Could not update request id, generating new one"
                         );
-                        registry
-                            .register_request_id(request_id, node_id)
-                            .await
+                        registry.register_request_id(request_id, node_id).await
                     }
                 }
             }

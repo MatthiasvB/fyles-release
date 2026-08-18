@@ -1,7 +1,7 @@
 use crate::event_loop::{EventLoopSender, InnerEvent, LocalNetworkSwarm};
 use async_trait::async_trait;
 use tokio::sync::oneshot;
-use tracing::{instrument, trace, Span};
+use tracing::{Span, instrument, trace};
 
 pub trait GetInnerEventSender<T: LocalNetworkSwarm> {
     fn get_inner_event_sender(&self) -> &EventLoopSender<T>;

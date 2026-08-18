@@ -11,14 +11,14 @@ use fyles_core::core::domain_models::{
     CompleteReceivedFile, ContactId, CreateIncomingFile, FylesId, ReceiveStatus,
 };
 use fyles_core::core::filerequest_drive_handler::FilerequestDriveHandler;
-use fyles_core::library::util::duration_ext::DurationExt;
 use fyles_core::library::util::epoch::unix_epoch_millis;
 use fyles_core::library::util::part_file::get_part_file_name;
-use libp2p::request_response::InboundRequestId;
 use libp2p::PeerId;
+use libp2p::request_response::InboundRequestId;
 use std::fmt::{Debug, Formatter};
 use tokio::io::AsyncWriteExt;
-use tracing::{debug, error, info, trace, warn, Span};
+use tracing::{Span, debug, error, info, trace, warn};
+use crate::constants::{RECEIVE_IDLE_SLACK, RECEIVE_IDLE_TIMEOUT};
 
 #[derive(Debug)]
 pub struct ReceiveManager {
@@ -42,6 +42,7 @@ enum ReceiverRes {
 }
 
 impl ReceiveManager {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         drive_handler: FilerequestDriveHandler,
         file: tokio::fs::File,
@@ -129,13 +130,27 @@ impl Debug for FilerequestReceiver {
 impl FilerequestReceiver {
     pub fn new(brain_action_sender: tokio::sync::mpsc::Sender<BrainAction>) -> Self {
         Self {
-            receiving_files: IdleExpiryMap::new(30.seconds(), 35.seconds(), |mut expired| {
-                tokio::spawn(async move {
-                    let _ = expired.file.flush().await;
-                });
-            }),
+            receiving_files: IdleExpiryMap::new(
+                RECEIVE_IDLE_TIMEOUT,
+                RECEIVE_IDLE_SLACK,
+                |mut expired| {
+                    tokio::spawn(async move {
+                        let _ = expired.file.flush().await;
+                    });
+                },
+            ),
             brain_action_sender,
         }
+    }
+}
+
+/// `None` once the entry has expired, since `entry()` has already destructed it.
+fn current_file_name<F: FnMut(ReceiveManager)>(
+    entry: &mut IdleEntry<'_, PeerId, ReceiveManager, F>,
+) -> Option<String> {
+    match entry {
+        IdleEntry::Occupied(occupied) => occupied.get().map(|it| it.file_name.clone()),
+        IdleEntry::Vacant(_) => None,
     }
 }
 
@@ -178,8 +193,12 @@ impl FilerequestReceiver {
                     }
                 };
 
-                let part_file_name =
-                    get_part_file_name(started_at_ms, &transfer_uuid.0, &node_id.to_base58(), &contact_id);
+                let part_file_name = get_part_file_name(
+                    started_at_ms,
+                    &transfer_uuid.0,
+                    &node_id.to_base58(),
+                    &contact_id,
+                );
 
                 let file = match drive_handler
                     .get_partial_file_for_writing(&part_file_name)
@@ -199,6 +218,9 @@ impl FilerequestReceiver {
                     contact_id: contact_id.clone(),
                     peer_id: node_id.to_base58(),
                     file_name: file_name.clone(),
+                    // Best estimate until the file lands; overwritten with the real
+                    // on-disk basename on completion.
+                    persisted_as_name: file_name.clone(),
                     file_size_bytes,
                     started_at_ms,
                 });
@@ -223,8 +245,11 @@ impl FilerequestReceiver {
                     contact_id,
                     started_at_ms,
                 );
-                if let Some(before) = entry.insert(receive_manager) {
-                    warn!(peer=?node_id, old_file_name=before.file_name, new_file_name=file_name, "Replaced previous receiving file with new transfer");
+                // Read before replacing: `insert_destruct` destructs the displaced transfer rather
+                // than handing it back, so this is the only chance to name it in the log.
+                let displaced = current_file_name(&mut entry);
+                if entry.insert_destruct(receive_manager) {
+                    warn!(peer=?node_id, old_file_name=?displaced, new_file_name=file_name, "Replaced previous receiving file with new transfer");
                 }
                 FileResponse::AcceptNewTransfer
             }
@@ -271,8 +296,12 @@ impl FilerequestReceiver {
                     return FileResponse::RestartContinueTransfer;
                 };
 
-                let part_file_name =
-                    get_part_file_name(started_at_ms, &transfer_uuid.0, &node_id.to_base58(), &contact_id);
+                let part_file_name = get_part_file_name(
+                    started_at_ms,
+                    &transfer_uuid.0,
+                    &node_id.to_base58(),
+                    &contact_id,
+                );
 
                 let file = match drive_handler
                     .get_partial_file_for_writing(&part_file_name)
@@ -315,8 +344,9 @@ impl FilerequestReceiver {
                 );
                 receive_manager.byte_progress = continue_at;
 
-                if let Some(before) = entry.insert(receive_manager) {
-                    warn!(peer=?node_id, old_file_name=before.file_name, new_file_name=file_name, "Replaced previous receiving file with continued transfer");
+                let displaced = current_file_name(&mut entry);
+                if entry.insert_destruct(receive_manager) {
+                    warn!(peer=?node_id, old_file_name=?displaced, new_file_name=file_name, "Replaced previous receiving file with continued transfer");
                 }
                 info!(?continue_at, "Ready to continue receiving file");
                 FileResponse::AcceptContinueTransfer {
@@ -324,24 +354,25 @@ impl FilerequestReceiver {
                 }
             }
             FileRequest::AbortTransfer { transfer_uuid } => {
-                let Some(receive_manager) = self.receiving_files.remove(&node_id) else {
+                // Checked before removing: an abort naming a transfer we have already moved on from
+                // must leave the current one alone rather than take it down with it.
+                let mut maybe_receiving = self.receiving_files.entry(node_id);
+                if let Some(ref transfer_id) = transfer_uuid {
+                    if let IdleEntry::Occupied(ref mut occupied_idle_entry) = maybe_receiving {
+                        if occupied_idle_entry.get().is_some_and(|it| it.transfer_id != *transfer_id) {
+                            warn!(peer=?node_id, "Peer requested transfer abort with ID that does not match the current transfer");
+                            return FileResponse::ProtocolViolation;
+                        }
+                    }
+                }
+                let Some(receive_manager) = maybe_receiving.remove() else {
                     warn!(peer=?node_id, "Attempted to abort transfer that we don't know");
                     return FileResponse::ProtocolViolation;
                 };
-                let effective_transfer_id = if let Some(transfer_id) = transfer_uuid {
-                    if transfer_id != receive_manager.transfer_id {
-                        warn!(peer=?node_id, "Peer requested transfer abort with ID that does not match the current transfer");
-                        None
-                    } else {
-                        Some(transfer_id)
-                    }
-                } else {
+                if transfer_uuid.is_none() {
                     warn!(peer=?node_id, "Peer request transfer abort without a transfer id. Assuming current transfer");
-                    Some(receive_manager.transfer_id)
-                };
-                let Some(verified_transfer_id) = effective_transfer_id else {
-                    return FileResponse::ProtocolViolation;
-                };
+                }
+                let verified_transfer_id = receive_manager.transfer_id.clone();
                 let part_file_name = get_part_file_name(
                     receive_manager.started_at_ms,
                     &verified_transfer_id.0,
@@ -381,7 +412,7 @@ impl FilerequestReceiver {
 
                 if chunk.transfer_uuid != receive_manager.transfer_id {
                     warn!(peer=?node_id, "Peer sent chunk with transfer id that does not match the current transfer");
-                    self.receiving_files.remove(&node_id);
+                    self.receiving_files.destruct(&node_id);
                     return FileResponse::ProtocolViolation;
                 }
 
@@ -389,7 +420,7 @@ impl FilerequestReceiver {
                     warn!(
                         "Contact ID does not match, is this an attack? Responding with something random"
                     );
-                    self.receiving_files.remove(&node_id);
+                    self.receiving_files.destruct(&node_id);
                     // TODO: Notification
                     return FileResponse::random();
                 }
@@ -410,14 +441,14 @@ impl FilerequestReceiver {
                     }
                     ReceiverRes::ProtocolViolation => {
                         warn!(peer=?node_id, ?request_id, "Protocol violation in received chunk");
-                        self.receiving_files.remove(&node_id);
+                        self.receiving_files.destruct(&node_id);
                         FileResponse::ProtocolViolation
                     }
                     ReceiverRes::IoError => {
                         warn!(peer=?node_id, "I/O error");
                         let transfer_id = receive_manager.transfer_id.clone();
                         let progress = receive_manager.byte_progress;
-                        self.receiving_files.remove(&node_id);
+                        self.receiving_files.destruct(&node_id);
                         let _ = self
                             .brain_action_sender
                             .send(BrainAction::NetworkNode(
@@ -464,16 +495,17 @@ impl FilerequestReceiver {
                     &contact_id,
                 );
 
-                match receive_manager_real
+                let response = match receive_manager_real
                     .drive_handler
                     .finalize_partial_file(&part_file_name, &receive_manager_real.file_name)
                     .await
                 {
-                    Ok(path) => {
+                    Ok(persisted_as_name) => {
                         let (request, response) =
                             BrainRequest::with_receiver(CompleteReceivedFile {
                                 transfer_id: receive_manager_real.transfer_id.clone(),
-                                file_path: path,
+                                file_path: persisted_as_name.clone(),
+                                persisted_as_name,
                                 received_at_ms: match unix_epoch_millis() {
                                     Ok(ms) => ms,
                                     Err(e) => {
@@ -501,11 +533,24 @@ impl FilerequestReceiver {
                         // TODO: Look at the error in detail. It may be that retrying makes no sense, for example when the filename doesn't sanitize
                         FileResponse::InternalError
                     }
+                };
+                if matches!(response, FileResponse::ConfirmDone) {
+                    receive_manager.destruct();
                 }
+                response
             }
             FileRequest::ProtocolViolation { transfer_uuid } => {
                 warn!(peer=?node_id, transfer_id=?transfer_uuid, state=?self.receiving_files, "Peer reported protocol error on our side");
-                self.receiving_files.remove(&node_id);
+                let mut maybe_receiving = self.receiving_files.entry(node_id);
+                let names_another = match (&transfer_uuid, &mut maybe_receiving) {
+                    (Some(transfer_id), IdleEntry::Occupied(occupied)) => occupied
+                        .get()
+                        .is_some_and(|it| it.transfer_id != *transfer_id),
+                    _ => false,
+                };
+                if !names_another {
+                    maybe_receiving.destruct();
+                }
                 FileResponse::AcknowledgeProtocolViolation
             }
         }

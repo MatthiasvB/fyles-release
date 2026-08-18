@@ -5,8 +5,8 @@ use crate::{
         brain::types::{ContactShareChallenge, SelfContactInviteChallenge},
         domain_models::{
             Contact, ContactId, CreateFilerequest, CreatePendingFiles, CreateRemoteFilerequest,
-            DisplayContact, Filerequest, FylesId, PeerIdWrapper, PendingFile, ReceivedFile,
-            RemoteFilerequest, SelfContact,
+            DisplayContact, Filerequest, FilerequestLocation, FylesId, PeerIdWrapper, PendingFile,
+            ReceivedFile, RemoteFilerequest, SelfContactInvite,
         },
         p2p::NodeStatusInfo,
     },
@@ -15,6 +15,7 @@ use crate::{
 
 use super::types::{BrainRequest, CreationResult, FilerequestResult};
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum ClientAction {
     WaitForReady(BrainRequest<(), bool>),
@@ -30,7 +31,7 @@ pub enum ClientAction {
     GetContactName(BrainRequest<ContactId, FilerequestResult<String>>),
     GetContactNames(BrainRequest<Vec<ContactId>, FilerequestResult<HashMap<ContactId, String>>>),
     GetContact(BrainRequest<ContactId, FilerequestResult<Contact>>),
-    GetFullSelfContact(BrainRequest<(), FilerequestResult<SelfContact>>),
+    GetFullSelfContact(BrainRequest<(), FilerequestResult<SelfContactInvite>>),
     ListContacts(BrainRequest<(), FilerequestResult<Vec<DisplayContact>>>),
     // CreateContact(BrainRequest<CreateContact, FilerequestResult<Contact>>),
     UpdateContact(BrainRequest<DisplayContact, FilerequestResult<()>>),
@@ -38,6 +39,7 @@ pub enum ClientAction {
 
     // System operations
     Shutdown(BrainRequest<(), FilerequestResult<bool>>),
+    ClientHeartbeat { foreground: bool },
 
     // P2P operations
     GetNodeStatus(BrainRequest<(), FilerequestResult<NodeStatusInfo>>),
@@ -64,8 +66,14 @@ pub enum ClientAction {
     ListReceivedFilesForRequest(BrainRequest<FylesId, FilerequestResult<Vec<ReceivedFile>>>),
     DeleteReceivedFile(BrainRequest<FylesId, FilerequestResult<()>>),
 
+    /// Resolve a (local) filerequest's on-disk folder for opening files/folders
+    /// in the UI. Returns a [`FilerequestLocation`] — an absolute path on hosts
+    /// with a directly-accessible filesystem (desktop), else a path relative to
+    /// the drop root on scoped-storage hosts (Android/iOS).
+    ResolveFilerequestLocation(BrainRequest<FylesId, FilerequestResult<FilerequestLocation>>),
+
     UpdateSelfContactName(BrainRequest<String, FilerequestResult<()>>),
-    UpdateIdentity(BrainRequest<SelfContact, FilerequestResult<()>>),
+    UpdateIdentity(BrainRequest<SelfContactInvite, FilerequestResult<()>>),
     GetSelfContactDisplay(BrainRequest<(), FilerequestResult<DisplayContact>>),
     SharePublicSelfContact(BrainRequest<(), FilerequestResult<Contact>>),
     RegisterContact(BrainRequest<Contact, FilerequestResult<()>>),
@@ -78,9 +86,13 @@ pub enum ClientAction {
     UnregisterContactShareChallenge(BrainRequest<ContactShareChallenge, ()>),
     UseContactShareChallenge(BrainRequest<(ContactShareChallenge, PeerIdWrapper), ()>),
 
+    RenameThisDevice(BrainRequest<String, FilerequestResult<()>>),
+    RemoveOwnedDevice(BrainRequest<PeerIdWrapper, FilerequestResult<()>>),
+    ListOwnedDevices(BrainRequest<(), FilerequestResult<Vec<(PeerIdWrapper, String)>>>),
+
     BackupData(BrainRequest<(), FilerequestResult<()>>),
     RestoreData(BrainRequest<Uri, FilerequestResult<()>>),
 
-    UpdateSettings(BrainRequest<Vec<u8>, FilerequestResult<()>>),
-    GetSettings(BrainRequest<(), FilerequestResult<Vec<u8>>>),
+    /// Opaque settings request/response relay.
+    Settings(BrainRequest<Vec<u8>, FilerequestResult<Vec<u8>>>),
 }

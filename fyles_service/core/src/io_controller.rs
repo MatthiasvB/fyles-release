@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use derive_more::{AsRef, Deref, DerefMut, Display, From};
 use tokio::fs::File;
 
-use crate::core::{domain_models::FylesId, notification::Notification};
+use crate::core::notification::Notification;
 
 #[derive(Debug, Display, Clone, Deref, DerefMut, From, AsRef)]
 pub struct Uri(pub String);
@@ -13,21 +13,10 @@ pub type CorrelationId = u64;
 pub type FileReadRequester = fn(CorrelationId, Uri) -> Result<(), ()>;
 pub type FileWriteRequester = fn(CorrelationId, OutDirSubPath) -> Result<(), ()>;
 
-pub trait CoreHandler
-where
-    Self: Sized,
-{
-    fn run(
-        file_read_requester: FileReadRequester,
-        file_write_requester: FileWriteRequester,
-        // args: Config,
-    ) -> Self;
 
-    fn share_file(&self, uri: Uri, filerequest_id: FylesId) -> Result<(), ()>;
-}
 
 #[derive(Debug)]
-pub enum FileNamespace {
+pub enum FileNamespace { 
     Namespace {
         namespace: String,
         child: Option<Box<FileNamespace>>,
@@ -51,6 +40,37 @@ impl From<FileNamespace> for PathBuf {
 }
 
 pub type BoxedError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// Filename of the hidden ownership marker written into each filerequest
+/// directory. It pins the directory to exactly one filerequest so files from two
+/// requests can never be mixed. Written by a dedicated primitive (not the normal
+/// file-write path), so it is exempt from the `.`-prefix rejection that applies
+/// to user-provided filenames.
+pub const OWNER_MARKER_FILENAME: &str = ".fyles-owner";
+
+/// Outcome of a directory rename. A directory rename refuses to overwrite an
+/// existing target (so files from two requests can never be merged); the
+/// `DestinationOccupied` variant reports that refusal atomically — the same way
+/// creation reports a folder collision via [`OwnershipOutcome::Conflict`] — so
+/// the caller can surface a clean, localizable error.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenameOutcome {
+    /// The rename completed.
+    Renamed,
+    /// The destination directory already exists; refused to avoid mixing files.
+    DestinationOccupied,
+}
+
+/// Outcome of claiming/verifying a filerequest directory's `.fyles-owner` marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnershipOutcome {
+    /// The directory already carried our marker. No-op.
+    Owned,
+    /// The directory had no marker; we wrote ours (created or adopted).
+    Adopted,
+    /// The directory is owned by a different filerequest. Caller must refuse.
+    Conflict { other_id: String },
+}
 
 pub struct FileMeta {
     pub file: tokio::fs::File,
@@ -79,14 +99,39 @@ pub trait HostController: Send + Sync + 'static {
 
     async fn remove_file(&self, uri: FileNamespace) -> Result<(), BoxedError>;
 
-    /// Will typically create a directory
-    async fn create_filerequest_resource(&self, name: FileNamespace) -> Result<(), BoxedError>;
+    /// Create the filerequest directory `dir` if it is missing and ensure it
+    /// carries an ownership marker (`.fyles-owner`) for `owner_id`. This is the
+    /// single atomic "create + claim" operation for a request directory:
+    /// - no marker present  → write ours and return `Adopted`
+    /// - marker == owner_id → return `Owned`
+    /// - marker != owner_id → return `Conflict { other_id }` (caller must refuse),
+    ///   unless `force` is set, in which case the marker is overwritten with ours
+    ///   and `Adopted` is returned (used to reclaim a directory whose marker
+    ///   points at a filerequest that no longer exists).
+    ///
+    /// The marker is hidden where the platform supports it. Must be idempotent.
+    async fn ensure_exists_and_is_owned(
+        &self,
+        dir: FileNamespace,
+        owner_id: &str,
+        force: bool,
+    ) -> Result<OwnershipOutcome, BoxedError>;
 
+    /// Recursively remove a filerequest directory (marker and all received
+    /// files). Used when a filerequest is deleted so its name is fully released.
+    async fn remove_filerequest_resource(&self, dir: FileNamespace) -> Result<(), BoxedError>;
+
+    /// Rename `from` to `to`. For file renames the target is deduplicated and the
+    /// result is always [`RenameOutcome::Renamed`]. For a directory rename the
+    /// target must not already exist (overwriting could mix files from two
+    /// requests); when it does, the rename is refused and
+    /// [`RenameOutcome::DestinationOccupied`] is returned instead of an error so
+    /// the caller can map it to a clean collision message.
     async fn rename_resource(
         &self,
         from: FileNamespace,
         to: FileNamespace,
-    ) -> Result<(), BoxedError>;
+    ) -> Result<RenameOutcome, BoxedError>;
 
     /// Get a location where a Backup of a single file (likely Sqlite) can be dropped.
     /// If the file already exists, it will be overwritten
@@ -100,18 +145,37 @@ pub trait HostController: Send + Sync + 'static {
     async fn list_temporary_outgoing_files(&self) -> Result<Vec<OutgoingFileInfo>, BoxedError>;
 
     /// Get a file for writing a partial transfer in a dedicated "Partial" directory.
-    async fn get_partial_file_for_writing(&self, filename: &str) -> Result<tokio::fs::File, BoxedError>;
+    async fn get_partial_file_for_writing(
+        &self,
+        filename: &str,
+    ) -> Result<tokio::fs::File, BoxedError>;
 
     /// Remove a partial file from the "Partial" directory.
     async fn remove_partial_file(&self, filename: &str) -> Result<(), BoxedError>;
 
-    /// Rename a partial file to its final destination resource.
-    async fn finalize_partial_file(&self, partial_filename: &str, final_namespace: FileNamespace) -> Result<(), BoxedError>;
+    /// Rename a partial file to its final destination resource. The target is
+    /// deduplicated, so the actual on-disk name may differ from the requested
+    /// one; the returned `String` is the final on-disk **basename** (not a path).
+    async fn finalize_partial_file(
+        &self,
+        partial_filename: &str,
+        final_namespace: FileNamespace,
+    ) -> Result<String, BoxedError>;
 
     /// List all partial files in the "Partial" directory.
     async fn list_partial_files(&self) -> Result<Vec<String>, BoxedError>;
 
     fn send_notification(&self, notification: Notification) -> ();
+
+    /// Absolute filesystem path of the drop directory (the root under which
+    /// filerequest folders live), if this host is backed by a directly
+    /// accessible filesystem. Desktop returns the real path so the UI can open
+    /// files without knowing where the daemon was pointed; hosts that use
+    /// scoped/opaque storage (Android SAF, iOS sandbox) return `None`, and the
+    /// client resolves the location itself. Default: `None`.
+    fn drop_dir_absolute_path(&self) -> Option<String> {
+        None
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -123,7 +187,10 @@ pub mod test {
 
     use crate::{
         core::notification::Notification,
-        io_controller::{BoxedError, FileMeta, FileNamespace, HostController, OutgoingFileInfo, Uri},
+        io_controller::{
+            BoxedError, FileMeta, FileNamespace, HostController, OWNER_MARKER_FILENAME,
+            OutgoingFileInfo, OwnershipOutcome, RenameOutcome, Uri,
+        },
         library::util::error_handling::AutoMapError,
     };
 
@@ -250,28 +317,58 @@ pub mod test {
                 .map_err(|e| Box::new(e) as BoxedError)
         }
 
-        async fn create_filerequest_resource(
-            &self,
-            resource: FileNamespace,
-        ) -> Result<(), BoxedError> {
-            let res_path = Self::resolve_namespace_path(&self.base_path(), &resource);
-            Self::ensure_parent_dir(&self.base_path()).await?;
-            fs::create_dir_all(res_path)
-                .await
-                .map_err(|e| Box::new(e) as BoxedError)
-        }
-
         async fn rename_resource(
             &self,
             from: FileNamespace,
             to: FileNamespace,
-        ) -> Result<(), BoxedError> {
+        ) -> Result<RenameOutcome, BoxedError> {
+            let is_dir_rename = matches!(&from, FileNamespace::Namespace { child: None, .. });
             let from_p = Self::resolve_namespace_path(self.base_path(), &from);
             let to_p = Self::resolve_namespace_path(self.base_path(), &to);
+            // A directory rename refuses to overwrite an existing target.
+            if is_dir_rename && to_p.exists() {
+                return Ok(RenameOutcome::DestinationOccupied);
+            }
             Self::ensure_parent_dir(&to_p).await?;
             fs::rename(from_p, to_p)
                 .await
+                .map(|()| RenameOutcome::Renamed)
                 .map_err(|e| Box::new(e) as BoxedError)
+        }
+
+        async fn ensure_exists_and_is_owned(
+            &self,
+            dir: FileNamespace,
+            owner_id: &str,
+            force: bool,
+        ) -> Result<OwnershipOutcome, BoxedError> {
+            let dir_p = Self::resolve_namespace_path(self.base_path(), &dir);
+            fs::create_dir_all(&dir_p)
+                .await
+                .map_err(|e| Box::new(e) as BoxedError)?;
+            let marker = dir_p.join(OWNER_MARKER_FILENAME);
+            match fs::read_to_string(&marker).await {
+                Ok(existing) if existing.trim() == owner_id => Ok(OwnershipOutcome::Owned),
+                Ok(existing) if !force => Ok(OwnershipOutcome::Conflict {
+                    other_id: existing.trim().to_string(),
+                }),
+                _ => {
+                    fs::write(&marker, owner_id)
+                        .await
+                        .map_err(|e| Box::new(e) as BoxedError)?;
+                    Ok(OwnershipOutcome::Adopted)
+                }
+            }
+        }
+
+        async fn remove_filerequest_resource(&self, dir: FileNamespace) -> Result<(), BoxedError> {
+            let dir_p = Self::resolve_namespace_path(self.base_path(), &dir);
+            if dir_p.exists() {
+                fs::remove_dir_all(&dir_p)
+                    .await
+                    .map_err(|e| Box::new(e) as BoxedError)?;
+            }
+            Ok(())
         }
 
         async fn get_path_to_db_backup_file(&self) -> Result<std::fs::File, BoxedError> {
@@ -293,7 +390,10 @@ pub mod test {
             Ok(vec![])
         }
 
-        async fn get_partial_file_for_writing(&self, filename: &str) -> Result<tokio::fs::File, BoxedError> {
+        async fn get_partial_file_for_writing(
+            &self,
+            filename: &str,
+        ) -> Result<tokio::fs::File, BoxedError> {
             let p = self.base_path().join("Partial").join(filename);
             Self::ensure_parent_dir(&p).await?;
             let f = tokio::fs::OpenOptions::new()
@@ -308,16 +408,30 @@ pub mod test {
         async fn remove_partial_file(&self, filename: &str) -> Result<(), BoxedError> {
             let p = self.base_path().join("Partial").join(filename);
             if p.exists() {
-                fs::remove_file(p).await.map_err(|e| Box::new(e) as BoxedError)?;
+                fs::remove_file(p)
+                    .await
+                    .map_err(|e| Box::new(e) as BoxedError)?;
             }
             Ok(())
         }
 
-        async fn finalize_partial_file(&self, partial_filename: &str, final_namespace: FileNamespace) -> Result<(), BoxedError> {
+        async fn finalize_partial_file(
+            &self,
+            partial_filename: &str,
+            final_namespace: FileNamespace,
+        ) -> Result<String, BoxedError> {
             let from_p = self.base_path().join("Partial").join(partial_filename);
             let to_p = Self::resolve_namespace_path(self.base_path(), &final_namespace);
             Self::ensure_parent_dir(&to_p).await?;
-            fs::rename(from_p, to_p).await.map_err(|e| Box::new(e) as BoxedError)
+            let final_name = to_p
+                .file_name()
+                .ok_or_else(|| -> BoxedError { "Invalid path: no filename".into() })?
+                .to_string_lossy()
+                .into_owned();
+            fs::rename(from_p, to_p)
+                .await
+                .map(|()| final_name)
+                .map_err(|e| Box::new(e) as BoxedError)
         }
 
         async fn list_partial_files(&self) -> Result<Vec<String>, BoxedError> {

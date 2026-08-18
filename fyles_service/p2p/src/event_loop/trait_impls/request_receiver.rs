@@ -4,11 +4,15 @@ use crate::send_receive_traits::request_receiver::RequestReceiver;
 use crate::types::{FileRequest, FileResponse};
 use async_trait::async_trait;
 use fyles_core::core::brain::action::BrainAction;
-use fyles_core::core::brain::action_p2p::NetworkNodeAction;
+use fyles_core::core::brain::action_p2p::{
+    NetworkNodeAction, PubkeyFetchReceiveRequest, SyncReceiveRequest,
+};
 use fyles_core::core::brain::types::{
-    BrainRequest, ContactShareChallenge, SelfContactInviteChallenge,
+    BrainRequest, ContactShareChallenge, FetchedContactKeys, PubkeyFetchRequest,
+    PubkeyFetchResponse, SelfContactInviteChallenge,
 };
 use fyles_core::core::domain_models::{Contact, ContactId, SelfContact};
+use fyles_core::core::sync::{SyncRequest, SyncResponse};
 use fyles_core::library::util::util::TimeoutLock;
 use libp2p::PeerId;
 use libp2p::request_response::InboundRequestId;
@@ -72,7 +76,7 @@ impl<T: FileTracker, S: LocalNetworkSwarm> RequestReceiver<ContactShareChallenge
         _node_id: Self::NodeId,
         _contact_id: Option<Self::ContactId>,
         request: ContactShareChallenge,
-        _request_id: Self::InboundRequestId
+        _request_id: Self::InboundRequestId,
     ) -> Option<Contact> {
         let (request, response) = BrainRequest::with_receiver(request);
         self.brain_action_sender
@@ -83,6 +87,83 @@ impl<T: FileTracker, S: LocalNetworkSwarm> RequestReceiver<ContactShareChallenge
             .expect("Sending to work");
 
         response.await.expect("Receiving to work")
+    }
+}
+
+#[async_trait]
+impl<T: FileTracker, S: LocalNetworkSwarm> RequestReceiver<SyncRequest, SyncResponse>
+    for RefCountEventLoopData<T, S>
+{
+    type NodeId = PeerId;
+    type ContactId = ContactId;
+    type InboundRequestId = InboundRequestId;
+
+    async fn respond_to(
+        &self,
+        node_id: Self::NodeId,
+        contact_id: Option<Self::ContactId>,
+        request: SyncRequest,
+        _request_id: Self::InboundRequestId,
+    ) -> Option<SyncResponse> {
+        // Only forward when the session is authenticated (carries some contact id); the
+        // brain then verifies that id is ours before merging.
+        let Some(contact_id) = contact_id else {
+            warn!(peer=?node_id, "Declining sync from unauthenticated peer");
+            return None;
+        };
+        let (brain_request, response) = BrainRequest::with_receiver(SyncReceiveRequest {
+            contact_id,
+            peer: node_id.to_string().into(),
+            wire: request,
+        });
+        self.brain_action_sender
+            .send(BrainAction::NetworkNode(NetworkNodeAction::SyncReceive(
+                brain_request,
+            )))
+            .await
+            .expect("Sending to work");
+        response.await.expect("Receiving to work")
+    }
+}
+
+#[async_trait]
+impl<T: FileTracker, S: LocalNetworkSwarm> RequestReceiver<PubkeyFetchRequest, PubkeyFetchResponse>
+    for RefCountEventLoopData<T, S>
+{
+    type NodeId = PeerId;
+    type ContactId = ContactId;
+    type InboundRequestId = InboundRequestId;
+
+    async fn respond_to(
+        &self,
+        node_id: Self::NodeId,
+        contact_id: Option<Self::ContactId>,
+        request: PubkeyFetchRequest,
+        _request_id: Self::InboundRequestId,
+    ) -> Option<PubkeyFetchResponse> {
+        // Only forward when the session is authenticated (carries some contact id); the brain
+        // then verifies that id is our own before serving any keys.
+        let Some(contact_id) = contact_id else {
+            warn!(peer=?node_id, "Declining pubkey fetch from unauthenticated peer");
+            return None;
+        };
+        let (brain_request, response) = BrainRequest::with_receiver(PubkeyFetchReceiveRequest {
+            contact_id,
+            wanted_contact_ids: request.contact_ids,
+        });
+        self.brain_action_sender
+            .send(BrainAction::NetworkNode(
+                NetworkNodeAction::GetContactsPublicKeys(brain_request),
+            ))
+            .await
+            .expect("Sending to work");
+        let found = response.await.expect("Receiving to work")?;
+        Some(PubkeyFetchResponse {
+            keys: found
+                .into_iter()
+                .map(|(contact_id, keys)| FetchedContactKeys { contact_id, keys })
+                .collect(),
+        })
     }
 }
 
@@ -99,7 +180,7 @@ impl<T: FileTracker, S: LocalNetworkSwarm> RequestReceiver<FileRequest, FileResp
         node_id: Self::NodeId,
         contact_id: Option<Self::ContactId>,
         request: FileRequest,
-        request_id: InboundRequestId
+        request_id: InboundRequestId,
     ) -> Option<FileResponse> {
         debug!(peer=?node_id, ?request, ?request_id, "Got filerequest request");
         let response = self

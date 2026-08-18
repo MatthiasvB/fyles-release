@@ -3,28 +3,30 @@
     windows_subsystem = "windows"
 )]
 
+use ::tracing::info;
+use tokio_util::sync::CancellationToken;
 use clap::Parser;
 use libp2p::identity::Keypair;
 #[cfg(feature = "otel-jaeger")]
 use std::time::UNIX_EPOCH;
 use std::{path::PathBuf, sync::Arc, time::SystemTime};
-use tokio::sync::mpsc;
-use ::tracing::info;
+use tokio::sync::{RwLock, mpsc};
 
+use fyles_core::library::sqlite::SqlitePath;
 use fyles_core::{
+    Endpoint,
     core::{
         api_server::ApiServer,
         brain::{BrainApiServer, BrainDb, BrainNetwork},
     },
     entrypoint,
     library::sqlite::{Sqlite, SqliteConfig},
-    Endpoint,
 };
-use p2p::{event_loop::LocalEventLoop, types::Config, P2pClient};
+use p2p::{P2pClient, event_loop::LocalEventLoop, types::Config};
 
 use direct_host_utils::{
     direct_fs_controller::DirectFsController,
-    tracing::{init_tracing, TracingConfig},
+    tracing::{TracingConfig, init_tracing},
 };
 
 struct DaemonConfig {
@@ -72,6 +74,7 @@ fn main() {
     let endpoint = Endpoint::parse(&config.config.endpoint).unwrap();
 
     let (brain_sender, brain_receiver) = mpsc::channel(16);
+    let shutdown = CancellationToken::new();
     let brain_sender_clone = brain_sender.clone();
     let (client_sender, client_receiver) = mpsc::channel(8);
 
@@ -79,9 +82,9 @@ fn main() {
     entrypoint(
         config.config.internal_data_dir.clone(),
         async || {
-            Arc::new(Sqlite::with_config(SqliteConfig {
-                path: db_path.clone(),
-            })) as BrainDb
+            Sqlite::spawn(SqliteConfig {
+                path: SqlitePath::File(db_path.clone()),
+            }) as BrainDb
         },
         async || {
             DirectFsController::new(output_dir.clone())
@@ -90,16 +93,17 @@ fn main() {
                 .dynamic()
         },
         async || {
-            Arc::new(
+            Arc::new(RwLock::new(
                 P2pClient::new(
                     brain_sender.clone(),
+                    shutdown.clone(),
                     Arc::new(move |keypair: Keypair, _config: &[u8]| {
                         LocalEventLoop::swarm_factory(keypair)
                     }),
                 )
                 .await
                 .expect("Creating P2p Client to work"),
-            ) as BrainNetwork
+            )) as BrainNetwork
         },
         async || {
             Box::new(ApiServer::new(
@@ -112,10 +116,12 @@ fn main() {
                     .expect("DB dir to have a parent that can be used as internal data dir")
                     .into(),
                 client_receiver,
+                shutdown.clone(),
             )) as BrainApiServer
         },
         brain_receiver,
         client_sender,
+        shutdown.clone(),
     );
 }
 
@@ -185,7 +191,12 @@ Forms:
     )]
     endpoint: String,
 
-    /// Directory for storing received files
+    /// Directory for storing received files (the "drop dir"). This is the sole
+    /// source of truth for where files land on desktop: it is chosen here at
+    /// launch, held in memory by the DirectFsController, and surfaced to the UI
+    /// via `HostController::drop_dir_absolute_path()` — it is never stored in the
+    /// database. (On mobile the equivalent is the platform's scoped storage:
+    /// Android's persisted SAF tree, iOS's Documents/Drop.)
     #[clap(short = 'o', long, default_value = ".", env = "OUTPUT_DIR")]
     output_dir: String,
 

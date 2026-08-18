@@ -10,7 +10,7 @@ use std::{
 use tokio::{select, sync::Mutex};
 use tokio_stream::{StreamExt, StreamMap};
 use tonic::{Status, Streaming};
-use tracing::{error, span, trace, Instrument};
+use tracing::{Instrument, error, span, trace};
 use uuid::Uuid;
 use zip_clone::ZipClone;
 
@@ -23,6 +23,7 @@ pub struct StreamRegistryInner<S: Clone, C> {
     stream_cmd_sender: tokio::sync::mpsc::Sender<StreamCommand<C>>,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum StreamCommand<C> {
     Add(StreamId, Streaming<C>),
     Remove(StreamId),

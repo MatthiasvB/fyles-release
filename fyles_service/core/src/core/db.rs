@@ -1,7 +1,9 @@
 use crate::core::brain::action_p2p::NodeInfo;
 use crate::core::domain_models::{ContactId, DisplayContact};
+use crate::core::p2p::NodeKeyPairBinary;
+use crate::core::sync::{DocKind, LocalDocWrite};
 use async_trait::async_trait;
-use crypto::ContactPublicKeys;
+use crypto::{ContactKeys, ContactPublicKeys};
 use derive_more::Display;
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
@@ -22,11 +24,17 @@ pub mod test;
 
 #[async_trait]
 pub trait FilerequestDb: Send + Sync {
-    async fn run(&self);
     // Filerequest operations
     async fn get_filerequest(&self, id: &FylesId) -> DatabaseResult<Filerequest>;
     async fn get_filerequests(&self) -> DatabaseResult<Vec<Filerequest>>;
-    async fn create_filerequest(&self, filerequest: &CreateFilerequest) -> DatabaseResult<FylesId>;
+    /// Persist a new filerequest under a caller-supplied id. The id is generated
+    /// (and its directory claimed) before this call so there is nothing to roll
+    /// back if persistence fails.
+    async fn create_filerequest(
+        &self,
+        id: &FylesId,
+        filerequest: &CreateFilerequest,
+    ) -> DatabaseResult<()>;
     async fn update_filerequest(&self, filerequest: &Filerequest) -> DatabaseResult<()>;
     async fn delete_filerequest(&self, id: &FylesId) -> DatabaseResult<()>;
 
@@ -38,15 +46,29 @@ pub trait FilerequestDb: Send + Sync {
     ) -> DatabaseResult<HashMap<ContactId, String>>;
     async fn get_contact(&self, id: &ContactId) -> DatabaseResult<Contact>;
     async fn get_contacts(&self) -> DatabaseResult<Vec<DisplayContact>>;
-    async fn update_contact(&self, contact: &DisplayContact) -> DatabaseResult<()>;
-    async fn delete_contact(&self, id: &ContactId) -> DatabaseResult<()>;
+    async fn update_contact(&self, contact: &DisplayContact) -> DatabaseResult<LocalDocWrite>;
+    async fn delete_contact(&self, id: &ContactId) -> DatabaseResult<LocalDocWrite>;
     async fn get_contact_public_keys(
         &self,
         contact_id: ContactId,
     ) -> DatabaseResult<Option<ContactPublicKeys>>;
+    /// Contact ids present in the synced contacts document but with no keys cached locally.
+    async fn keyless_synced_contacts(&self) -> DatabaseResult<Vec<ContactId>>;
+    /// Public keys for the requested contacts, for those we hold (others omitted).
+    async fn get_contacts_public_keys(
+        &self,
+        contact_ids: Vec<ContactId>,
+    ) -> DatabaseResult<Vec<(ContactId, ContactPublicKeys)>>;
     // Node key operations
     async fn store_node_keys(&self, keys: NodeInfo) -> DatabaseResult<()>;
     async fn get_node_keys(&self) -> DatabaseResult<NodeInfo>;
+    /// Reads the libp2p keypair and self contact id, without the signing keys.
+    async fn get_node_and_self_contact_id(&self) -> DatabaseResult<(NodeKeyPairBinary, ContactId)>;
+    /// Reads only the self contact id (cheaper than the keypair variant above).
+    async fn get_self_contact_id(&self) -> DatabaseResult<ContactId>;
+    /// Persists the signing keys into the existing self_contact row, leaving the
+    /// contact id, name and node_keys untouched.
+    async fn store_signing_keys(&self, keys: ContactKeys) -> DatabaseResult<()>;
 
     // Remote filerequest operations
     async fn get_remote_filerequest(&self, id: &FylesId) -> DatabaseResult<RemoteFilerequest>;
@@ -58,9 +80,13 @@ pub trait FilerequestDb: Send + Sync {
     async fn create_remote_filerequest(
         &self,
         remote_fr: &CreateRemoteFilerequest,
-    ) -> DatabaseResult<FylesId>;
-    async fn delete_remote_filerequest(&self, id: &FylesId) -> DatabaseResult<()>;
-    async fn update_remote_filerequest(&self, id: FylesId, name: String) -> DatabaseResult<()>;
+    ) -> DatabaseResult<(FylesId, LocalDocWrite)>;
+    async fn delete_remote_filerequest(&self, id: &FylesId) -> DatabaseResult<LocalDocWrite>;
+    async fn update_remote_filerequest(
+        &self,
+        id: FylesId,
+        name: String,
+    ) -> DatabaseResult<LocalDocWrite>;
 
     // Pending file operations
     async fn get_pending_file(&self, id: &FylesId) -> DatabaseResult<PendingFile>;
@@ -73,7 +99,7 @@ pub trait FilerequestDb: Send + Sync {
         &self,
         pending_files: &CreatePendingFiles,
     ) -> DatabaseResult<Vec<FylesId>>;
-    
+
     /// Returns the ID of the filerequest this file belongs to
     async fn handle_update_pending_file_status(
         &self,
@@ -81,13 +107,12 @@ pub trait FilerequestDb: Send + Sync {
         status: &SendStatus,
         retry_count: Option<usize>,
     ) -> DatabaseResult<FylesId>;
-    async fn add_interruption_reason(
-        &self,
-        id: &FylesId,
-        reason: String,
-    ) -> DatabaseResult<()>;
+    async fn add_interruption_reason(&self, id: &FylesId, reason: String) -> DatabaseResult<()>;
     async fn delete_pending_file(&self, id: &FylesId) -> DatabaseResult<()>;
-    async fn count_non_terminal_pending_files_for_path(&self, pending_file_id: &FylesId) -> DatabaseResult<usize>;
+    async fn count_non_terminal_pending_files_for_path(
+        &self,
+        pending_file_id: &FylesId,
+    ) -> DatabaseResult<usize>;
 
     // Received-file operations (covers both in-progress and completed)
     async fn create_incoming_file(&self, incoming: &CreateIncomingFile) -> DatabaseResult<FylesId>;
@@ -110,7 +135,10 @@ pub trait FilerequestDb: Send + Sync {
         filerequest_id: &FylesId,
     ) -> DatabaseResult<Vec<ReceivedFile>>;
     async fn delete_received_file(&self, id: &FylesId) -> DatabaseResult<()>;
-    async fn get_stale_received_files(&self, older_than_ms: i64) -> DatabaseResult<Vec<ReceivedFile>>;
+    async fn get_stale_received_files(
+        &self,
+        older_than_ms: i64,
+    ) -> DatabaseResult<Vec<ReceivedFile>>;
 
     // SelfContact operations
     async fn get_self_contact(&self) -> DatabaseResult<SelfContact>;
@@ -118,7 +146,14 @@ pub trait FilerequestDb: Send + Sync {
     async fn update_self_contact_name(&self, name: String) -> DatabaseResult<()>;
     async fn update_identity(&self, self_contact: SelfContact) -> DatabaseResult<()>;
     async fn get_sharable_public_self_contact(&self) -> DatabaseResult<Contact>;
-    async fn register_contact(&self, contact: Contact) -> DatabaseResult<()>;
+    async fn update_contact_projection(&self, contact: Contact) -> DatabaseResult<LocalDocWrite>;
+    /// Delete cached key rows for contacts no longer in the synced contacts document —
+    /// how a contact removed on another device is pruned locally after sync.
+    async fn prune_contact_key_cache(&self) -> DatabaseResult<()>;
+    /// Delete pending files whose target remote filerequest is no longer in the synced
+    /// remote-filerequests document — how files queued for a remote filerequest removed on
+    /// another device are cleaned up locally after sync (formerly a foreign-key cascade).
+    async fn prune_orphaned_pending_files(&self) -> DatabaseResult<()>;
 
     async fn backup_database(
         &self,
@@ -130,6 +165,19 @@ pub trait FilerequestDb: Send + Sync {
     // Opaque settings – stored as a binary blob (version is managed internally by the DB layer)
     async fn get_settings(&self) -> DatabaseResult<Vec<u8>>;
     async fn store_settings(&self, settings: Vec<u8>) -> DatabaseResult<()>;
+
+    /// Creates a shared-genesis empty document if none is stored yet.
+    async fn get_sync_doc(&self, kind: DocKind) -> DatabaseResult<Vec<u8>>;
+    async fn save_sync_doc(&self, kind: DocKind, blob: Vec<u8>) -> DatabaseResult<()>;
+    /// Read-modify-write in one actor turn, so concurrent writers cannot drop each other's changes.
+    ///
+    /// Returns no [`LocalDocWrite`] on purpose: convergence merges go through here, and being
+    /// unable to mint the token is what stops a merge announcing itself back around the device set.
+    async fn mutate_sync_doc(
+        &self,
+        kind: DocKind,
+        transform: Box<dyn FnOnce(Vec<u8>) -> DatabaseResult<Vec<u8>> + Send>,
+    ) -> DatabaseResult<()>;
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +230,8 @@ pub enum OperationType {
 pub enum DbError {
     #[error("The type of data queried was not yet initialized")]
     DataNotYetInitialized,
+    #[error("The node identity exists but its signing keys were cleared and need regeneration")]
+    SigningKeysMissing,
     #[error("Database operation error: {info} - {source}")]
     Operation {
         info: DbOperationInfo,
@@ -204,6 +254,10 @@ pub enum DbError {
     DataConversion { message: String },
     #[error("Record not found: {message}")]
     NotFound { message: String },
+    /// Identity known (arrived via sync) but some out-of-band data isn't resolved yet — a
+    /// contact's public keys are one example.
+    #[error("Data not yet fully synced: {message}")]
+    DataNotYetFullySynced { message: String },
     #[error("I/O error: {source}")]
     Io {
         #[from]

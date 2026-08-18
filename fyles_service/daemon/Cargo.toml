@@ -1,6 +1,6 @@
 [package]
 name = "fyles-daemon"
-version = "0.4.2"
+version = "0.6.0"
 rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,6 +14,7 @@ tap = { workspace = true }
 test-log = { workspace = true, features = ["trace"] }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, features = ["experimental_async_runtime"], optional = true }
@@ -26,7 +27,6 @@ libp2p.workspace = true
 
 [features]
 default = []
-test-with-prod-db = ["fyles-core/test-with-prod-db"]
 console = ["tracing-subscriber/fmt", "direct_host_utils/console"]
 otel-jaeger = ["opentelemetry", "opentelemetry-otlp", "tracing-opentelemetry", "opentelemetry-stdout", "opentelemetry_sdk"]
 

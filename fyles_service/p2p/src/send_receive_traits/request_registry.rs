@@ -1,14 +1,14 @@
 use async_trait::async_trait;
 use futures::Stream;
 use fyles_core::library::util::util::TimeoutLock;
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio_util::time::DelayQueue;
 use tracing::{debug, error, warn};
 
@@ -107,22 +107,22 @@ pub struct TimeoutRequestRegistryHandle<ExternalRequestId, NodeId> {
 
 impl<ExternalRequestId, NodeId> TimeoutRequestRegistryHandle<ExternalRequestId, NodeId> {
     fn register(&self, request_id: ExternalRequestId, node_id: NodeId) {
-        if let Err(_) = self.sender.send(Command::Register {
+        if self.sender.send(Command::Register {
             request_id,
             node_id,
-        }) {
+        }).is_err() {
             error!("failed to register request");
         }
     }
 
     fn unregister(&self, request_id: ExternalRequestId) {
-        if let Err(_) = self.sender.send(Command::UnRegister { request_id }) {
+        if self.sender.send(Command::UnRegister { request_id }).is_err() {
             error!("failed to unregister request");
         }
     }
 
     fn reset_timeout(&self, request_id: ExternalRequestId) {
-        if let Err(_) = self.sender.send(Command::ResetTimeout { request_id }) {
+        if self.sender.send(Command::ResetTimeout { request_id }).is_err() {
             error!("failed to reset timeout");
         }
     }
@@ -401,7 +401,10 @@ where
 
         if for_resend.is_some() {
             request_data.get_mut().retry_count += 1;
-            warn!(request_retry_count=request_data.get().retry_count, "Requested to resend request, retry count increased");
+            warn!(
+                request_retry_count = request_data.get().retry_count,
+                "Requested to resend request, retry count increased"
+            );
             self.worker_handle
                 .reset_timeout(request_data.get().external_id);
         }
@@ -433,7 +436,10 @@ where
 
         if for_resend.is_some() {
             request_data.get_mut().retry_count += 1;
-            warn!(request_retry_count=request_data.get().retry_count, "Requested to resend request after session error, retry count increased");
+            warn!(
+                request_retry_count = request_data.get().retry_count,
+                "Requested to resend request after session error, retry count increased"
+            );
             self.worker_handle
                 .reset_timeout(request_data.get().external_id);
         }
@@ -454,7 +460,7 @@ where
         new_request_id: RequestId,
     ) -> Result<usize, ()> {
         let mut data = self.data.timeout_lock().await;
-        
+
         {
             if let Some(request) = data.register.remove(old_request_id) {
                 let external_id = request.external_id;

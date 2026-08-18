@@ -1,10 +1,179 @@
-use crate::core::domain_models::FylesId;
+use crate::core::domain_models::{ContactId, FylesId, PeerIdWrapper};
+use crate::core::sync::{self, ContactEntry, DocKind, RemoteFrEntry};
 
 use super::Migration;
 use rusqlite::{Connection, OptionalExtension};
 use semver::Version;
 use std::collections::HashMap;
 use uuid::Uuid;
+
+/// Map a `core::sync` build error into a `rusqlite::Error` for use inside migrations.
+fn sync_err(e: sync::SyncDocError) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e.to_string())))
+}
+
+/// Create the `sync_docs` table and seed the three CRDT documents from the existing
+/// (local) SQLite rows. Every document starts from the shared deterministic genesis so
+/// that documents seeded independently on different devices still converge on sync.
+fn seed_sync_docs(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS sync_docs (
+             doc_kind TEXT PRIMARY KEY,
+             data BLOB NOT NULL
+         )",
+        [],
+    )?;
+
+    // Contacts -> ContactsDoc. The fingerprint is computed directly over the stored,
+    // already-serialized public-key blobs (same bytes core::sync::fingerprint expects).
+    let mut contacts = HashMap::new();
+    {
+        let mut stmt = conn
+            .prepare("SELECT id, name, pq_signing_public_key, ed25519_public_key FROM contacts")?;
+        let rows = stmt.query_map([], |row| {
+            let id: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            let pq: Vec<u8> = row.get(2)?;
+            let ed: Vec<u8> = row.get(3)?;
+            Ok((id, name, pq, ed))
+        })?;
+        for row in rows {
+            let (id, name, pq, ed) = row?;
+            contacts.insert(
+                ContactId(id),
+                ContactEntry {
+                    name,
+                    key_fingerprint: sync::fingerprint(&pq, &ed),
+                },
+            );
+        }
+    }
+
+    // Remote filerequests -> RemoteFrDoc, keyed by their own local id.
+    let mut remote_filerequests = HashMap::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT id, peer_id, filerequest_id, contact_id, name FROM remote_filerequests",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (id, peer_id, filerequest_id, contact_id, name) = row?;
+            remote_filerequests.insert(
+                FylesId(id),
+                RemoteFrEntry {
+                    peer_id_hint: PeerIdWrapper(peer_id),
+                    filerequest_id: FylesId(filerequest_id),
+                    contact_id: ContactId(contact_id),
+                    name,
+                },
+            );
+        }
+    }
+
+    let contacts_blob = sync::new_contacts_blob(contacts).map_err(sync_err)?;
+    let remote_fr_blob = sync::new_remote_fr_blob(remote_filerequests).map_err(sync_err)?;
+
+    // Seed this device into the Devices document, derived from the stored node keypair. Doing it
+    // here (not only at runtime via `ensure_own_device_registered`) matters for a restore: the
+    // restored DB runs migrations but the app doesn't restart, so the runtime self-registration
+    // never re-fires and the device would otherwise be missing from the owned-device list until a
+    // full restart. Falls back to an empty doc if the keypair is absent/undecodable (a fresh
+    // install goes through `initialize_tables`, not this migration, so a real upgrade has it).
+    // Best-effort: any failure (missing table/row, undecodable keypair) falls back to an empty
+    // devices doc — exactly the prior behaviour, where the local device self-registered at runtime.
+    let own_peer_id: Option<String> =
+        match conn.query_row("SELECT key_bytes FROM node_keys WHERE id = 1", [], |row| {
+            row.get::<_, Vec<u8>>(0)
+        }) {
+            Ok(key_bytes) => match crate::core::p2p::peer_id_from_node_keypair(&key_bytes) {
+                Ok(peer_id) => Some(peer_id),
+                Err(e) => {
+                    tracing::warn!("seed: could not derive peer id from node keys: {e}");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!("seed: could not read node keys, seeding empty devices doc: {e}");
+                None
+            }
+        };
+    let devices_blob = match own_peer_id {
+        Some(peer_id) => {
+            let mut devices = HashMap::new();
+            devices.insert(
+                PeerIdWrapper(peer_id),
+                sync::DeviceEntry {
+                    name: Uuid::new_v4().to_string(),
+                },
+            );
+            sync::new_devices_blob(devices).map_err(sync_err)?
+        }
+        None => sync::empty_blob(DocKind::Devices).map_err(sync_err)?,
+    };
+
+    for (kind, blob) in [
+        (DocKind::Contacts, contacts_blob),
+        (DocKind::RemoteFilerequests, remote_fr_blob),
+        (DocKind::Devices, devices_blob),
+    ] {
+        conn.execute(
+            "INSERT OR REPLACE INTO sync_docs (doc_kind, data) VALUES (?, ?)",
+            rusqlite::params![kind.as_str(), blob],
+        )?;
+    }
+
+    // The full remote_filerequests rows now live in the CRDT document, so the SQL table is
+    // redundant and gets dropped. `pending_files` foreign-keyed to it; SQLite can't drop a FK in
+    // place, so rebuild `pending_files` without the FK first (same shape as schema.rs), then drop
+    // the now-unreferenced table. `contact_id` for pending files is resolved from the document.
+    conn.execute_batch(
+        "CREATE TABLE pending_files_new (
+            id TEXT PRIMARY KEY,
+            file_path TEXT NOT NULL,
+            target_filerequest_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'Pending'
+                CHECK (status IN ('Pending', 'Sending', 'Interrupted', 'Sent', 'Rejected', 'Failed')),
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            progress_bytes INTEGER,
+            file_size_bytes INTEGER,
+            transfer_id TEXT,
+            display_name TEXT,
+            interruption_reasons TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+
+            CHECK (
+                (status = 'Pending'
+                    AND progress_bytes IS NULL AND file_size_bytes IS NULL AND transfer_id IS NULL)
+                OR
+                (status IN ('Sending', 'Interrupted')
+                    AND progress_bytes IS NOT NULL AND progress_bytes >= 0
+                    AND file_size_bytes IS NOT NULL AND file_size_bytes >= 0
+                    AND transfer_id IS NOT NULL)
+                OR
+                (status IN ('Sent', 'Rejected', 'Failed'))
+            )
+        );
+
+        INSERT INTO pending_files_new (id, file_path, target_filerequest_id, status, retry_count, progress_bytes, file_size_bytes, transfer_id, display_name, interruption_reasons, created_at)
+        SELECT id, file_path, target_filerequest_id, status, retry_count, progress_bytes, file_size_bytes, transfer_id, display_name, interruption_reasons, created_at
+        FROM pending_files;
+
+        DROP TABLE pending_files;
+        ALTER TABLE pending_files_new RENAME TO pending_files;
+
+        DROP TABLE remote_filerequests;",
+    )?;
+
+    Ok(())
+}
 
 pub fn get_migrations() -> Vec<Migration> {
     vec![
@@ -1615,6 +1784,125 @@ pub fn get_migrations() -> Vec<Migration> {
                 Ok(())
             },
         ),
+        Migration::new(
+            Version::new(1, 19, 1),
+            Version::new(1, 20, 0),
+            "Reset cryptographic identity for the ml-dsa/ml-kem migration: rename signing-key \
+             columns, clear the old signing keys (regenerated on next launch while keeping the \
+             stable libp2p PeerId and contact id), wipe contacts and stale transfer history",
+            |conn: &Connection| {
+                conn.execute_batch(
+                    // Rebuild self_contact into its new shape: drop the public-key columns
+                    // (public keys are now derived from the private ones) and rename the
+                    // private signing column. The old signing keys are discarded (left NULL)
+                    // so the brain regenerates them on next load; the libp2p keypair (PeerId)
+                    // and contact_id are intentionally kept stable.
+                    "CREATE TABLE self_contact_new (
+                         id INTEGER PRIMARY KEY CHECK (id = 1),
+                         contact_id TEXT NOT NULL UNIQUE,
+                         name TEXT NOT NULL,
+                         pq_signing_private_key BLOB,
+                         ed25519_private_key BLOB
+                     );
+                     INSERT INTO self_contact_new (id, contact_id, name, pq_signing_private_key, ed25519_private_key)
+                         SELECT 1, contact_id, 'Reset after update', NULL, NULL FROM self_contact WHERE id = 1;
+                     DROP TABLE self_contact;
+                     ALTER TABLE self_contact_new RENAME TO self_contact;
+
+                     -- Rename the contacts signing column to the algorithm-agnostic name.
+                     ALTER TABLE contacts RENAME COLUMN dilithium_public_key TO pq_signing_public_key;
+
+                     -- Contacts' stored public keys are now wrong-format / stale identity.
+                     DELETE FROM filerequest_audience;
+                     DELETE FROM contacts;
+
+                     -- Transfer history points at dead contact ids / counterpart keys.
+                     DELETE FROM pending_files;
+                     DELETE FROM remote_filerequests;
+                     DELETE FROM received_files;",
+                )?;
+                Ok(())
+            },
+            // Downgrades are not implemented across this codebase; this reset is intentionally
+            // irreversible (the discarded key material cannot be recovered).
+            |_conn: &Connection| Ok(()),
+        ),
+        Migration::new(
+            Version::new(1, 20, 0),
+            Version::new(1, 21, 0),
+            "Add persisted_as_name to received_files: the name a received file is actually \
+             stored under on disk (after sanitization/deduplication), used for display. \
+             Backfill existing rows from file_name.",
+            |conn: &Connection| {
+                conn.execute_batch(
+                    "ALTER TABLE received_files ADD COLUMN persisted_as_name TEXT NOT NULL DEFAULT '';
+                     UPDATE received_files SET persisted_as_name = file_name;",
+                )?;
+                Ok(())
+            },
+            // Downgrades are not implemented across this codebase.
+            |_conn: &Connection| Ok(()),
+        ),
+        Migration::new(
+            Version::new(1, 21, 0),
+            Version::new(1, 22, 0),
+            "Add sync_docs table for multi-device CRDT sync and seed the contacts, \
+             remote_filerequests and devices documents from existing local rows (each \
+             built from the shared deterministic genesis).",
+            seed_sync_docs,
+            unseed_sync_docs,
+        ),
     ])
     .collect()
+}
+
+/// Reverse of [`seed_sync_docs`]: the forward migration dropped the `remote_filerequests` table
+/// entirely (the CRDT document is authoritative), so recreate it and backfill every column from
+/// the synced document, then drop the `sync_docs` table. The `pending_files` foreign key is not
+/// restored — downgrades are best-effort and unsupported across this codebase.
+fn unseed_sync_docs(conn: &Connection) -> rusqlite::Result<()> {
+    // Rehydrate the remote-filerequests document before we drop it.
+    let blob: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT data FROM sync_docs WHERE doc_kind = ?",
+            [DocKind::RemoteFilerequests.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let remote_fr = match blob {
+        Some(blob) => {
+            let doc = sync::load(&blob).map_err(sync_err)?;
+            let view: sync::RemoteFrDoc = sync::hydrate(&doc).map_err(sync_err)?;
+            view.remote_filerequests
+        }
+        None => Default::default(),
+    };
+
+    // Recreate the table in its pre-sync shape, then backfill from the document.
+    conn.execute_batch(
+        "CREATE TABLE remote_filerequests (
+            id TEXT PRIMARY KEY,
+            peer_id TEXT NOT NULL,
+            filerequest_id TEXT NOT NULL,
+            contact_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );",
+    )?;
+    for (id, entry) in remote_fr {
+        conn.execute(
+            "INSERT INTO remote_filerequests (id, peer_id, filerequest_id, contact_id, name, created_at)
+             VALUES (?, ?, ?, ?, ?, datetime('now'))",
+            rusqlite::params![
+                id.0,
+                entry.peer_id_hint.0,
+                entry.filerequest_id.0,
+                entry.contact_id.0,
+                entry.name
+            ],
+        )?;
+    }
+
+    conn.execute("DROP TABLE sync_docs", [])?;
+    Ok(())
 }

@@ -1,7 +1,7 @@
 use core::panic;
 use fyles_core::library::util::duration_ext::DurationExt;
 use tokio::time::timeout;
-use tracing::{span, trace, Instrument, Level};
+use tracing::{Instrument, Level, span, trace};
 
 use fyles_core::core::brain::action::BrainAction;
 use fyles_core::core::brain::action_client::ClientAction;
@@ -194,10 +194,6 @@ async fn use_self_contact_invite_challenge(start_with_incorrect_challenge: bool)
             "Contact names to match"
         );
     }
-
-    owner_harness.abort();
-    new_harness.abort();
-    secondary_new_harness.abort();
 }
 
 #[tokio::test(flavor = "current_thread")]

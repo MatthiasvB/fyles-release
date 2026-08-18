@@ -6,3 +6,4 @@ pub mod domain_proto_conversion;
 pub mod filerequest_drive_handler;
 pub mod notification;
 pub mod p2p;
+pub mod sync;

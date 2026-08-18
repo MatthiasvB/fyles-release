@@ -1,6 +1,6 @@
 use std::sync::LazyLock;
 
-use fluent::{concurrent::FluentBundle, FluentArgs, FluentResource, FluentValue};
+use fluent::{FluentArgs, FluentResource, FluentValue, concurrent::FluentBundle};
 use include_flate::flate;
 use sys_locale::get_locale;
 use tracing::{error, info, warn};
@@ -491,7 +491,7 @@ mod tests {
         let language = init_i18n();
 
         // Try to get a simple message to verify the language object works
-        let result = text_resource(&language, "file-received-title");
+        let result = text_resource(&language, "file-received-notification-title");
         assert!(!result.is_empty(), "Translation result should not be empty");
         assert!(
             !result.starts_with('<'),
@@ -507,7 +507,7 @@ mod tests {
         // Test a translation that takes parameters using the correct FTL parameter names
         let result = text_resource_args(
             &language,
-            "file-received-mess-with-contact",
+            "file-received-notification-text-with-sender",
             &[
                 ("senderName", FluentValue::from("John")),
                 ("fileName", FluentValue::from("test.txt")),

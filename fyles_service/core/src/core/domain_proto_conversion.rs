@@ -1,30 +1,35 @@
 use crypto::{
-    deserialize_dilithium_private_key, deserialize_dilithium_public_key, deserialize_ed25519_private_key, deserialize_ed25519_public_key,
-    serialize_dilithium_private_key, serialize_dilithium_public_key,
-    serialize_ed25519_private_key, serialize_ed25519_public_key,
-    ContactKeys, ContactPrivateKeys,
-    ContactPublicKeys, PrivateEd25519DeserializationError, PublicEd25519DeserializationError,
+    ContactKeys, ContactPrivateKeys, ContactPublicKeys, PqSigningPrivateKeyDeserializationError,
+    PqSigningPublicKeyDeserializationError, PrivateEd25519DeserializationError,
+    PublicEd25519DeserializationError, deserialize_ed25519_private_key,
+    deserialize_ed25519_public_key, deserialize_pq_signing_private_key,
+    deserialize_pq_signing_public_key, serialize_ed25519_private_key, serialize_ed25519_public_key,
+    serialize_pq_signing_private_key, serialize_pq_signing_public_key,
 };
 use itertools::Itertools;
 use thiserror::Error;
 use tonic::Status;
 use tracing::{error, trace, warn};
 
-use crate::{
-    core::domain_models::{Contact, DisplayContact, SelfContact},
-    library::wire::api::{
-        self, server_message, AccessProto, ContactKeysProto, ContactPrivateKeysProto,
-        ContactProto, ContactPublicKeysProto, CreateRemoteFileRequestProto,
-        DatabaseRestoredFromBackup, FileRequestProto, PendingFileProto, PendingFileStatusChanged,
-        PublicProto, ReceiveStatusProto, ReceivedContactShareOverNetwork,
-        ReceivedFileProto, ReceivedFileStatusChanged, ReceivedSelfContactInviteOverNetwork,
-        RemoteFileRequestProto, SelfContactInviteAcceptedOverNetwork, SelfContactProto,
-        SelfContactPublicProto, SendStatusProto, ServerMessage, SpecificUsersProto,
-        StorePendingFileRequest,
-    },
+use super::domain_models::{
+    CreatePendingFiles, CreateRemoteFilerequest, FileInfo, Filerequest, FilerequestAccess,
+    InProgressSendStatus, PendingFile, ReceiveStatus, ReceivedFile, RemoteFilerequest, SendStatus,
 };
 use crate::library::wire::api::TransferDataProto;
-use super::domain_models::{CreatePendingFiles, CreateRemoteFilerequest, FileInfo, Filerequest, FilerequestAccess, InProgressSendStatus, PendingFile, ReceiveStatus, ReceivedFile, RemoteFilerequest, SendStatus};
+use crate::{
+    core::domain_models::{Contact, DisplayContact, PeerIdWrapper, SelfContact, SelfContactInvite},
+    library::wire::api::{
+        self, AccessProto, ContactKeysProto, ContactPrivateKeysProto, ContactProto,
+        ContactPublicKeysProto, ContactsChanged, CreateRemoteFileRequestProto,
+        DatabaseRestoredFromBackup, FileRequestProto, OwnedDeviceProto, OwnedDevicesChanged,
+        PendingFileProto, PendingFileStatusChanged, PublicProto, ReceiveStatusProto,
+        ReceivedContactShareOverNetwork, ReceivedFileProto, ReceivedFileStatusChanged,
+        ReceivedSelfContactInviteOverNetwork, RemoteFileRequestProto, RemoteFilerequestsChanged,
+        SelfContactInviteAcceptedOverNetwork, SelfContactInviteProto, SelfContactPublicProto,
+        SendStatusProto, ServerMessage, SpecificUsersProto, StorePendingFileRequest,
+        server_message,
+    },
+};
 
 impl From<&Contact> for ContactProto {
     fn from(contact: &Contact) -> Self {
@@ -202,11 +207,28 @@ impl From<&PendingFile> for PendingFileProto {
                 transfer_id: it.transfer_id.0.clone(),
                 file_size_bytes: it.file_size_bytes,
             }),
-            // progress_bytes: transfer_data.map(|d| d.progress_bytes),
-            // transfer_id: transfer_data.map(|d| d.transfer_id.0.clone()),
-            // file_size_bytes: transfer_data.map(|d| d.file_size_bytes),
             display_name: p.display_name.clone(),
             interruption_reasons: p.interruption_reasons.clone(),
+        }
+    }
+}
+
+impl From<PendingFile> for PendingFileProto {
+    fn from(p: PendingFile) -> Self {
+        let send_status = SendStatusProto::from(&p.status).into();
+        let transfer_data = p.status.into_transfer_data();
+        PendingFileProto {
+            id: p.id.0,
+            file_path: p.file_path,
+            target_file_request_id: p.target_filerequest_id.0,
+            send_status,
+            transfer_data: transfer_data.map(|it| TransferDataProto {
+                progress_bytes: it.progress_bytes,
+                transfer_id: it.transfer_id.0,
+                file_size_bytes: it.file_size_bytes,
+            }),
+            display_name: p.display_name,
+            interruption_reasons: p.interruption_reasons,
         }
     }
 }
@@ -215,7 +237,14 @@ impl From<StorePendingFileRequest> for CreatePendingFiles {
     fn from(p: StorePendingFileRequest) -> Self {
         let pending_files = p.pending_files.unwrap();
         CreatePendingFiles {
-            file_infos: pending_files.file_infos.into_iter().map(|it| FileInfo { path: it.path, display_name: it.display_name }).collect(),
+            file_infos: pending_files
+                .file_infos
+                .into_iter()
+                .map(|it| FileInfo {
+                    path: it.path,
+                    display_name: it.display_name,
+                })
+                .collect(),
             target_filerequest_id: pending_files.target_file_request_id.into(),
         }
     }
@@ -231,44 +260,32 @@ impl From<ReceivedFile> for ReceivedFileProto {
             file_path: r.file_path.unwrap_or_default(),
             size: r.file_size_bytes as i64,
             received_at_ms: r.received_at_ms.unwrap_or(0),
+            persisted_as_name: r.persisted_as_name,
         }
     }
 }
 
-
 #[derive(Debug, Error)]
 pub enum PublicKeyDeserializationError {
-    #[error("Failed to deserialize public dilithium key. Wrong key length?")]
-    PublicDilithium(#[from] bincode::error::DecodeError),
+    #[error("{0}")]
+    PqSigning(#[from] PqSigningPublicKeyDeserializationError),
     #[error("{0}")]
     PublicEd25519(#[from] PublicEd25519DeserializationError),
 }
 
 #[derive(Debug, Error)]
-pub enum PublicKeySerializationError {
-    #[error("Failed to serialize public dilithium key. Wrong key length?")]
-    PublicDilithium(#[from] bincode::error::EncodeError),
-}
-
-#[derive(Debug, Error)]
 pub enum PrivateKeyDeserializationError {
-    #[error("Failed to deserialize private dilithium key. Wrong key length?")]
-    PrivateDilithium(#[from] bincode::error::DecodeError),
+    #[error("{0}")]
+    PqSigning(#[from] PqSigningPrivateKeyDeserializationError),
     #[error("{0}")]
     PrivateEd25519(#[from] PrivateEd25519DeserializationError),
-}
-
-#[derive(Debug, Error)]
-pub enum PrivateKeySerializationError {
-    #[error("Failed to deserialize private dilithium key. Wrong key length?")]
-    PrivateDilithium(#[from] bincode::error::EncodeError),
 }
 
 impl TryFrom<ContactPublicKeysProto> for ContactPublicKeys {
     type Error = PublicKeyDeserializationError;
     fn try_from(proto: ContactPublicKeysProto) -> Result<Self, Self::Error> {
         Ok(Self {
-            dilithium: Box::new(deserialize_dilithium_public_key(proto.dilithium)?),
+            pq_signing: Box::new(deserialize_pq_signing_public_key(proto.pq_signing)?),
             ed25519: deserialize_ed25519_public_key(proto.ed25519)?,
         })
     }
@@ -284,69 +301,62 @@ pub enum SelfContactDeserializationError {
     PublicKeyDeserialization(#[from] PublicKeyDeserializationError),
 }
 
-#[derive(Error, Debug)]
-pub enum SelfContactSerializationError {
-    #[error("Could not deserialize a private key")]
-    PrivateKeySerialization(#[from] PrivateKeySerializationError),
-    #[error("Could not deserialize a public key")]
-    PublicKeySerialization(#[from] PublicKeySerializationError),
-}
-
-impl TryFrom<SelfContactProto> for SelfContact {
+impl TryFrom<SelfContactInviteProto> for SelfContactInvite {
     type Error = SelfContactDeserializationError;
-    fn try_from(value: SelfContactProto) -> Result<Self, Self::Error> {
+    fn try_from(value: SelfContactInviteProto) -> Result<Self, Self::Error> {
         Ok(Self {
-            id: value.id.into(),
-            name: value.name,
-            keys: value
-                .keys
-                .ok_or(SelfContactDeserializationError::Proto3FuckMissingKey(
-                    "keys",
-                ))?
-                .try_into()?,
+            contact: SelfContact {
+                id: value.id.into(),
+                name: value.name,
+                keys: value
+                    .keys
+                    .ok_or(SelfContactDeserializationError::Proto3FuckMissingKey(
+                        "keys",
+                    ))?
+                    .try_into()?,
+            },
+            inviter_peer_id: value.inviter_peer_id.into(),
+            inviter_device_name: value.inviter_device_name,
         })
     }
 }
 
-impl TryFrom<SelfContact> for SelfContactProto {
-    type Error = SelfContactSerializationError;
-    fn try_from(value: SelfContact) -> Result<Self, Self::Error> {
-        Ok(Self {
-            id: value.id.0,
-            name: value.name,
-            keys: Some(value.keys.try_into()?),
-        })
+impl From<SelfContactInvite> for SelfContactInviteProto {
+    fn from(value: SelfContactInvite) -> Self {
+        Self {
+            id: value.contact.id.0,
+            name: value.contact.name,
+            keys: Some(value.contact.keys.into()),
+            inviter_peer_id: value.inviter_peer_id.0,
+            inviter_device_name: value.inviter_device_name,
+        }
     }
 }
 
-impl TryFrom<ContactKeys> for ContactKeysProto {
-    type Error = SelfContactSerializationError;
-    fn try_from(value: ContactKeys) -> Result<Self, Self::Error> {
-        Ok(Self {
-            private_keys: Some(value.private.try_into()?),
-            public_keys: Some(value.public.try_into()?),
-        })
+impl From<ContactKeys> for ContactKeysProto {
+    fn from(value: ContactKeys) -> Self {
+        // Only the private keys are carried; the receiver re-derives the public keys.
+        Self {
+            private_keys: Some(value.private.into()),
+        }
     }
 }
 
-impl TryFrom<ContactPublicKeys> for ContactPublicKeysProto {
-    type Error = PublicKeySerializationError;
-    fn try_from(value: ContactPublicKeys) -> Result<Self, Self::Error> {
-        Ok(Self {
-            dilithium: serialize_dilithium_public_key(&value.dilithium)?,
+impl From<ContactPublicKeys> for ContactPublicKeysProto {
+    fn from(value: ContactPublicKeys) -> Self {
+        Self {
+            pq_signing: serialize_pq_signing_public_key(&value.pq_signing),
             ed25519: serialize_ed25519_public_key(&value.ed25519),
-        })
+        }
     }
 }
 
-impl TryFrom<ContactPrivateKeys> for ContactPrivateKeysProto {
-    type Error = PrivateKeySerializationError;
-
-    fn try_from(value: ContactPrivateKeys) -> Result<Self, Self::Error> {
-        Ok(Self {
-            dilithium: serialize_dilithium_private_key(&value.dilithium)?,
+impl From<ContactPrivateKeys> for ContactPrivateKeysProto {
+    fn from(value: ContactPrivateKeys) -> Self {
+        Self {
+            pq_signing: serialize_pq_signing_private_key(&value.pq_signing),
             ed25519: serialize_ed25519_private_key(&value.ed25519),
-        })
+        }
     }
 }
 
@@ -354,20 +364,14 @@ impl TryFrom<ContactKeysProto> for ContactKeys {
     type Error = SelfContactDeserializationError;
 
     fn try_from(value: ContactKeysProto) -> Result<Self, Self::Error> {
-        Ok(Self {
-            private: value
-                .private_keys
-                .ok_or(SelfContactDeserializationError::Proto3FuckMissingKey(
-                    "private_keys",
-                ))?
-                .try_into()?,
-            public: value
-                .public_keys
-                .ok_or(SelfContactDeserializationError::Proto3FuckMissingKey(
-                    "public_keys",
-                ))?
-                .try_into()?,
-        })
+        let private = value
+            .private_keys
+            .ok_or(SelfContactDeserializationError::Proto3FuckMissingKey(
+                "private_keys",
+            ))?
+            .try_into()?;
+        // The public keys are derived from the private ones rather than transmitted.
+        Ok(ContactKeys::from_private(private))
     }
 }
 
@@ -375,20 +379,19 @@ impl TryFrom<ContactPrivateKeysProto> for ContactPrivateKeys {
     type Error = PrivateKeyDeserializationError;
     fn try_from(value: ContactPrivateKeysProto) -> Result<Self, Self::Error> {
         Ok(Self {
-            dilithium: Box::new(deserialize_dilithium_private_key(value.dilithium)?),
+            pq_signing: Box::new(deserialize_pq_signing_private_key(value.pq_signing)?),
             ed25519: deserialize_ed25519_private_key(value.ed25519)?,
         })
     }
 }
 
-impl TryFrom<Contact> for SelfContactPublicProto {
-    type Error = PublicKeySerializationError;
-    fn try_from(contact: Contact) -> Result<Self, Self::Error> {
-        Ok(SelfContactPublicProto {
+impl From<Contact> for SelfContactPublicProto {
+    fn from(contact: Contact) -> Self {
+        SelfContactPublicProto {
             name: contact.name,
             contact_id: contact.id.0,
-            public_keys: Some(contact.public_keys.try_into()?),
-        })
+            public_keys: Some(contact.public_keys.into()),
+        }
     }
 }
 
@@ -445,7 +448,59 @@ impl ServerMessage {
         }
     }
 
-    pub fn pending_file_status_changed(pending_file_id: &str, status: &SendStatus, target_filerequest_id: &str) -> Self {
+    /// The synced contacts document changed; carries the full contact list.
+    pub fn contacts_changed(contacts: Vec<DisplayContact>) -> Self {
+        ServerMessage {
+            message: Some(server_message::Message::ContactsChanged(ContactsChanged {
+                contacts: contacts.into_iter().map(ContactProto::from).collect(),
+            })),
+        }
+    }
+
+    /// The synced remote-filerequests document changed; carries the full remote-filerequest list
+    /// plus every pending file, so the client rebuilds the nested structure without a refetch.
+    pub fn remote_filerequests_changed(
+        remote_filerequests: Vec<RemoteFilerequest>,
+        pending_files: Vec<PendingFile>,
+    ) -> Self {
+        ServerMessage {
+            message: Some(server_message::Message::RemoteFilerequestsChanged(
+                RemoteFilerequestsChanged {
+                    remote_file_requests: remote_filerequests
+                        .into_iter()
+                        .map(RemoteFileRequestProto::from)
+                        .collect(),
+                    pending_files: pending_files
+                        .into_iter()
+                        .map(PendingFileProto::from)
+                        .collect(),
+                },
+            )),
+        }
+    }
+
+    /// The synced owned-devices document changed; carries the full owned-device list.
+    pub fn owned_devices_changed(devices: Vec<(PeerIdWrapper, String)>) -> Self {
+        ServerMessage {
+            message: Some(server_message::Message::OwnedDevicesChanged(
+                OwnedDevicesChanged {
+                    devices: devices
+                        .into_iter()
+                        .map(|(peer_id, name)| OwnedDeviceProto {
+                            peer_id: peer_id.0,
+                            name,
+                        })
+                        .collect(),
+                },
+            )),
+        }
+    }
+
+    pub fn pending_file_status_changed(
+        pending_file_id: &str,
+        status: &SendStatus,
+        target_filerequest_id: &str,
+    ) -> Self {
         match status {
             SendStatus::InProgress(_) => {
                 trace!(?status, "Sending sending file status update");
@@ -480,15 +535,13 @@ impl ServerMessage {
         ServerMessage {
             message: Some(server_message::Message::ReceivedFileStatusChanged(
                 ReceivedFileStatusChanged {
-                    transfer_id: rf
-                        .transfer_id
-                        .as_ref()
-                        .map(|t| t.to_string()),
+                    transfer_id: rf.transfer_id.as_ref().map(|t| t.to_string()),
                     filerequest_id: rf.filerequest_id.to_string(),
                     new_status: status_proto.into(),
                     progress_bytes: rf.progress_bytes,
                     file_size_bytes: rf.file_size_bytes,
                     file_name: rf.file_name.clone(),
+                    persisted_as_name: rf.persisted_as_name.clone(),
                 },
             )),
         }

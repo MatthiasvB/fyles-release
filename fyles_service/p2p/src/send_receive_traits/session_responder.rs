@@ -3,14 +3,14 @@ use crate::send_receive_traits::get_session::GetSession;
 use crate::send_receive_traits::request_receiver::RequestReceiver;
 use crate::send_receive_traits::session::Session;
 use async_trait::async_trait;
-use crypto::{Encrypted};
-use serde::de::DeserializeOwned;
+use crypto::Encrypted;
+use libp2p::request_response::InboundRequestId;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use std::error;
 use std::fmt::Debug;
-use libp2p::request_response::InboundRequestId;
 use thiserror::Error;
-use tracing::warn;
+use tracing::{trace, warn};
 
 #[async_trait]
 pub trait SessionResponder<Req: Serialize + DeserializeOwned, Res: Serialize + DeserializeOwned> {
@@ -22,7 +22,7 @@ pub trait SessionResponder<Req: Serialize + DeserializeOwned, Res: Serialize + D
         &self,
         node_id: Self::NodeId,
         request: Encrypted<Req>,
-        request_id: Self::InboundRequestId
+        request_id: Self::InboundRequestId,
     ) -> Option<
         Result<Encrypted<Res>, SessionResponderError<<Self::Session as Session>::EncryptError>>,
     >;
@@ -52,7 +52,13 @@ impl<EE: std::error::Error> From<SessionResponderError<EE>> for SessionErrorResp
 impl<T, Req, Res, NodeId, ContactId, DecryptError, S> SessionResponder<Req, Res> for T
 where
     T: GetSession<Session = S, NodeId = NodeId>,
-    T: RequestReceiver<Req, Res, NodeId = NodeId, ContactId = ContactId, InboundRequestId = InboundRequestId>,
+    T: RequestReceiver<
+            Req,
+            Res,
+            NodeId = NodeId,
+            ContactId = ContactId,
+            InboundRequestId = InboundRequestId,
+        >,
     T: Send + Sync + 'static,
     DecryptError: Debug + Send + Sync + 'static,
     S: Session<ContactId = ContactId, DecryptError = DecryptError> + Send + Sync + 'static,
@@ -72,7 +78,7 @@ where
     ) -> Option<Result<Encrypted<Res>, SessionResponderError<S::EncryptError>>> {
         let mut decrypt_errors = vec![];
         let recent_sessions = self.get_recent_receive_sessions(&node_id).await;
-        warn!("receive_session_count: {}", recent_sessions.len());
+        trace!(count = recent_sessions.len(), "Sessions to try decrypting with");
         for session in &recent_sessions {
             let decrypted = match session.decrypt(&request).await {
                 Err(e) => {
@@ -82,12 +88,9 @@ where
                 Ok(decrypted) => decrypted,
             };
 
-            let Some(response) = self
+            let response = self
                 .respond_to(node_id, session.get_contact_id(), decrypted, request_id)
-                .await
-            else {
-                return None;
-            };
+                .await?;
             let encrypted = session.encrypt(&response).await;
             return Some(encrypted.map_err(SessionResponderError::EncryptError));
         }

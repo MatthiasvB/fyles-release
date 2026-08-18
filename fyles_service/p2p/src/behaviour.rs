@@ -1,23 +1,24 @@
-
 use crypto::Encrypted;
-#[cfg(test)]
-use fyles_core::library::util::duration_ext::DurationExt;
 use libp2p::identity::Keypair;
 use libp2p::swarm::NetworkBehaviour;
-use libp2p::{mdns, request_response, StreamProtocol};
+use libp2p::{StreamProtocol, mdns, request_response};
 use request_response::ProtocolSupport;
 use serde::{Deserialize, Serialize};
 
 use fyles_core::core::brain::types::{
-    ContactShareChallenge, SelfContactInviteChallenge,
+    ContactShareChallenge, PubkeyFetchRequest, PubkeyFetchResponse, SelfContactInviteChallenge,
 };
 use fyles_core::core::domain_models::{Contact, SelfContact};
+use fyles_core::core::sync::{SyncRequest, SyncResponse};
 
 use crate::crypto::{
     AuthWireRequest, AuthWireResponse, KeyExchangeResponseMessage,
     ResponderSessionEstablishmentError, SessionInitiationRequest,
 };
+use crate::constants::SESSION_ESTABLISHMENT_PROTOCOL;
 use crate::types::{FileRequest, FileResponse};
+#[cfg(test)]
+use crate::constants::BEHAVIOUR_REQUEST_TIMEOUT;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum SessionErrorResponse {
@@ -31,6 +32,8 @@ pub struct CoreBehaviour {
     pub self_contact_invite: SelfContactInviteBehaviour,
     pub contact_share: ContactShareBehaviour,
     pub session_establishment: SessionEstablishmentBehaviour,
+    pub sync: SyncBehaviour,
+    pub pubkey_fetch: PubkeyFetchBehaviour,
 }
 
 pub type FilerequestBehaviour = request_response::cbor::Behaviour<
@@ -53,6 +56,16 @@ pub type SessionEstablishmentBehaviour = request_response::cbor::Behaviour<
     Result<AuthWireResponse<Box<KeyExchangeResponseMessage>>, ResponderSessionEstablishmentError>,
 >;
 
+pub type SyncBehaviour = request_response::cbor::Behaviour<
+    Encrypted<SyncRequest>,
+    Result<Encrypted<SyncResponse>, SessionErrorResponse>,
+>;
+
+pub type PubkeyFetchBehaviour = request_response::cbor::Behaviour<
+    Encrypted<PubkeyFetchRequest>,
+    Result<Encrypted<PubkeyFetchResponse>, SessionErrorResponse>,
+>;
+
 #[derive(NetworkBehaviour)]
 pub struct LocalNetworkBehaviour {
     pub core: CoreBehaviour,
@@ -72,7 +85,7 @@ impl CoreBehaviour {
 
         #[cfg(test)]
         let request_response_config = request_response_config
-            .with_request_timeout(500.millis())
+            .with_request_timeout(BEHAVIOUR_REQUEST_TIMEOUT)
             .with_relay_for_requests(false);
 
         Self {
@@ -85,21 +98,35 @@ impl CoreBehaviour {
             ),
             self_contact_invite: request_response::cbor::Behaviour::new(
                 [(
-                    StreamProtocol::new("/fyles/self-contact-invite/0.0.1"),
+                    StreamProtocol::new("/fyles/self-contact-invite/0.0.2"),
                     ProtocolSupport::Full,
                 )],
                 request_response_config.clone(),
             ),
             contact_share: request_response::cbor::Behaviour::new(
                 [(
-                    StreamProtocol::new("/fyles/contact-invite/0.0.1"),
+                    StreamProtocol::new("/fyles/contact-invite/0.0.2"),
                     ProtocolSupport::Full,
                 )],
                 request_response_config.clone(),
             ),
             session_establishment: request_response::cbor::Behaviour::new(
                 [(
-                    StreamProtocol::new("/session-establishment/0.0.2"),
+                    StreamProtocol::new(SESSION_ESTABLISHMENT_PROTOCOL),
+                    ProtocolSupport::Full,
+                )],
+                request_response_config.clone(),
+            ),
+            sync: request_response::cbor::Behaviour::new(
+                [(
+                    StreamProtocol::new("/fyles/sync/0.0.1"),
+                    ProtocolSupport::Full,
+                )],
+                request_response_config.clone(),
+            ),
+            pubkey_fetch: request_response::cbor::Behaviour::new(
+                [(
+                    StreamProtocol::new("/fyles/pubkey-fetch/0.0.1"),
                     ProtocolSupport::Full,
                 )],
                 request_response_config,

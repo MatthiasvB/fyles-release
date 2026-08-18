@@ -12,6 +12,7 @@ use tracing::trace;
 use uuid::Uuid;
 
 use crate::library::util::duration_ext::DurationExt;
+use crate::constants::{RETRY_BASE_INTERVAL, RETRY_MAX_INTERVAL};
 
 macro_rules! creatable {
     // Match variant with doc strings for fields
@@ -181,8 +182,8 @@ impl Contact {
     pub fn for_test() -> Self {
         Contact {
             id: ContactId::new(),
-            name: "Test Contact".into(),
-            public_keys: ContactPublicKeys::new(),
+            name: format!("Test Contact {}", Uuid::new_v4()),
+            public_keys: ContactPublicKeys::random(),
         }
     }
 }
@@ -207,6 +208,13 @@ pub struct SelfContact {
     pub id: ContactId,
     pub name: String,
     pub keys: ContactKeys,
+}
+
+#[derive(Debug, Clone)]
+pub struct SelfContactInvite {
+    pub contact: SelfContact,
+    pub inviter_peer_id: PeerIdWrapper,
+    pub inviter_device_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -259,7 +267,9 @@ impl SendStatus {
         match self {
             SendStatus::Pending => Ok("Pending"),
             SendStatus::InProgress(status) => match status.status {
-                InProgressSendStatus::Prepared => Err("Prepared is an ephemeral status and must not be persisted".into()),
+                InProgressSendStatus::Prepared => {
+                    Err("Prepared is an ephemeral status and must not be persisted".into())
+                }
                 InProgressSendStatus::Sending => Ok("Sending"),
                 InProgressSendStatus::Interrupted => Ok("Interrupted"),
                 InProgressSendStatus::PendingSent => {
@@ -273,10 +283,16 @@ impl SendStatus {
         }
     }
 
-    /// Returns the transfer data associated with this status, if any.
     pub fn transfer_data(&self) -> Option<&TransferData> {
         match self {
             SendStatus::InProgress(status) => Some(&status.transfer_data),
+            _ => None,
+        }
+    }
+
+    pub fn into_transfer_data(self) -> Option<TransferData> {
+        match self {
+            SendStatus::InProgress(status) => Some(status.transfer_data),
             _ => None,
         }
     }
@@ -301,7 +317,9 @@ impl SendStatus {
 
         match status_tag {
             "Pending" => Ok(SendStatus::Pending),
-            "Prepared" => Err("Prepared status is ephemeral and must not be persisted to DB".into()),
+            "Prepared" => {
+                Err("Prepared status is ephemeral and must not be persisted to DB".into())
+            }
             "Sending" => transfer_data()
                 .map(|it| {
                     SendStatus::InProgress(InProgress {
@@ -374,6 +392,11 @@ pub struct ReceivedFile {
     pub filerequest_id: FylesId,
     pub transfer_id: Option<FylesId>,
     pub file_name: String,
+    /// The name the file is actually stored under on disk. Differs from `file_name`
+    /// when the requested name was deduplicated (e.g. `photo_0.jpg`). Initialized to
+    /// the requested name at receive-start and overwritten with the real on-disk
+    /// basename on completion. This is what the UI should display.
+    pub persisted_as_name: String,
     /// `None` while the transfer is still in progress.
     pub file_path: Option<String>,
     pub file_size_bytes: u64,
@@ -393,6 +416,9 @@ pub struct CreateIncomingFile {
     pub contact_id: Option<ContactId>,
     pub peer_id: String,
     pub file_name: String,
+    /// Initial value for `persisted_as_name` (the requested sanitized name); replaced
+    /// with the real on-disk basename once the transfer completes.
+    pub persisted_as_name: String,
     pub file_size_bytes: u64,
     /// Milliseconds since UNIX epoch when the transfer started (used for .part file naming).
     pub started_at_ms: i64,
@@ -403,7 +429,21 @@ pub struct CreateIncomingFile {
 pub struct CompleteReceivedFile {
     pub transfer_id: FylesId,
     pub file_path: String,
+    /// The actual on-disk basename the file was stored under (after dedup).
+    pub persisted_as_name: String,
     pub received_at_ms: i64,
+}
+
+/// Where a filerequest's folder lives on disk, resolved for the UI to open —
+/// genuinely either-or, depending on the host's storage model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FilerequestLocation {
+    /// A complete absolute filesystem path, on a directly-accessible host
+    /// (desktop). The client opens it as-is.
+    Absolute(String),
+    /// A path relative to the host drop root, on scoped-storage hosts (Android
+    /// SAF, iOS sandbox). The client composes the full path itself.
+    Relative(String),
 }
 
 // ── Receiver-side transfer status tracking ──
@@ -512,7 +552,7 @@ impl CreatePendingFiles {
             file.flush().await.expect("Failed to flush test file");
             FileInfo {
                 path: file_path.to_str().unwrap().to_string(),
-                display_name: Some(file_name)
+                display_name: Some(file_name),
             }
         });
         let file_infos = join_all(file_info_futures).await;
@@ -527,6 +567,7 @@ impl CreatePendingFiles {
 }
 
 /// Things you may want to send data to
+#[allow(clippy::large_enum_variant)]
 #[allow(dead_code)]
 pub enum Dialable {
     /// A single, specific device, like Ann's smartphone or XY-company's server
@@ -627,13 +668,8 @@ pub struct CappedExponentialRetry {
 impl Default for CappedExponentialRetry {
     fn default() -> Self {
         Self {
-            base_interval: 5.seconds(),
-            // try at least four times per day. That's not often enough
-            // to cause significant resource drain, but often enough to
-            // ensure at least one attempt is made during the waking hours
-            // of a normal person, which is when most devices are likely to
-            // be online.
-            max_interval: 6.hours(),
+            base_interval: RETRY_BASE_INTERVAL,
+            max_interval: RETRY_MAX_INTERVAL,
         }
     }
 }

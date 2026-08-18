@@ -16,22 +16,21 @@ use fyles_core::core::brain::action::BrainAction;
 use fyles_core::core::brain::action_p2p::NetworkNodeAction;
 use fyles_core::core::brain::types::BrainRequest;
 use fyles_core::core::domain_models::ContactId;
-use fyles_core::library::util::duration_ext::DurationExt;
 use fyles_core::library::util::util::TimeoutLock;
 use itertools::Itertools;
 use libp2p::PeerId;
+use tap::Pipe;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, error, trace, warn};
 
-#[cfg(test)]
-const SESSION_ESTABLISHMENT_TIMEOUT: Duration = Duration::from_millis(500);
-
-#[cfg(not(test))]
-const SESSION_ESTABLISHMENT_TIMEOUT: Duration = Duration::from_secs(10);
+use crate::constants::{
+    EXPIRED_SESSION_IDLE, EXPIRED_SESSION_MAX, EXPIRED_SESSION_SCOPE,
+    SESSION_ESTABLISHMENT_TIMEOUT,
+};
 
 #[async_trait]
 pub trait GetSession {
@@ -75,7 +74,7 @@ pub struct SessionManager<NodeId: Hash + Eq + Send, ContactId: Clone, Swarm: Loc
 }
 
 impl<NodeId: Hash + Eq + Clone + Send + Debug, Swarm: LocalNetworkSwarm>
-SessionManager<NodeId, ContactId, Swarm>
+    SessionManager<NodeId, ContactId, Swarm>
 {
     pub fn new(
         brain_action_sender: mpsc::Sender<BrainAction>,
@@ -90,8 +89,18 @@ SessionManager<NodeId, ContactId, Swarm>
             event_loop_sender,
             self_contact_id: contact_id.into(),
             keys: contact_keys.into(),
-            expired_session_cache: ScopedExpiryMap::new(15.seconds(), 15.seconds(), 60.seconds()),
+            expired_session_cache: ScopedExpiryMap::new(
+                EXPIRED_SESSION_IDLE,
+                EXPIRED_SESSION_SCOPE,
+                EXPIRED_SESSION_MAX,
+            ),
         }
+    }
+
+    /// Our own contact id (shared across our devices). Used e.g. to bind an outgoing
+    /// sync session to our own identity so the peer authenticates us as an owned device.
+    pub async fn self_contact_id(&self) -> ContactId {
+        self.self_contact_id.read().await.clone()
     }
 
     pub async fn update_identity(&self, contact_id: ContactId, keys: ContactKeys) {
@@ -114,7 +123,8 @@ SessionManager<NodeId, ContactId, Swarm>
     {
         debug!(?peer, "Received session establishment request");
         trace!("Optimistically verifying other end");
-        let (brain_request, keys_response) = BrainRequest::with_receiver(request.sender.clone());
+        let (brain_request, keys_response) =
+            BrainRequest::with_receiver(request.payload.sender.clone());
         trace!("Requesting public keys to verify other end during request");
         self.brain_action_sender
             .send(BrainAction::NetworkNode(
@@ -123,18 +133,29 @@ SessionManager<NodeId, ContactId, Swarm>
             .await
             .expect("Brain action sender to be alive");
         let maybe_keys = keys_response.await.expect("Keys response to be received");
-        match request.to_session_and_response(match maybe_keys {
-            Some(ref keys) => Some((request.sender.clone(), keys)),
-            None => None,
-        }) {
+        let self_contact_id = self.self_contact_id.read().await.clone();
+        trace!(
+            "Signing session response for peer {peer:?} with self contact id {self_contact_id}"
+        );
+        let result = request.to_session_and_response(
+            match maybe_keys {
+                Some(ref keys) => Some((request.payload.sender.clone(), keys)),
+                None => None,
+            },
+            self_contact_id,
+            &mut self.keys.write().await.private,
+        );
+        match result {
             Err(SessionFromRequestError::SignatureVerification(e)) => {
                 error!("Initiator signature verification failed: {e:?}");
-                Err(ResponderSessionEstablishmentError::ContactVerificationFailed(
-                    request.sender,
-                ))
+                Err(
+                    ResponderSessionEstablishmentError::ContactVerificationFailed(
+                        request.payload.sender,
+                    ),
+                )
             }
-            Err(SessionFromRequestError::Kyber(e)) => {
-                error!(error=?e, "Kyber error during session creation");
+            Err(SessionFromRequestError::Signing(e)) => {
+                error!("Failed to sign the key exchange response: {e:?}");
                 Err(ResponderSessionEstablishmentError::SharedSecretGenerationFailed)
             }
             Ok((session, response)) => {
@@ -142,33 +163,17 @@ SessionManager<NodeId, ContactId, Swarm>
                     ?peer,
                     "Storing session after receiving session establishment request"
                 );
-                let self_contact_id = self.self_contact_id.read().await.clone();
-                trace!(
-                    "Signing session response for peer {peer:?} with self contact id {self_contact_id}"
-                );
-                match response.sign(
-                    &mut self.keys.write().await.private,
-                    self_contact_id,
-                    maybe_keys.is_some(),
-                ) {
-                    Ok(signed) => {
-                        let mut session_store_lock = self.session_store.timeout_lock().await;
-                        let old_session = session_store_lock
-                            .store
-                            .insert(peer.clone(), Wrapper(session.into()));
-                        if let Some(session) = old_session {
-                            trace!("Retaining old session in the cache");
-                            self.expired_session_cache.push(peer, session).await;
-                        }
-                        drop(session_store_lock);
-                        trace!("Initiating return of signed response");
-                        Ok(signed)
-                    }
-                    Err(e) => {
-                        error!("Failed to create shared secrets: {e:?}");
-                        Err(ResponderSessionEstablishmentError::SharedSecretGenerationFailed)
-                    }
+                let mut session_store_lock = self.session_store.timeout_lock().await;
+                let old_session = session_store_lock
+                    .store
+                    .insert(peer.clone(), Wrapper(session.into()));
+                if let Some(session) = old_session {
+                    trace!("Retaining old session in the cache");
+                    self.expired_session_cache.push(peer, session).await;
                 }
+                drop(session_store_lock);
+                trace!("Initiating return of signed response");
+                Ok(response)
             }
         }
     }
@@ -204,7 +209,7 @@ SessionManager<NodeId, ContactId, Swarm>
             Ok(response) => {
                 trace!(
                     "Response is Ok. Authenticated: {}",
-                    response.is_authenticated
+                    response.payload.is_authenticated
                 );
                 let session_builder = match self
                     .session_build_store
@@ -220,9 +225,16 @@ SessionManager<NodeId, ContactId, Swarm>
                     Some(session_builder) => session_builder,
                 };
                 trace!("Session builder found for peer {peer:?}");
-                let (request, brain_response) = BrainRequest::with_receiver(response.sender.clone());
-                self.brain_action_sender.send(BrainAction::NetworkNode(NetworkNodeAction::GetContactPublicKeys(request))).await.expect("Sending to work");
-                let maybe_contact_public_keys = brain_response.await.expect("Sender not to be dropped");
+                let (request, brain_response) =
+                    BrainRequest::with_receiver(response.payload.sender.clone());
+                self.brain_action_sender
+                    .send(BrainAction::NetworkNode(
+                        NetworkNodeAction::GetContactPublicKeys(request),
+                    ))
+                    .await
+                    .expect("Sending to work");
+                let maybe_contact_public_keys =
+                    brain_response.await.expect("Sender not to be dropped");
                 let session = session_builder.to_session(response, maybe_contact_public_keys);
                 match session {
                     Err(e) => error!("Error during session creation: {e:?}"),
@@ -233,7 +245,9 @@ SessionManager<NodeId, ContactId, Swarm>
                             "Session successfully created. Inserting into session store"
                         );
                         let mut session_store_lock = self.session_store.timeout_lock().await;
-                        let old_session = session_store_lock.store.insert(peer.clone(), session.into());
+                        let old_session = session_store_lock
+                            .store
+                            .insert(peer.clone(), session.into());
                         if let Some(session) = old_session {
                             trace!("Retaining old session in the cache");
                             self.expired_session_cache.push(peer, session).await;
@@ -245,6 +259,31 @@ SessionManager<NodeId, ContactId, Swarm>
                 }
             }
         };
+    }
+
+    /// A responder stores its session before answering, so its message can overtake the
+    /// establishment response we are still waiting for. Needs no timeout: every build entry ends in
+    /// a session, an error, or the initiator's timeout dropping the builder.
+    async fn session_from_pending_build(&self, peer: &NodeId) -> Option<W<Arc<CryptoSession>>> {
+        let mut pending_build = {
+            let session_build_store = self.session_build_store.timeout_lock().await;
+            session_build_store
+                .store
+                .get(peer)?
+                .pipe(|build| build.get_session_receiver())
+        };
+        trace!(?peer, "Waiting for the session being built for this peer");
+        if let Ok(Ok(session)) = pending_build.recv().await {
+            return Some(session.into());
+        }
+        // Subscribing after the broadcast already fired receives nothing, so the store is the only
+        // way to tell "never established" from "established just before we looked".
+        self.session_store
+            .timeout_lock()
+            .await
+            .store
+            .get(peer)
+            .cloned()
     }
 
     pub async fn handle_session_establishment_failure(&self, peer: NodeId) {
@@ -263,7 +302,7 @@ SessionManager<NodeId, ContactId, Swarm>
 }
 
 impl<NodeId: Hash + Eq + Send, ContactId: Clone, Swarm: LocalNetworkSwarm>
-GetInnerEventSender<Swarm> for SessionManager<NodeId, ContactId, Swarm>
+    GetInnerEventSender<Swarm> for SessionManager<NodeId, ContactId, Swarm>
 {
     fn get_inner_event_sender(&self) -> &EventLoopSender<Swarm> {
         &self.event_loop_sender
@@ -271,10 +310,7 @@ GetInnerEventSender<Swarm> for SessionManager<NodeId, ContactId, Swarm>
 }
 
 #[async_trait]
-impl<
-    Swarm: LocalNetworkSwarm + 'static,
-> GetSession for SessionManager<PeerId, ContactId, Swarm>
-{
+impl<Swarm: LocalNetworkSwarm + 'static> GetSession for SessionManager<PeerId, ContactId, Swarm> {
     type Session = W<Arc<CryptoSession>>;
     type NodeId = PeerId;
     type ContactId = ContactId;
@@ -293,8 +329,7 @@ impl<
         // random things fixed themselves)
         for attempt in 0..2 {
             trace!("Attempt no {attempt}");
-            if let Some(existing_session) = self.get_established_session(node_id, true).await
-            {
+            if let Some(existing_session) = self.get_established_session(node_id, true).await {
                 trace!("Found existing session");
                 return Ok(existing_session);
             }
@@ -332,13 +367,7 @@ impl<
             // there was no session build in progress, or it yielded a session with insufficient requirements
 
             {
-                let session_initiator_secrets =
-                    Box::new(SessionInitiatorSecrets::new().map_err(|_| {
-                        Arc::new(
-                            InitiatorSessionEstablishmentError::EphemeralSecretGenerationError
-                                .into(),
-                        )
-                    })?);
+                let session_initiator_secrets = Box::new(SessionInitiatorSecrets::new());
                 let request = {
                     let self_contact_id = self.self_contact_id.read().await.clone();
                     let mut signing_keys = self.keys.write().await;
@@ -346,13 +375,15 @@ impl<
                         Box::new(session_initiator_secrets.public),
                         for_contact_id.as_ref(),
                     )
-                        .sign(&mut signing_keys.private, self_contact_id)
-                        .map_err(|_| {
-                            Arc::new(InitiatorSessionEstablishmentError::SigningError.into())
-                        })?
+                    .sign(&mut signing_keys.private, self_contact_id)
+                    .map_err(|_| {
+                        Arc::new(InitiatorSessionEstablishmentError::SigningError.into())
+                    })?
                 };
-                let session_creation =
-                    InitiatorSessionCreation::new(session_initiator_secrets.private);
+                let session_creation = InitiatorSessionCreation::new(
+                    session_initiator_secrets.private,
+                    request.transcript_bytes(),
+                );
                 let mut response_receiver = session_creation.get_session_receiver();
                 session_build_store_lock
                     .store
@@ -364,8 +395,19 @@ impl<
                         .get_session_establishment_behaviour()
                         .send_request(&node_id, request);
                 });
-                return tokio::time::timeout(SESSION_ESTABLISHMENT_TIMEOUT, response_receiver.recv())
-                    .await
+                let response =
+                    tokio::time::timeout(SESSION_ESTABLISHMENT_TIMEOUT, response_receiver.recv())
+                        .await;
+                if response.is_err() {
+                    // Drops the only sender on the builder's channel, which `session_from_pending_build`
+                    // parks on. `TtlMap` reclaims only when a later `insert` vacuums.
+                    self.session_build_store
+                        .timeout_lock()
+                        .await
+                        .store
+                        .remove(&node_id);
+                }
+                return response
                     .map_err(|_| {
                         error!("Did not receive a response from session establishment request within timeout {SESSION_ESTABLISHMENT_TIMEOUT:?}");
                         Arc::new(InitiatorSessionEstablishmentError::NoResponse.into())
@@ -382,7 +424,7 @@ impl<
             InitiatorSessionEstablishmentError::Internal(
                 "Did not obtain a session in two loops which should be impossible".into(),
             )
-                .into(),
+            .into(),
         ))
     }
 
@@ -402,9 +444,7 @@ impl<
             Some(session) => {
                 let now = SystemTime::now();
 
-                if use_for_send && session.use_expiry > now {
-                    Some(session)
-                } else if session.accept_expiry > now {
+                if use_for_send && session.use_expiry > now || session.accept_expiry > now {
                     Some(session)
                 } else {
                     None
@@ -415,10 +455,16 @@ impl<
     }
 
     async fn get_recent_receive_sessions(&self, node_id: &Self::NodeId) -> Vec<Self::Session> {
-        let current_session = {
+        let mut current_session = {
             let session_store = self.session_store.timeout_lock().await;
             session_store.store.get(node_id).cloned()
         };
+        let expired_sessions = self.expired_session_cache.get(node_id).await;
+
+        // Waiting delays this payload, so only where the alternative is a certain `MissingSession`.
+        if current_session.is_none() && expired_sessions.is_empty() {
+            current_session = self.session_from_pending_build(node_id).await;
+        }
 
         trace!(peer=?node_id, "{}", {
             match &current_session {
@@ -429,13 +475,7 @@ impl<
 
         current_session
             .into_iter()
-            .chain(
-                self.expired_session_cache
-                    .get(node_id)
-                    .await
-                    .into_iter()
-                    .map_into(),
-            )
+            .chain(expired_sessions.into_iter().map_into())
             .collect()
     }
 

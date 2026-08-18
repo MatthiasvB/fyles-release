@@ -1,4 +1,4 @@
-use tracing::{span, Instrument, Level};
+use tracing::{Instrument, Level, span};
 
 use crate::tests::test_utils::IdleP2pTestHarness;
 use fyles_core::{
@@ -114,7 +114,4 @@ async fn test_upgrade_session_requirement() {
         )
         .await
         .unwrap();
-
-    with_private_request.abort();
-    with_public_request.abort();
 }

@@ -2,52 +2,45 @@ use crypto::ContactKeys;
 use futures::StreamExt;
 use fyles_core::core::api_server::MockRunnableFilerequestServer;
 use fyles_core::core::brain::action_test::TestAction;
-use fyles_core::core::brain::ActionInterceptor;
-use fyles_core::core::db::test::{setup_test_db, DbWrapper};
+use fyles_core::core::brain::{ActionInterceptor, BrainNetwork, GigaBrain};
+use fyles_core::core::db::test::{DbRef, setup_test_db};
 use fyles_core::core::domain_models::ContactId;
-use fyles_core::core::p2p::{NetworkNode, Runnable, RunnableNetworkNode};
-use fyles_core::io_controller::test::TestHostController;
+use fyles_core::core::p2p::{NetworkNode, Runnable};
 use fyles_core::io_controller::HostController;
+use fyles_core::io_controller::test::TestHostController;
 use fyles_core::library::util::duration_ext::DurationExt;
 use fyles_core::library::util::util::TimeoutLock;
+use fyles_core::library::wire::api::ServerMessage;
 use libp2p::swarm::{Swarm, SwarmEvent};
-use libp2p::{identity::Keypair, PeerId};
+use libp2p::{PeerId, identity::Keypair};
 use libp2p_swarm_test::SwarmExt;
 use std::{future::Future, path::PathBuf, sync::Arc, time::Duration};
-use tap::Pipe;
 use tempfile::TempDir;
-use tokio::{
-    sync::mpsc,
-    task::JoinHandle,
-    time::timeout,
-};
-use tracing::{instrument, span, trace, Instrument, Level};
+use tokio::sync::RwLock;
+use tokio::{sync::mpsc, task::JoinHandle, time::timeout};
+use tokio_util::sync::CancellationToken;
+use tracing::{Instrument, Level, instrument, span, trace};
 
 use fyles_core::core::{
     brain::{
+        Brain,
         action::BrainAction,
         action_client::ClientAction,
         action_p2p::{NetworkNodeAction, NodeInfo},
         types::BrainRequest,
-        Brain,
     },
     domain_models::{Contact, CreatePendingFiles, CreateRemoteFilerequest, FylesId, SendStatus},
 };
 
+use crate::TestSwarmFactory;
 use crate::event_loop::CoreFileTracker;
 use crate::types::Wrap;
 use crate::utils::{decode_stored_keys, encode_keypair};
-use crate::TestSwarmFactory;
 use crate::{
+    P2pClient,
     behaviour::{LocalNetworkBehaviour, LocalNetworkBehaviourEvent},
     event_loop::InnerAsyncEvent,
-    P2pClient,
 };
-
-#[cfg(feature = "test-with-prod-db")]
-const USE_MEMORY_DB: bool = false;
-#[cfg(not(feature = "test-with-prod-db"))]
-const USE_MEMORY_DB: bool = true;
 
 pub fn generate_random_keypair(node_key_pair: &Keypair) -> NodeInfo {
     use crypto::ContactKeys;
@@ -94,7 +87,7 @@ pub struct IdleP2pTestHarness {
     pub temp_dir: TempDir,
     pub out_dir: PathBuf,
     pub out_dir_handler: Arc<dyn HostController>,
-    pub db: Arc<DbWrapper>,
+    pub db: DbRef,
     swarm: std::sync::Mutex<Option<Swarm<LocalNetworkBehaviour>>>,
     swarm_factory: TestSwarmFactory<Swarm<LocalNetworkBehaviour>>,
 }
@@ -105,18 +98,18 @@ impl IdleP2pTestHarness {
         swarm_factory: TestSwarmFactory<Swarm<LocalNetworkBehaviour>>,
         node_info: NodeInfo,
         peer_id: PeerId,
-        db: Option<Arc<DbWrapper>>,
+        db: Option<DbRef>,
+        temp_dir: Option<TempDir>,
     ) -> Self {
-        let temp_dir = TempDir::new().expect("failed to create tempdir");
+        let temp_dir =
+            temp_dir.unwrap_or_else(|| TempDir::new().expect("failed to create tempdir"));
         let out_dir = temp_dir.path().to_path_buf();
 
         let (brain_sender, brain_receiver) = mpsc::channel(50);
 
         let db = match db {
             Some(db) => db,
-            None => setup_test_db(Some(node_info.clone()), USE_MEMORY_DB)
-                .await
-                .pipe(Arc::new),
+            None => setup_test_db(Some(node_info.clone())).await,
         };
 
         let swarm = std::sync::Mutex::new(Some(swarm_factory().unwrap()));
@@ -139,17 +132,19 @@ impl IdleP2pTestHarness {
     #[instrument(skip_all, level = "trace")]
     pub async fn default() -> Self {
         let (swarm_factory, node_info, peer_id) = generate_swarm_factory(None);
-        Self::new(swarm_factory, node_info, peer_id, None).await
+        Self::new(swarm_factory, node_info, peer_id, None, None).await
     }
 
     /// Initializes the P2P test harness, creating the event loop and starting the brain.
     // #[instrument(skip_all, level = "trace")]
     pub async fn initialize(self) -> InitializingP2pTestHarness {
-        let (client_sender, _) = mpsc::channel(1);
+        let (client_sender, client_push_receiver) = mpsc::channel(256);
+        let shutdown = CancellationToken::new();
         let swarm_factory_clone = self.swarm_factory.clone();
-        let p2p = Arc::new(
+        let p2p = Arc::new(RwLock::new(
             P2pClient::new(
                 self.brain_sender.clone(),
+                shutdown.clone(),
                 Arc::new(move |_keypair: Keypair, _config: &[u8]| {
                     Ok(if let Some(swarm) = self.swarm.lock().unwrap().take() {
                         swarm
@@ -160,25 +155,26 @@ impl IdleP2pTestHarness {
             )
             .await
             .unwrap(),
-        );
+        ));
         self.brain_sender
             .send(BrainAction::NetworkNode(NetworkNodeAction::Ready))
             .await
             .unwrap();
         let p2p_clone = p2p.clone();
-        let db = self.db.db.clone();
+        let db = self.db.clone();
         let out_dir_handler = self.out_dir_handler.clone();
         let internal_data_dir = self.temp_dir.path().to_path_buf();
         let brain_runner = Brain::run(
             internal_data_dir,
             async move || db.clone(),
             async move || out_dir_handler.clone(),
-            async move || p2p_clone.clone() as Arc<dyn RunnableNetworkNode>,
+            async move || p2p_clone.clone() as BrainNetwork,
             async || Box::new(MockRunnableFilerequestServer {}) as _,
             self.brain_receiver,
             client_sender,
+            shutdown,
         );
-        let (brain_handle, _) = brain_runner.in_current_span().await;
+        let (brain_handle, giga_brain) = brain_runner.in_current_span().await;
 
         InitializingP2pTestHarness {
             p2p_client: p2p,
@@ -190,7 +186,9 @@ impl IdleP2pTestHarness {
             out_dir_handler: self.out_dir_handler,
             out_dir: self.out_dir,
             brain_handle,
+            giga_brain,
             swarm_factory: self.swarm_factory,
+            client_push_receiver: Some(client_push_receiver),
         }
     }
 
@@ -267,7 +265,7 @@ pub struct BrainlessIdleP2pTestHarness {
     pub temp_dir: TempDir,
     /// Path to the temp directory (for reading files)
     pub out_dir: PathBuf,
-    pub db: Arc<DbWrapper>,
+    pub db: DbRef,
     /// Must be available initially to connect other swarms, but will be moved out upon initialization
     pub swarm: std::sync::Mutex<Option<Swarm<LocalNetworkBehaviour>>>,
     pub swarm_factory: TestSwarmFactory<Swarm<LocalNetworkBehaviour>>,
@@ -289,9 +287,7 @@ impl BrainlessIdleP2pTestHarness {
         let (command_sender, command_receiver) =
             P2pClient::<CoreFileTracker, Swarm<LocalNetworkBehaviour>>::get_channel();
 
-        let db = setup_test_db(Some(node_info.clone()), USE_MEMORY_DB)
-            .await
-            .pipe(Arc::new);
+        let db = setup_test_db(Some(node_info.clone())).await;
 
         let swarm = swarm_factory().expect("Swarm factory should produce a swarm");
 
@@ -322,6 +318,7 @@ impl BrainlessIdleP2pTestHarness {
         let p2p_client = Arc::new(
             P2pClient::new(
                 self.brain_sender.clone(),
+                CancellationToken::new(),
                 Arc::new(move |_k: Keypair, _config: &[u8]| {
                     Ok(if let Some(swarm) = self.swarm.lock().unwrap().take() {
                         swarm
@@ -387,8 +384,8 @@ impl BrainlessIdleP2pTestHarness {
 
 /// This is a full Peer test harness in the second stage of initialization.
 pub struct InitializingP2pTestHarness {
-    pub p2p_client: Arc<P2pClient<CoreFileTracker, Swarm<LocalNetworkBehaviour>>>,
-    pub db: Arc<DbWrapper>,
+    pub p2p_client: Arc<RwLock<P2pClient<CoreFileTracker, Swarm<LocalNetworkBehaviour>>>>,
+    pub db: DbRef,
     pub node_info: NodeInfo,
     /// The Swarm's local PeerId
     pub peer_id: PeerId,
@@ -397,7 +394,11 @@ pub struct InitializingP2pTestHarness {
     pub out_dir_handler: Arc<dyn HostController>,
     pub out_dir: PathBuf,
     brain_handle: JoinHandle<()>,
+    giga_brain: GigaBrain,
     swarm_factory: TestSwarmFactory<Swarm<LocalNetworkBehaviour>>,
+    /// Messages the brain pushes toward connected clients. A test may `take()` this before
+    /// `run()` to assert against the pushes; otherwise `run()` spawns a task that drains it.
+    pub client_push_receiver: Option<mpsc::Receiver<ServerMessage>>,
 }
 
 #[allow(unused)]
@@ -411,6 +412,9 @@ impl InitializingP2pTestHarness {
     // TODO: The distinction between initializing and running harnesses has become obsolete.
     /// NoOp
     pub async fn run(self) -> RunningP2pTestHarness {
+        if let Some(mut rx) = self.client_push_receiver {
+            tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        }
         RunningP2pTestHarness {
             p2p_client: self.p2p_client,
             db: self.db,
@@ -421,6 +425,7 @@ impl InitializingP2pTestHarness {
             out_dir_handler: self.out_dir_handler,
             out_dir: self.out_dir,
             brain_handle: self.brain_handle,
+            giga_brain: self.giga_brain,
             swarm_factory: self.swarm_factory,
         }
     }
@@ -451,8 +456,8 @@ pub enum InterceptionRes {
 /// act like the real device would.
 #[allow(unused)]
 pub struct RunningP2pTestHarness {
-    pub p2p_client: Arc<P2pClient<CoreFileTracker, Swarm<LocalNetworkBehaviour>>>,
-    pub db: Arc<DbWrapper>,
+    pub p2p_client: Arc<RwLock<P2pClient<CoreFileTracker, Swarm<LocalNetworkBehaviour>>>>,
+    pub db: DbRef,
     pub node_info: NodeInfo,
     pub peer_id: PeerId,
     pub brain_sender: mpsc::Sender<BrainAction>,
@@ -460,6 +465,7 @@ pub struct RunningP2pTestHarness {
     pub out_dir_handler: Arc<dyn HostController>,
     pub out_dir: PathBuf,
     brain_handle: JoinHandle<()>,
+    giga_brain: GigaBrain,
     swarm_factory: TestSwarmFactory<Swarm<LocalNetworkBehaviour>>,
 }
 
@@ -553,7 +559,10 @@ impl RunningP2pTestHarness {
         tokio::join!(interception, work);
     }
 
-    pub fn abort(&self) {
+    /// Crash the whole node: stop the p2p event loop (and other workloads) before
+    /// the brain, so it can't serve requests against a torn-down brain.
+    pub async fn abort(&self) {
+        self.giga_brain.shutdown_workloads().await;
         self.brain_handle.abort();
     }
 
@@ -671,7 +680,7 @@ impl RunningP2pTestHarness {
         self,
         connectors: Vec<&RunningP2pTestHarness>,
     ) -> IdleP2pTestHarness {
-        self.abort();
+        self.abort().await;
 
         let mut reborn_swarm = (self.swarm_factory)().unwrap();
 
@@ -682,9 +691,11 @@ impl RunningP2pTestHarness {
             let (swarm_sender, swarm_receiver) = tokio::sync::oneshot::channel();
             connector
                 .p2p_client
+                .read()
+                .await
                 .inner_async_event_sender
                 .send(InnerAsyncEvent::ConnectOtherSwarm {
-                    other: swarm_harbor.take().expect("Only one connector allowed"),
+                    other: Box::new(swarm_harbor.take().expect("Only one connector allowed")),
                     return_connected_sender: swarm_sender,
                 })
                 .expect("Connecting to reborn swarm should succeed");
@@ -709,6 +720,7 @@ impl RunningP2pTestHarness {
             self.node_info,
             self.peer_id,
             Some(self.db),
+            Some(self.temp_dir),
         )
         .instrument(span!(Level::INFO, "Crashing reborn setup"))
         .await
@@ -788,7 +800,7 @@ pub fn generate_random_node_info(keypair: &Keypair) -> NodeInfo {
 /// It also handles the `GetNodeKeys` action to respond with the node's keys.
 #[instrument(skip_all, level = "trace")]
 pub async fn wait_for_ready(brain_receiver: &mut mpsc::Receiver<BrainAction>, node_info: NodeInfo) {
-    timeout(1.seconds(), async {
+    timeout(3.seconds(), async {
         loop {
             let action = brain_receiver.recv().await.expect("sender dropped");
             match action {

@@ -2,7 +2,6 @@ use crypto::{Encrypted, SerCryptError};
 
 use crate::Chunk;
 
-
 #[derive(Debug)]
 pub enum ReadCryptResult {
     Ok(Chunk, Encrypted<Chunk>),

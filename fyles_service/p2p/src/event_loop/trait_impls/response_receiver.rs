@@ -4,13 +4,16 @@ use crate::event_loop::{LocalNetworkSwarm, RefCountEventLoopData};
 use crate::send_receive_traits::response_receiver::ResponseReceiver;
 use crate::send_receive_traits::session_send_receive::ReceiveError;
 use crate::types::FileResponse;
+use crate::types::Wrap;
 use async_trait::async_trait;
 use crypto::{DeSerCryptError, SerCryptError};
 use fyles_core::core::brain::action::BrainAction;
 use fyles_core::core::brain::action_p2p::NetworkNodeAction;
+use fyles_core::core::brain::types::PubkeyFetchResponse;
 use fyles_core::core::domain_models::{Contact, ContactId, SelfContact};
-use libp2p::request_response::OutboundFailure;
+use fyles_core::core::sync::SyncResponse;
 use libp2p::PeerId;
+use libp2p::request_response::OutboundFailure;
 use std::sync::Arc;
 use tracing::{trace, warn};
 
@@ -68,7 +71,7 @@ impl<T: FileTracker, S: LocalNetworkSwarm> ResponseReceiver<SelfContact>
 
     async fn receive_response(
         &self,
-        _node_id: Self::NodeId,
+        node_id: Self::NodeId,
         _contact_id: Option<ContactId>,
         _request_id: Result<Self::RequestId, ()>,
         response: SelfContact,
@@ -76,6 +79,7 @@ impl<T: FileTracker, S: LocalNetworkSwarm> ResponseReceiver<SelfContact>
         self.brain_action_sender
             .send(BrainAction::NetworkNode(NetworkNodeAction::UpdateIdentity(
                 response,
+                node_id.wrap(),
             )))
             .await
             .expect("Sending to work");
@@ -100,6 +104,102 @@ impl<T: FileTracker, S: LocalNetworkSwarm> ResponseReceiver<SelfContact>
             ))
             .await
             .expect("Sending to work");
+    }
+}
+
+#[async_trait]
+impl<T: FileTracker, S: LocalNetworkSwarm> ResponseReceiver<SyncResponse>
+    for RefCountEventLoopData<T, S>
+{
+    type DecryptError = DeSerCryptError;
+    type TransportError = OutboundFailure;
+    type EncryptError = SerCryptError;
+    type GetSessionError = Arc<SessionEstablishmentError>;
+    type NodeId = PeerId;
+    type RequestId = usize;
+
+    async fn receive_response(
+        &self,
+        node_id: Self::NodeId,
+        _contact_id: Option<ContactId>,
+        _request_id: Result<Self::RequestId, ()>,
+        response: SyncResponse,
+    ) {
+        self.brain_action_sender
+            .send(BrainAction::NetworkNode(
+                NetworkNodeAction::SyncReplyReceived {
+                    peer: node_id.wrap(),
+                    reply: response,
+                },
+            ))
+            .await
+            .expect("Sending to work");
+    }
+
+    async fn handle_receive_error(
+        &self,
+        node_id: Self::NodeId,
+        _request_id: Result<Self::RequestId, ()>,
+        error: ReceiveError<
+            Self::TransportError,
+            Self::DecryptError,
+            Self::EncryptError,
+            Self::GetSessionError,
+        >,
+    ) {
+        warn!(peer=?node_id, ?error, "Error receiving sync response");
+        // The exchange failed; drop any in-flight sync state so a later attempt starts fresh.
+        self.brain_action_sender
+            .send(BrainAction::NetworkNode(
+                NetworkNodeAction::SyncTransportFailed {
+                    peer: node_id.wrap(),
+                },
+            ))
+            .await
+            .expect("Sending to work");
+    }
+}
+
+#[async_trait]
+impl<T: FileTracker, S: LocalNetworkSwarm> ResponseReceiver<PubkeyFetchResponse>
+    for RefCountEventLoopData<T, S>
+{
+    type DecryptError = DeSerCryptError;
+    type TransportError = OutboundFailure;
+    type EncryptError = SerCryptError;
+    type GetSessionError = Arc<SessionEstablishmentError>;
+    type NodeId = PeerId;
+    type RequestId = usize;
+
+    async fn receive_response(
+        &self,
+        _node_id: Self::NodeId,
+        _contact_id: Option<ContactId>,
+        _request_id: Result<Self::RequestId, ()>,
+        response: PubkeyFetchResponse,
+    ) {
+        self.brain_action_sender
+            .send(BrainAction::NetworkNode(
+                NetworkNodeAction::StoreFetchedContactKeys(response),
+            ))
+            .await
+            .expect("Sending to work");
+    }
+
+    async fn handle_receive_error(
+        &self,
+        node_id: Self::NodeId,
+        _request_id: Result<Self::RequestId, ()>,
+        error: ReceiveError<
+            Self::TransportError,
+            Self::DecryptError,
+            Self::EncryptError,
+            Self::GetSessionError,
+        >,
+    ) {
+        // Non-fatal: the contact stays keyless and is re-fetched on the next Contacts sync
+        // convergence (fetch_missing_contact_keys re-checks the cache each time).
+        warn!(peer=?node_id, ?error, "Error receiving pubkey fetch response");
     }
 }
 

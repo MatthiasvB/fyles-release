@@ -6,12 +6,14 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::Receiver;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
-use tonic::{async_trait, Request, Response, Status, Streaming};
-use tracing::{debug, error, info, span, warn, Instrument};
+use tonic::{Request, Response, Status, Streaming, async_trait};
+use tokio_util::sync::CancellationToken;
+use tracing::{Instrument, debug, error, info, span, warn};
 
+use crate::Endpoint;
 use crate::core::api_server::stream_registry::{DroppableStream, StreamId, StreamRegistry};
 use crate::core::api_server::tcp_token_interceptor::bearer_auth_interceptor;
 use crate::core::domain_models::RemoteFilerequest;
@@ -22,6 +24,7 @@ use crate::library::wire::api::node_status::State;
 use crate::library::wire::api::node_status_service_server::{
     NodeStatusService, NodeStatusServiceServer,
 };
+use crate::library::wire::api::resolve_filerequest_location_response::Location;
 use crate::library::wire::api::{
     BackupDataRequest, BackupDataResponse, ClientMessage, DeletePendingFileRequest,
     DeletePendingFileResponse, DeleteReceivedFileRequest, DeleteReceivedFileResponse,
@@ -32,42 +35,44 @@ use crate::library::wire::api::{
     GetNodeStatusResponse, GetPendingFileRequest, GetPendingFileResponse,
     GetRemoteFileRequestRequest, GetRemoteFileRequestResponse, GetSelfContactDisplayRequest,
     GetSelfContactDisplayResponse, GetSelfContactInviteChallengeRequest,
-    GetSelfContactInviteChallengeResponse, GetSettingsRequest, GetSettingsResponse,
-    HealthCheckRequest, HealthCheckResponse, ListPendingFilesRequest, ListPendingFilesResponse,
-    ListReceivedFilesRequest, ListReceivedFilesResponse, ListRemoteFileRequestsRequest,
-    ListRemoteFileRequestsResponse, NodeInfo, NodeStats, NodeStatus, RegisterContactRequest,
-    RegisterContactResponse, RestoreDataRequest, RestoreDataResponse, ServerMessage,
+    GetSelfContactInviteChallengeResponse, HealthCheckRequest, HealthCheckResponse,
+    ListPendingFilesRequest, ListPendingFilesResponse, ListReceivedFilesRequest,
+    ListReceivedFilesResponse, ListRemoteFileRequestsRequest, ListRemoteFileRequestsResponse,
+    NodeInfo, NodeStats, NodeStatus, RegisterContactRequest, RegisterContactResponse,
+    ResolveFilerequestLocationRequest, ResolveFilerequestLocationResponse, RestoreDataRequest,
+    RestoreDataResponse, ServerMessage, SettingsRequestEnvelope, SettingsResponseEnvelope,
     SharePublicSelfContactRequest, SharePublicSelfContactResponse, StorePendingFileRequest,
     StorePendingFileResponse, StoreRemoteFileRequestRequest, StoreRemoteFileRequestResponse,
     UnregisterContactShareChallengeRequest, UnregisterContactShareChallengeResponse,
     UnregisterSelfContactInviteChallengeRequest, UnregisterSelfContactInviteChallengeResponse,
     UpdateIdentityRequest, UpdateIdentityResponse, UpdateRemoteFileRequestRequest,
     UpdateRemoteFileRequestResponse, UpdateSelfContactNameRequest, UpdateSelfContactNameResponse,
-    UpdateSettingsRequest, UpdateSettingsResponse, UseContactShareChallengeRequest,
-    UseContactShareChallengeResponse, UseSelfContactInviteRequest, UseSelfContactInviteResponse,
-    WaitForReadyRequest, WaitForReadyResponse,
+    UseContactShareChallengeRequest, UseContactShareChallengeResponse, UseSelfContactInviteRequest,
+    UseSelfContactInviteResponse, WaitForReadyRequest, WaitForReadyResponse,
 };
 use crate::library::wire::{
-    api::{
-        file_request_service_server::FileRequestService, CreateFileRequestRequest, CreateFileRequestResponse,
-        DeleteContactRequest, DeleteContactResponse, DeleteFileRequestRequest,
-        DeleteFileRequestResponse, FileRequestProto, FileRequestRequest, FileRequestResponse,
-        GetAllContactsRequest, GetAllContactsResponse, GetAllFileRequestsRequest,
-        GetAllFileRequestsResponse, GetContactNameRequest, GetContactNameResponse,
-        GetContactNamesRequest, GetContactNamesResponse, GetContactRequest, GetContactResponse,
-        GetVersionRequest, GetVersionResponse, ShutdownRequest, ShutdownResponse,
-        UpdateContactRequest, UpdateContactResponse, UpdateFileRequestRequest,
-        UpdateFileRequestResponse,
-    },
     RunnableFilerequestServer,
+    api::{
+        CreateFileRequestRequest, CreateFileRequestResponse, DeleteContactRequest,
+        DeleteContactResponse, DeleteFileRequestRequest, DeleteFileRequestResponse,
+        FileRequestProto, FileRequestRequest, FileRequestResponse, GetAllContactsRequest,
+        GetAllContactsResponse, GetAllFileRequestsRequest, GetAllFileRequestsResponse,
+        GetContactNameRequest, GetContactNameResponse, GetContactNamesRequest,
+        GetContactNamesResponse, GetContactRequest, GetContactResponse, GetVersionRequest,
+        GetVersionResponse, ListOwnedDevicesRequest, ListOwnedDevicesResponse, OwnedDeviceProto,
+        RemoveOwnedDeviceRequest, RemoveOwnedDeviceResponse, RenameThisDeviceRequest,
+        RenameThisDeviceResponse, ShutdownRequest, ShutdownResponse, UpdateContactRequest,
+        UpdateContactResponse, UpdateFileRequestRequest, UpdateFileRequestResponse,
+        file_request_service_server::FileRequestService,
+    },
 };
-use crate::Endpoint;
 
 use super::brain::action_client::ClientAction;
+use super::brain::error::FilerequestError;
 use super::brain::types::BrainRequest;
 use super::brain::{self, action::BrainAction};
 
-use super::domain_models::{CreateFilerequest, Filerequest};
+use super::domain_models::{CreateFilerequest, Filerequest, FilerequestLocation, PeerIdWrapper};
 
 pub mod stream_registry;
 mod tcp_token_interceptor;
@@ -78,6 +83,7 @@ pub struct ApiServer {
     stream_registry: Arc<StreamRegistry<Result<ServerMessage, Status>, ClientMessage>>,
     endpoint: Endpoint,
     internal_data_dir: PathBuf,
+    shutdown: CancellationToken,
 }
 
 impl ApiServer {
@@ -86,6 +92,7 @@ impl ApiServer {
         endpoint: Endpoint,
         internal_data_dir: PathBuf,
         mut receiver: Receiver<ServerMessage>,
+        shutdown: CancellationToken,
     ) -> Self {
         let sender_clone = action_sender.clone();
         let stream_registry = Arc::new(StreamRegistry::new(
@@ -96,12 +103,11 @@ impl ApiServer {
                         // Handle incoming messages here
                         match msg_result {
                             Ok(msg) => {
-                                // Process the incoming message
-                                println!("Received message on stream {}: {:?}", stream_id, msg);
                                 match msg.message.expect("Message is non-optional") {
                                     Message::StoreRemoteFileRequest(
                                         store_remote_file_request_request,
                                     ) => {
+                                        debug!(%stream_id, "Received remote filerequest on stream");
                                         let (request, _) = BrainRequest::with_receiver(
                                             store_remote_file_request_request
                                                 .remote_file_request
@@ -111,6 +117,17 @@ impl ApiServer {
                                         action_sender
                                             .send(BrainAction::Client(
                                                 ClientAction::CreateRemoteFilerequest(request),
+                                            ))
+                                            .await
+                                            .unwrap();
+                                    }
+                                    // Not logged: arrives every few seconds from every client.
+                                    Message::Heartbeat(heartbeat) => {
+                                        action_sender
+                                            .send(BrainAction::Client(
+                                                ClientAction::ClientHeartbeat {
+                                                    foreground: heartbeat.foreground,
+                                                },
                                             ))
                                             .await
                                             .unwrap();
@@ -136,13 +153,16 @@ impl ApiServer {
             stream_registry,
             internal_data_dir,
             endpoint,
+            shutdown,
         }
     }
+
 }
 
 #[async_trait]
 impl RunnableFilerequestServer for ApiServer {
     async fn run(self: Box<Self>) {
+        let shutdown = self.shutdown.clone();
         match &self.endpoint {
             Endpoint::Tcp { host, port } => {
                 // let addr = format!("{}:{}", host, port)
@@ -184,7 +204,7 @@ impl RunnableFilerequestServer for ApiServer {
                         auth.clone(),
                     ))
                     .add_service(NodeStatusServiceServer::with_interceptor(*self, auth))
-                    .serve_with_incoming(incoming)
+                    .serve_with_incoming_shutdown(incoming, shutdown.cancelled_owned())
                     .await
                     .expect("API server to serve");
             }
@@ -217,7 +237,7 @@ impl RunnableFilerequestServer for ApiServer {
                     Server::builder()
                         .add_service(FileRequestServiceServer::new(*self.clone()))
                         .add_service(NodeStatusServiceServer::new(*self))
-                        .serve_with_incoming(incoming)
+                        .serve_with_incoming_shutdown(incoming, shutdown.cancelled_owned())
                         .await
                         .expect("Api server to serve");
                 }
@@ -292,6 +312,9 @@ impl FileRequestService for ApiServer {
                     access: inner.access,
                 }),
             })),
+            Err(e @ FilerequestError::FolderClaimed { .. }) => {
+                Err(Status::already_exists(e.to_string()))
+            }
             Err(e) => Err(Status::internal(e.to_string())),
         }
     }
@@ -361,6 +384,9 @@ impl FileRequestService for ApiServer {
             Ok(_) => Ok(Response::new(UpdateFileRequestResponse {
                 file_request: Some(file_request),
             })),
+            Err(e @ FilerequestError::FolderClaimed { .. }) => {
+                Err(Status::already_exists(e.to_string()))
+            }
             Err(e) => Err(Status::internal(e.to_string())),
         }
     }
@@ -590,6 +616,71 @@ impl FileRequestService for ApiServer {
         }
     }
 
+    async fn list_owned_devices(
+        &self,
+        _request: Request<ListOwnedDevicesRequest>,
+    ) -> Result<Response<ListOwnedDevicesResponse>, Status> {
+        let (request, response) = BrainRequest::with_receiver(());
+        self.action_sender
+            .send(BrainAction::Client(ClientAction::ListOwnedDevices(request)))
+            .await
+            .map_err(|_| Status::internal("Failed to send action"))?;
+        let result = response
+            .await
+            .map_err(|_| Status::internal("Failed to receive response"))?;
+        match result {
+            Ok(devices) => Ok(Response::new(ListOwnedDevicesResponse {
+                devices: devices
+                    .into_iter()
+                    .map(|(peer_id, name)| OwnedDeviceProto {
+                        peer_id: peer_id.0,
+                        name,
+                    })
+                    .collect(),
+            })),
+            Err(e) => Err(Status::internal(e.to_string())),
+        }
+    }
+
+    async fn rename_this_device(
+        &self,
+        request: Request<RenameThisDeviceRequest>,
+    ) -> Result<Response<RenameThisDeviceResponse>, Status> {
+        let (request, response) = BrainRequest::with_receiver(request.into_inner().name);
+        self.action_sender
+            .send(BrainAction::Client(ClientAction::RenameThisDevice(request)))
+            .await
+            .map_err(|_| Status::internal("Failed to send action"))?;
+        let result = response
+            .await
+            .map_err(|_| Status::internal("Failed to receive response"))?;
+        match result {
+            Ok(_) => Ok(Response::new(RenameThisDeviceResponse { success: true })),
+            Err(e) => Err(Status::internal(e.to_string())),
+        }
+    }
+
+    async fn remove_owned_device(
+        &self,
+        request: Request<RemoveOwnedDeviceRequest>,
+    ) -> Result<Response<RemoveOwnedDeviceResponse>, Status> {
+        let (request, response) =
+            BrainRequest::with_receiver(PeerIdWrapper(request.into_inner().peer_id));
+        self.action_sender
+            .send(BrainAction::Client(ClientAction::RemoveOwnedDevice(
+                request,
+            )))
+            .await
+            .map_err(|_| Status::internal("Failed to send action"))?;
+        let result = response
+            .await
+            .map_err(|_| Status::internal("Failed to receive response"))?;
+        match result {
+            Ok(_) => Ok(Response::new(RemoveOwnedDeviceResponse { success: true })),
+            Err(e) => Err(Status::internal(e.to_string())),
+        }
+    }
+
     async fn update_self_contact_name(
         &self,
         request: Request<UpdateSelfContactNameRequest>,
@@ -650,15 +741,10 @@ impl FileRequestService for ApiServer {
 
         let response = response_sender.await.expect("Sender not to be dropped");
 
-        let proto = match response {
-            Ok(r) => r
-                .try_into()
-                .map_err(|_| Status::internal("Unable to serialize SelfContact")),
-            Err(_) => Err(Status::internal("Unable to get SelfContact")),
-        }?;
+        let invite = response.map_err(|_| Status::internal("Unable to get self-contact invite"))?;
 
         Ok(Response::new(GetFullSelfContactResponse {
-            contact: Some(proto),
+            invite: Some(invite.into()),
         }))
     }
 
@@ -666,15 +752,15 @@ impl FileRequestService for ApiServer {
         &self,
         new_self_contact: Request<UpdateIdentityRequest>,
     ) -> Result<Response<UpdateIdentityResponse>, Status> {
-        let new_self_contact = new_self_contact
+        let invite = new_self_contact
             .into_inner()
-            .self_contact
-            .ok_or_else(|| Status::invalid_argument("Missing contact in UpdateIdentityRequest"))?
+            .invite
+            .ok_or_else(|| Status::invalid_argument("Missing invite in UpdateIdentityRequest"))?
             .try_into()
             .map_err(|e: SelfContactDeserializationError| {
                 Status::invalid_argument(e.to_string())
             })?;
-        let (request, response_sender) = BrainRequest::with_receiver(new_self_contact);
+        let (request, response_sender) = BrainRequest::with_receiver(invite);
 
         self.action_sender
             .send(BrainAction::Client(ClientAction::UpdateIdentity(request)))
@@ -737,8 +823,7 @@ impl FileRequestService for ApiServer {
             Ok(response) => Ok(Response::new(SharePublicSelfContactResponse {
                 sharable_contact: Some(
                     response
-                        .try_into()
-                        .map_err(|_| Status::internal("Failed to serialize SelfContact"))?,
+                        .into(),
                 ),
             })),
             Err(e) => Err(Status::internal(e.to_string())),
@@ -1195,6 +1280,40 @@ impl FileRequestService for ApiServer {
         }
     }
 
+    async fn resolve_filerequest_location(
+        &self,
+        request: Request<ResolveFilerequestLocationRequest>,
+    ) -> Result<Response<ResolveFilerequestLocationResponse>, Status> {
+        let (response_sender, response_receiver) = oneshot::channel();
+
+        self.action_sender
+            .send(BrainAction::Client(
+                ClientAction::ResolveFilerequestLocation(brain::types::BrainRequest {
+                    request: request.into_inner().filerequest_id.into(),
+                    response_sender: Mutex::new(Some(response_sender)),
+                }),
+            ))
+            .await
+            .map_err(|_| Status::internal("dispatch failed"))?;
+
+        let result = response_receiver
+            .await
+            .map_err(|_| Status::internal("no response"))?;
+
+        match result {
+            Ok(resolved) => {
+                let location = match resolved {
+                    FilerequestLocation::Absolute(path) => Location::AbsolutePath(path),
+                    FilerequestLocation::Relative(path) => Location::RelativePath(path),
+                };
+                Ok(Response::new(ResolveFilerequestLocationResponse {
+                    location: Some(location),
+                }))
+            }
+            Err(e) => Err(Status::internal(e.to_string())),
+        }
+    }
+
     async fn get_self_contact_invite_challenge(
         &self,
         _request: Request<GetSelfContactInviteChallengeRequest>,
@@ -1376,56 +1495,30 @@ impl FileRequestService for ApiServer {
         }))
     }
 
-    async fn update_settings(
+    async fn settings(
         &self,
-        request: Request<UpdateSettingsRequest>,
-    ) -> Result<Response<UpdateSettingsResponse>, Status> {
-        let settings = request.into_inner().settings;
+        request: Request<SettingsRequestEnvelope>,
+    ) -> Result<Response<SettingsResponseEnvelope>, Status> {
+        let request_bytes = request.into_inner().request;
         let (response_sender, response_receiver) = oneshot::channel();
 
         self.action_sender
-            .send(BrainAction::Client(ClientAction::UpdateSettings(
+            .send(BrainAction::Client(ClientAction::Settings(
                 brain::types::BrainRequest {
-                    request: settings,
+                    request: request_bytes,
                     response_sender: Mutex::new(Some(response_sender)),
                 },
             )))
             .await
-            .map_err(|_| Status::internal("Failed to send update_settings action"))?;
+            .map_err(|_| Status::internal("Failed to send settings action"))?;
 
         let result = response_receiver
             .await
             .map_err(|_| Status::internal("Failed to receive response"))?;
 
         match result.as_ref() {
-            Ok(()) => Ok(Response::new(UpdateSettingsResponse { success: true })),
-            Err(e) => Err(Status::internal(e.to_string())),
-        }
-    }
-
-    async fn get_settings(
-        &self,
-        _request: Request<GetSettingsRequest>,
-    ) -> Result<Response<GetSettingsResponse>, Status> {
-        let (response_sender, response_receiver) = oneshot::channel();
-
-        self.action_sender
-            .send(BrainAction::Client(ClientAction::GetSettings(
-                brain::types::BrainRequest {
-                    request: (),
-                    response_sender: Mutex::new(Some(response_sender)),
-                },
-            )))
-            .await
-            .map_err(|_| Status::internal("Failed to send get_settings action"))?;
-
-        let result = response_receiver
-            .await
-            .map_err(|_| Status::internal("Failed to receive response"))?;
-
-        match result.as_ref() {
-            Ok(settings) => Ok(Response::new(GetSettingsResponse {
-                settings: settings.clone(),
+            Ok(response) => Ok(Response::new(SettingsResponseEnvelope {
+                response: response.clone(),
             })),
             Err(e) => Err(Status::internal(e.to_string())),
         }
@@ -1540,6 +1633,27 @@ impl FileRequestService for MockRunnableFilerequestServer {
         Ok(Response::new(GetVersionResponse {
             version: env!("CARGO_PKG_VERSION").to_string(),
         }))
+    }
+
+    async fn list_owned_devices(
+        &self,
+        _request: Request<ListOwnedDevicesRequest>,
+    ) -> Result<Response<ListOwnedDevicesResponse>, Status> {
+        todo!("Mock don't do nothing")
+    }
+
+    async fn rename_this_device(
+        &self,
+        _request: Request<RenameThisDeviceRequest>,
+    ) -> Result<Response<RenameThisDeviceResponse>, Status> {
+        todo!("Mock don't do nothing")
+    }
+
+    async fn remove_owned_device(
+        &self,
+        _request: Request<RemoveOwnedDeviceRequest>,
+    ) -> Result<Response<RemoveOwnedDeviceResponse>, Status> {
+        todo!("Mock don't do nothing")
     }
 
     async fn shutdown(
@@ -1759,6 +1873,13 @@ impl FileRequestService for MockRunnableFilerequestServer {
         todo!("Mock don't do nothing")
     }
 
+    async fn resolve_filerequest_location(
+        &self,
+        _request: Request<ResolveFilerequestLocationRequest>,
+    ) -> Result<Response<ResolveFilerequestLocationResponse>, Status> {
+        todo!("Mock don't do nothing")
+    }
+
     async fn get_self_contact_invite_challenge(
         &self,
         _request: Request<GetSelfContactInviteChallengeRequest>,
@@ -1815,17 +1936,10 @@ impl FileRequestService for MockRunnableFilerequestServer {
         todo!("Mock don't do nothing")
     }
 
-    async fn update_settings(
+    async fn settings(
         &self,
-        _request: Request<UpdateSettingsRequest>,
-    ) -> Result<Response<UpdateSettingsResponse>, Status> {
-        todo!("Mock don't do nothing")
-    }
-
-    async fn get_settings(
-        &self,
-        _request: Request<GetSettingsRequest>,
-    ) -> Result<Response<GetSettingsResponse>, Status> {
+        _request: Request<SettingsRequestEnvelope>,
+    ) -> Result<Response<SettingsResponseEnvelope>, Status> {
         todo!("Mock don't do nothing")
     }
 

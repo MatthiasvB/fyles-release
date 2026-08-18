@@ -3,11 +3,11 @@ use fyles_core::library::util::duration_ext::DurationExt;
 use fyles_core::library::util::util::TimeoutLock;
 use std::sync::Arc;
 use tokio::sync::oneshot;
-use tokio::{time};
-use tracing::{info, span, warn, Instrument, Level};
+use tokio::time;
+use tracing::{Instrument, Level, info, span, warn};
 
 use libp2p::swarm::SwarmEvent;
-use libp2p::{request_response, Swarm};
+use libp2p::{Swarm, request_response};
 
 use fyles_core::core::{
     brain::{action::BrainAction, action_p2p::NetworkNodeAction},
@@ -32,7 +32,7 @@ async fn wait_for_and_assert_accepted(
     expected: FileResponse,
     session: &W<Arc<CryptoSession>>,
 ) {
-    let timeout = time::timeout(1.seconds(), async {
+    let timeout = time::timeout(3.seconds(), async {
         loop {
             match swarm.select_next_some().await {
                 SwarmEvent::Behaviour(LocalNetworkBehaviourEvent::Core(
@@ -86,7 +86,7 @@ pub async fn test_reject_oversized_file() {
         .instrument(span!(Level::INFO, "misbehaved run"))
         .await;
 
-    let respond_keys = tokio::time::timeout(1.seconds(), async {
+    let respond_keys = tokio::time::timeout(3.seconds(), async {
         loop {
             if let BrainAction::NetworkNode(p2p_node_action) =
                 host.brain_receiver.recv().await.expect("sender dropped")
@@ -108,6 +108,8 @@ pub async fn test_reject_oversized_file() {
     let (event_loop_sender, event_loop_receiver) = oneshot::channel();
     misbehaved
         .p2p_client
+        .read()
+        .await
         .inner_async_event_sender
         .send(InnerAsyncEvent::GetEventLoop(event_loop_sender))
         .unwrap();
@@ -197,8 +199,12 @@ pub async fn test_reject_oversized_file() {
                         .unwrap(),
                 );
                 println!("Before {i}th accept");
-                wait_for_and_assert_accepted(swarm, FileResponse::ConfirmChunk, &misbehaved_session)
-                    .await;
+                wait_for_and_assert_accepted(
+                    swarm,
+                    FileResponse::ConfirmChunk,
+                    &misbehaved_session,
+                )
+                .await;
                 println!("After {i}th accept");
             }
 

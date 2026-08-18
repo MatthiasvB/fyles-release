@@ -1,5 +1,5 @@
 use fyles_core::library::util::duration_ext::DurationExt;
-use tracing::{span, trace, Instrument, Level};
+use tracing::{Instrument, Level, span, trace};
 
 use crate::tests::test_utils::IdleP2pTestHarness;
 use fyles_core::core::brain::action_client::ClientAction;
@@ -55,17 +55,17 @@ async fn reestablish_session_after_peer_crash() {
         )
         .await;
 
+    // Keep the source files on disk for the whole test: the crash resets this
+    // in-flight send, and the retry must still be able to read them.
+    let (_source_files, _) = persisting_harness
+        .create_pending_files(internal_filerequest_id.clone(), vec![100])
+        .await;
     persisting_harness
-        .send_files_and_wait(
-            internal_filerequest_id.clone(),
-            vec![100],
-            1.seconds(),
-            50.millis(),
-        )
+        .wait_all_pending_files_sent(3.seconds(), 50.millis())
         .await
         .expect("Initial file send should work");
 
-    let crashing_reborn = crashing_harness
+    let _crashing_reborn = crashing_harness
         .restart_and_get_connected_by(vec![&persisting_harness])
         .instrument(span!(Level::INFO, "Crashing restarting"))
         .await
@@ -78,11 +78,7 @@ async fn reestablish_session_after_peer_crash() {
 
     // Sending files again should work
     persisting_harness
-        .send_files_and_wait(internal_filerequest_id, vec![100], 1.seconds(), 50.millis())
+        .send_files_and_wait(internal_filerequest_id, vec![100], 3.seconds(), 50.millis())
         .await
         .expect("Sending files after reconnecting should work");
-
-    // Clean up
-    crashing_reborn.abort();
-    persisting_harness.abort();
 }

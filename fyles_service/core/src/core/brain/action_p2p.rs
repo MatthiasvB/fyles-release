@@ -2,7 +2,7 @@ use crypto::{ContactKeys, ContactPublicKeys};
 
 use crate::{
     core::{
-        brain::types::{ContactShareChallenge, SelfContactInviteChallenge},
+        brain::types::{ContactShareChallenge, PubkeyFetchResponse, SelfContactInviteChallenge},
         domain_models::{Contact, ContactId, FylesId, SelfContact},
         filerequest_drive_handler::FilerequestDriveHandler,
         p2p::NodeKeyPairBinary,
@@ -13,8 +13,22 @@ use crate::{
 use super::types::{BrainRequest, FilerequestResult};
 
 use crate::core::domain_models::{
-    CompleteReceivedFile, CreateIncomingFile, ReceiveStatus, SendStatus,
+    CompleteReceivedFile, CreateIncomingFile, PeerIdWrapper, ReceiveStatus, SendStatus,
 };
+use crate::core::sync::{DocKind, SyncRequest, SyncResponse};
+
+#[derive(Debug)]
+pub struct SyncReceiveRequest {
+    pub contact_id: ContactId,
+    pub peer: PeerIdWrapper,
+    pub wire: SyncRequest,
+}
+
+#[derive(Debug)]
+pub struct PubkeyFetchReceiveRequest {
+    pub contact_id: ContactId,
+    pub wanted_contact_ids: Vec<ContactId>,
+}
 
 #[derive(Clone)]
 #[cfg_attr(any(test, feature = "test-support"), derive(PartialEq, Debug))]
@@ -41,6 +55,7 @@ pub struct OpenFileForReadingRequest {
     pub byte_offset: u64,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum NetworkNodeAction {
     RequestFileDrop(
@@ -51,6 +66,10 @@ pub enum NetworkNodeAction {
         BrainRequest<FilerequestContinueRequest, Option<FilerequestContinueResponse>>,
     ),
     GetNodeInfo(BrainRequest<(), FilerequestResult<(NodeInfo, Vec<u8>)>>),
+    /// Persist an opaque settings blob. Store-only (no apply) — the network node is
+    /// the applier and owns settings persistence. Awaitable so the caller can be
+    /// sure the write is durable (e.g. before telling the UI a change succeeded).
+    PersistSettings(BrainRequest<Vec<u8>, FilerequestResult<()>>),
     Ready,
     FileSending {
         pending_file_id: FylesId,
@@ -93,12 +112,17 @@ pub enum NetworkNodeAction {
         transfer_id: FylesId,
     },
     GetContactPublicKeys(BrainRequest<ContactId, Option<ContactPublicKeys>>),
+    /// Batched key lookup for the pubkey-fetch responder. `None` means decline to answer at all —
+    /// the requesting session isn't one of our own devices.
+    GetContactsPublicKeys(
+        BrainRequest<PubkeyFetchReceiveRequest, Option<Vec<(ContactId, ContactPublicKeys)>>>,
+    ),
     IsContactKnown(BrainRequest<ContactId, Result<bool, String>>),
     OpenFileForReading(BrainRequest<OpenFileForReadingRequest, Result<FileMeta, ()>>),
     ValidateSelfContactInviteChallenge(
         BrainRequest<SelfContactInviteChallenge, Option<SelfContact>>,
     ),
-    UpdateIdentity(SelfContact),
+    UpdateIdentity(SelfContact, PeerIdWrapper),
     AnsweredSelfContactInvite,
     RejectedSelfContactInvite,
     SelfContactInviteGotRejected,
@@ -107,6 +131,21 @@ pub enum NetworkNodeAction {
     AnsweredContactShare,
     RejectedContactShare,
     ContactShareGotRejected,
+    /// `None` means don't reply at all, likely because we suspect being under attack.
+    SyncReceive(BrainRequest<SyncReceiveRequest, Option<SyncResponse>>),
+    SyncReplyReceived {
+        peer: PeerIdWrapper,
+        reply: SyncResponse,
+    },
+    SyncOnPeerConnect(PeerIdWrapper),
+    SyncDocWithPeer {
+        peer: PeerIdWrapper,
+        kind: DocKind,
+    },
+    SyncTransportFailed {
+        peer: PeerIdWrapper,
+    },
+    StoreFetchedContactKeys(PubkeyFetchResponse),
 }
 
 #[derive(Debug)]

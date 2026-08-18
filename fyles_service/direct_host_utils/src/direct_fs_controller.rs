@@ -1,9 +1,14 @@
+use crate::i18n::{Language, init_i18n};
+use crate::tr;
 use async_trait::async_trait;
 use chrono::Local;
 use derive_more::Deref;
 use fyles_core::core::filerequest_drive_handler::GetFileError;
-use fyles_core::core::notification::Notification;
-use fyles_core::io_controller::{BoxedError, FileMeta, FileNamespace, HostController, OutgoingFileInfo, Uri};
+use fyles_core::core::notification::{FileSender, Notification};
+use fyles_core::io_controller::{
+    BoxedError, FileMeta, FileNamespace, HostController, OWNER_MARKER_FILENAME, OutgoingFileInfo,
+    OwnershipOutcome, RenameOutcome, Uri,
+};
 use sanitize_filename::sanitize;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -12,8 +17,6 @@ use tap::Tap;
 use thiserror::Error;
 use tokio::fs::{self, File};
 use tracing::{error, info, instrument, trace, warn};
-use crate::i18n::{init_i18n, Language};
-use crate::tr;
 
 #[derive(Debug, Error)]
 pub enum FileReadError {
@@ -38,7 +41,6 @@ pub enum FileWriteError {
     #[error(transparent)]
     GetFileError(#[from] GetFileError),
 }
-
 
 #[derive(Debug, Error)]
 pub enum FileRenameError {
@@ -301,7 +303,6 @@ impl DirectFsController {
         }
     }
 
-
     async fn create_file_for_writing(
         &self,
         uri: FileNamespace,
@@ -545,7 +546,9 @@ fn validate_partial_basename(filename: &str) -> Result<(), BoxedError> {
         .file_name()
         .is_some_and(|name| name == std::ffi::OsStr::new(filename));
     if !is_bare_basename {
-        return Err(format!("Refusing partial filename that is not a bare basename: '{filename}'").into());
+        return Err(
+            format!("Refusing partial filename that is not a bare basename: '{filename}'").into(),
+        );
     }
     Ok(())
 }
@@ -675,12 +678,95 @@ async fn ensure_filerequest_dir(
     }
 }
 
+/// Read/write the `.fyles-owner` marker inside an already-resolved (canonical,
+/// escape-checked) filerequest directory. Idempotent; uses an atomic
+/// create-if-absent so concurrent adoption is race-safe.
+async fn ensure_exists_and_is_owned_at(
+    dir: &Path,
+    owner_id: &str,
+    force: bool,
+) -> io::Result<OwnershipOutcome> {
+    let marker = dir.join(OWNER_MARKER_FILENAME);
+    match fs::read_to_string(&marker).await {
+        Ok(existing) => {
+            let existing = existing.trim();
+            if existing == owner_id {
+                Ok(OwnershipOutcome::Owned)
+            } else if force {
+                // Reclaim a directory whose owner no longer exists.
+                fs::write(&marker, owner_id).await?;
+                set_marker_hidden(&marker);
+                Ok(OwnershipOutcome::Adopted)
+            } else {
+                Ok(OwnershipOutcome::Conflict {
+                    other_id: existing.to_string(),
+                })
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&marker)
+            {
+                Ok(mut f) => {
+                    use std::io::Write;
+                    f.write_all(owner_id.as_bytes())?;
+                    f.sync_all().ok();
+                    set_marker_hidden(&marker);
+                    Ok(OwnershipOutcome::Adopted)
+                }
+                // Lost an adoption race: re-read and reconcile.
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    let existing = fs::read_to_string(&marker).await?;
+                    let existing = existing.trim();
+                    if existing == owner_id {
+                        Ok(OwnershipOutcome::Owned)
+                    } else {
+                        Ok(OwnershipOutcome::Conflict {
+                            other_id: existing.to_string(),
+                        })
+                    }
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Mark the owner marker as hidden where the dot-prefix convention is not enough
+/// (Windows). Best-effort; failure is non-fatal.
+#[cfg(windows)]
+fn set_marker_hidden(path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_HIDDEN, SetFileAttributesW};
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `wide` is a valid NUL-terminated UTF-16 string for the lifetime of the call.
+    unsafe {
+        SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_HIDDEN);
+    }
+}
+
+#[cfg(not(windows))]
+fn set_marker_hidden(_path: &Path) {}
+
 #[derive(Deref)]
 #[repr(transparent)]
 struct DirectFsControllerWrapper(DirectFsController);
 
 #[async_trait]
 impl HostController for DirectFsControllerWrapper {
+    fn drop_dir_absolute_path(&self) -> Option<String> {
+        // The drop dir is a real, already-canonicalized filesystem path on
+        // desktop, so hand it to the UI directly.
+        self.0.file_drop_dir.to_str().map(|s| s.to_string())
+    }
+
     async fn access_file_for_reading(&self, uri: Uri) -> Result<FileMeta, BoxedError> {
         trace!("Accessing file for reading: {:?}", uri);
         self.0
@@ -717,13 +803,40 @@ impl HostController for DirectFsControllerWrapper {
             .map_err(|_| "Could not remove file".into())
     }
 
-    async fn create_filerequest_resource(&self, name: FileNamespace) -> Result<(), BoxedError> {
-        trace!("Creating filerequest resource: {:?}", name);
-        let safe_path = name
+    async fn ensure_exists_and_is_owned(
+        &self,
+        dir: FileNamespace,
+        owner_id: &str,
+        force: bool,
+    ) -> Result<OwnershipOutcome, BoxedError> {
+        let safe_path = dir
             .parse_sanitized()
             .map_err(|e| Box::new(e) as BoxedError)?;
         let dir = ensure_filerequest_dir(&self.0.file_drop_dir, &safe_path).await?;
-        fs::create_dir_all(dir)
+        ensure_exists_and_is_owned_at(&dir, owner_id, force)
+            .await
+            .map_err(|e| Box::new(e) as BoxedError)
+    }
+
+    async fn remove_filerequest_resource(&self, dir: FileNamespace) -> Result<(), BoxedError> {
+        let safe_path = dir
+            .parse_sanitized()
+            .map_err(|e| Box::new(e) as BoxedError)?;
+        let raw = self.0.file_drop_dir.join(&safe_path);
+        // Nothing to remove if it never materialised.
+        if fs::metadata(&raw).await.is_err() {
+            return Ok(());
+        }
+        // Escape check before recursive delete.
+        let canonical = std::fs::canonicalize(&raw).map_err(|e| Box::new(e) as BoxedError)?;
+        if !canonical.starts_with(&self.0.file_drop_dir) {
+            return Err(format!(
+                "Refusing to remove {} outside of drop dir",
+                canonical.display()
+            )
+            .into());
+        }
+        fs::remove_dir_all(&canonical)
             .await
             .map_err(|e| Box::new(e) as BoxedError)?;
         Ok(())
@@ -733,12 +846,16 @@ impl HostController for DirectFsControllerWrapper {
         &self,
         from: FileNamespace,
         to: FileNamespace,
-    ) -> Result<(), BoxedError> {
+    ) -> Result<RenameOutcome, BoxedError> {
         trace!("Renaming resource from {:?} to {:?}", from, to);
-        self.0
-            .rename_resource(from, to)
-            .await
-            .map_err(|e| Box::new(e) as BoxedError)
+        match self.0.rename_resource(from, to).await {
+            Ok(()) => Ok(RenameOutcome::Renamed),
+            // A directory rename onto an existing target is refused atomically;
+            // report it as a typed outcome (not an error) so the brain can map it
+            // to a clean folder-collision message.
+            Err(FileRenameError::TargetAlreadyExists(_)) => Ok(RenameOutcome::DestinationOccupied),
+            Err(e) => Err(Box::new(e) as BoxedError),
+        }
     }
 
     async fn get_path_to_db_backup_file(&self) -> Result<std::fs::File, BoxedError> {
@@ -788,7 +905,11 @@ impl HostController for DirectFsControllerWrapper {
         Ok(())
     }
 
-    async fn finalize_partial_file(&self, partial_filename: &str, final_namespace: FileNamespace) -> Result<(), BoxedError> {
+    async fn finalize_partial_file(
+        &self,
+        partial_filename: &str,
+        final_namespace: FileNamespace,
+    ) -> Result<String, BoxedError> {
         validate_partial_basename(partial_filename)?;
         let from_p = self.0.partial_dir.join(partial_filename);
 
@@ -810,29 +931,38 @@ impl HostController for DirectFsControllerWrapper {
         let to_p = if raw_to.exists() {
             escalate_existing_path(&raw_to)
                 .await
-                .map_err(|n| -> BoxedError { format!("Could not find unique filename after {n} tries").into() })?
+                .map_err(|n| -> BoxedError {
+                    format!("Could not find unique filename after {n} tries").into()
+                })?
         } else {
             raw_to
         };
 
+        // The deduped basename is the name the file is actually stored under.
+        let final_name = to_p
+            .file_name()
+            .ok_or_else(|| -> BoxedError { "Invalid path: no filename".into() })?
+            .to_string_lossy()
+            .into_owned();
+
         fs::rename(from_p, to_p).await?;
-        Ok(())
+        Ok(final_name)
     }
 
     async fn list_partial_files(&self) -> Result<Vec<String>, BoxedError> {
         if !self.0.partial_dir.exists() {
             return Ok(vec![]);
         }
-        
+
         let mut entries = fs::read_dir(&self.0.partial_dir).await?;
         let mut files = Vec::new();
-        
+
         while let Some(entry) = entries.next_entry().await? {
             if let Ok(name) = entry.file_name().into_string() {
                 files.push(name);
             }
         }
-        
+
         Ok(files)
     }
 
@@ -840,7 +970,7 @@ impl HostController for DirectFsControllerWrapper {
         trace!("Sending notification: {:?}", notification);
         let (title, body): (&str, &str) = match notification {
             Notification::FileReceived {
-                contact_name,
+                sender,
                 filerequest_name,
                 file_name,
                 file_size,
@@ -848,12 +978,12 @@ impl HostController for DirectFsControllerWrapper {
                 let (file_size_value, file_size_unit) = crate::i18n::format_file_size(file_size);
 
                 (
-                    &tr!(&self.lang, "file-received-title"),
-                    &match contact_name {
-                        Some(name) => {
+                    &tr!(&self.lang, "file-received-notification-title"),
+                    &match sender {
+                        FileSender::Contact(name) => {
                             tr!(
                                 &self.lang,
-                                "file-received-mess-with-contact",
+                                "file-received-notification-text-with-sender",
                                 senderName = name,
                                 fileName = file_name,
                                 fileSizeValue = file_size_value,
@@ -861,9 +991,17 @@ impl HostController for DirectFsControllerWrapper {
                                 requestName = filerequest_name
                             )
                         }
-                        None => tr!(
+                        FileSender::SelfDevice => tr!(
                             &self.lang,
-                            "received-file-via-filerequest",
+                            "file-received-notification-text-from-self",
+                            fileName = file_name,
+                            fileSizeValue = file_size_value,
+                            fileSizeUnit = file_size_unit,
+                            requestName = filerequest_name
+                        ),
+                        FileSender::Unknown => tr!(
+                            &self.lang,
+                            "file-received-notification-text-without-sender",
                             fileName = file_name,
                             fileSizeValue = file_size_value,
                             fileSizeUnit = file_size_unit,
@@ -1079,7 +1217,7 @@ mod tests {
             created += 1;
         }
         let dir = dir.unwrap();
-        let count = dir_file_count(&dir);
+        let count = dir_file_count(&dir) - 1; // remove ownership marker
         assert!(
             count == created,
             "Directory should have exactly {created} files, found {count}"
@@ -1088,10 +1226,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn finalize_partial_file_returns_deduplicated_basename() {
+        let (_tmp, _root, frh) = setup("finalize-dedup").await;
+
+        // First transfer of "photo.jpg" lands under its requested name.
+        let f = frh
+            .get_partial_file_for_writing("xfer1.part")
+            .await
+            .unwrap();
+        drop(f);
+        let first = frh
+            .finalize_partial_file("xfer1.part", "photo.jpg")
+            .await
+            .unwrap();
+        assert_eq!(first, "photo.jpg");
+
+        // Second transfer of the same name collides and must report the real,
+        // deduplicated on-disk basename — not the requested name.
+        let f = frh
+            .get_partial_file_for_writing("xfer2.part")
+            .await
+            .unwrap();
+        drop(f);
+        let second = frh
+            .finalize_partial_file("xfer2.part", "photo.jpg")
+            .await
+            .unwrap();
+        assert_eq!(second, "photo_0.jpg");
+    }
+
+    #[tokio::test]
     #[cfg(unix)]
     async fn symlink_escape_detected() {
         use std::os::unix::fs as unix_fs;
-
         let (_tmp, root, frh) = setup("symlink-attack").await;
 
         // First create a normal file to ensure the directory exists.
@@ -1106,6 +1273,13 @@ mod tests {
 
         // Clean up: remove created file and directory so we can replace it with a symlink.
         std::fs::remove_file(&first_path).expect("remove first file");
+        std::fs::remove_file(
+            PathBuf::from(first_path)
+                .parent()
+                .unwrap()
+                .join(OWNER_MARKER_FILENAME),
+        )
+        .expect("delete ownership marker");
         std::fs::remove_dir(&fr_dir).expect("remove original fr dir");
 
         // Point the symlink to the parent of the allowed root (or root itself if no parent).
@@ -1134,7 +1308,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "There is a major issue (probably across host controller implementations) that lets multiple filerequests write to the same directory if their names are identical (possibly only after sanitization). This needs to be fixed."]
     async fn different_filerequests_with_same_sanitized_names_dont_collide() {
         let tmp = TempDir::new().unwrap();
         let root = deep_root_path(&tmp);
@@ -1168,21 +1341,10 @@ mod tests {
         let frh2 = FilerequestDriveHandler::new(handler2.dynamic(), fr2);
 
         // Create files in both filerequests
-        let (path1, f1) = frh1.get_file_for_writing("file1.txt").await.unwrap();
-        drop(f1);
-        let (path2, f2) = frh2.get_file_for_writing("file2.txt").await.unwrap();
-        drop(f2);
-
-        // Extract the parent directories
-        let dir1 = PathBuf::from(path1).parent().unwrap().to_path_buf();
-        let dir2 = PathBuf::from(path2).parent().unwrap().to_path_buf();
-
-        // This assertion will fail, demonstrating the bug
-        assert_ne!(
-            dir1,
-            dir2,
-            "SECURITY ISSUE: Different filerequests are using the same directory: {}",
-            dir1.display()
+        frh1.get_file_for_writing("file1.txt").await.unwrap();
+        std::assert_matches!(
+            frh2.get_file_for_writing("file2.txt").await,
+            Err(GetFileError::Claimed { .. })
         );
     }
 }

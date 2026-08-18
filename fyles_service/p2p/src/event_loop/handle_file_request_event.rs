@@ -1,25 +1,20 @@
-
 use crypto::Encrypted;
 use libp2p::request_response::{self, Event};
-use tracing::{debug, trace, warn};
-
+use tracing::{Instrument, debug, trace, warn};
 
 use crate::send_receive_traits::session_responder::SessionResponder;
+use crate::send_receive_traits::session_send_receive::SessionReceive;
 use crate::send_receive_traits::session_send_receive::{
     LocalReceiveError, ReceiveError, ReceivePayload, RemoteReceiveError,
 };
-use crate::send_receive_traits::session_send_receive::SessionReceive;
 use crate::{
     behaviour::SessionErrorResponse,
-    event_loop::{
-        with_swarm::WithSwarm, FileTracker, LocalNetworkSwarm, RefCountEventLoopData,
-    },
+    event_loop::{FileTracker, LocalNetworkSwarm, RefCountEventLoopData, with_swarm::WithSwarm},
     types::{FileRequest, FileResponse},
 };
 
 pub type FilerequestEvent =
     Event<Encrypted<FileRequest>, Result<Encrypted<FileResponse>, SessionErrorResponse>>;
-
 
 impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoopData<T, S> {
     pub(super) fn handle_filerequest_event(self, event: FilerequestEvent) {
@@ -48,17 +43,20 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
                         debug!("IO error: {e}");
                     }
                 }
-                tokio::spawn(async move {
-                    self.receive_encrypted_response(
-                        peer,
-                        request_id,
-                        ReceivePayload::<FileResponse, _, _, _, _>::ReceiveError(
-                            ReceiveError::LocalError(LocalReceiveError::TransportError(error)),
-                        ),
-                        &self.filerequest_request_registry,
-                    )
-                    .await
-                });
+                tokio::spawn(
+                    async move {
+                        self.receive_encrypted_response(
+                            peer,
+                            request_id,
+                            ReceivePayload::<FileResponse, _, _, _, _>::ReceiveError(
+                                ReceiveError::LocalError(LocalReceiveError::TransportError(error)),
+                            ),
+                            &self.filerequest_request_registry,
+                        )
+                        .await
+                    }
+                    .in_current_span(),
+                );
             }
             request_response::Event::InboundFailure { peer, error, .. } => {
                 warn!("Inbound request failed from peer {peer} with error: {error}");
@@ -68,52 +66,69 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
             }
             request_response::Event::Message { message, peer, .. } => match message {
                 request_response::Message::Request {
-                    request, channel, request_id, ..
+                    request,
+                    channel,
+                    request_id,
+                    ..
                 } => {
-                    tokio::spawn(async move {
-                        if let Some(response) = self.decrypt_respond(peer, request, request_id).await {
-                            self.with_swarm(move |swarm| {
-                                if swarm.get_filerequest_behaviour().send_response(
-                                    channel,
-                                    response.map_err(|e| {
-                                        warn!(error=?e, "Error in filerequest behaviour");
-                                        SessionErrorResponse::CryptError
-                                    }),
-                                ).is_err() {
-                                    warn!(?peer, "Unable to send response to peer");
-                                };
-                            })
-                        } else {
-                            trace!("Not sending a response");
+                    tokio::spawn(
+                        async move {
+                            if let Some(response) =
+                                self.decrypt_respond(peer, request, request_id).await
+                            {
+                                self.with_swarm(move |swarm| {
+                                    if swarm
+                                        .get_filerequest_behaviour()
+                                        .send_response(
+                                            channel,
+                                            response.map_err(|e| {
+                                                warn!(error=?e, "Error in filerequest behaviour");
+                                                SessionErrorResponse::CryptError
+                                            }),
+                                        )
+                                        .is_err()
+                                    {
+                                        warn!(?peer, "Unable to send response to peer");
+                                    };
+                                })
+                            } else {
+                                trace!("Not sending a response");
+                            }
                         }
-                    });
+                        .in_current_span(),
+                    );
                 }
                 request_response::Message::Response {
                     request_id,
                     response,
                 } => {
-                    tokio::spawn(async move {
-                        let payload = match response {
-                            Ok(response) => ReceivePayload::Response(response),
-                            Err(e) => match e {
-                                SessionErrorResponse::MissingSession => {
-                                    ReceivePayload::ReceiveError(ReceiveError::RemoteError(
-                                        RemoteReceiveError::MissingSession,
-                                    ))
-                                }
-                                SessionErrorResponse::CryptError => ReceivePayload::ReceiveError(
-                                    ReceiveError::RemoteError(RemoteReceiveError::CannotDecrypt),
-                                ),
-                            },
-                        };
-                        self.receive_encrypted_response(
-                            peer,
-                            request_id,
-                            payload,
-                            &self.filerequest_request_registry,
-                        )
-                        .await
-                    });
+                    tokio::spawn(
+                        async move {
+                            let payload = match response {
+                                Ok(response) => ReceivePayload::Response(response),
+                                Err(e) => match e {
+                                    SessionErrorResponse::MissingSession => {
+                                        ReceivePayload::ReceiveError(ReceiveError::RemoteError(
+                                            RemoteReceiveError::MissingSession,
+                                        ))
+                                    }
+                                    SessionErrorResponse::CryptError => {
+                                        ReceivePayload::ReceiveError(ReceiveError::RemoteError(
+                                            RemoteReceiveError::CannotDecrypt,
+                                        ))
+                                    }
+                                },
+                            };
+                            self.receive_encrypted_response(
+                                peer,
+                                request_id,
+                                payload,
+                                &self.filerequest_request_registry,
+                            )
+                            .await
+                        }
+                        .in_current_span(),
+                    );
                 }
             },
         }

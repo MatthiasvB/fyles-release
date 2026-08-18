@@ -4,25 +4,41 @@ use crypto::ContactKeys;
 use tap::Pipe;
 use tracing::{Instrument, Span, debug, error, info, instrument, trace, warn};
 
+use crate::core::brain::GigaBrain;
 use crate::core::brain::action::BrainAction;
 use crate::core::brain::action_p2p::NodeInfo;
 #[cfg(any(test, feature = "test-support"))]
 use crate::core::brain::action_test::TestAction;
+use crate::core::brain::stale_cleanup;
+use crate::core::brain::types::CreationResult;
 use crate::core::brain::types::{ContactShareChallenge, SelfContactInviteChallenge};
-use crate::core::brain::GigaBrain;
 use crate::core::db::DbError;
-use crate::core::domain_models::{ContactId, InProgressSendStatus, ReceiveStatus, ReceivedFile, SendStatus};
-use crate::core::filerequest_drive_handler::FilerequestDriveHandler;
-use crate::core::notification::Notification;
+use crate::core::domain_models::{
+    ContactId, FilerequestLocation, FylesId, InProgressSendStatus, PeerIdWrapper, ReceiveStatus,
+    ReceivedFile, SelfContact, SelfContactInvite, SendStatus,
+};
+use crate::core::filerequest_drive_handler::{FilerequestDriveHandler, RenameFilerequestError};
+use crate::core::notification::{FileSender, Notification};
 use crate::core::p2p::FileToSend;
-use crate::io_controller::FileNamespace;
+use crate::core::sync::LocalDocWrite;
+use crate::io_controller::{FileNamespace, OwnershipOutcome};
 use crate::library::util::error_handling::AutoMapError;
-use crate::library::util::util::{generate_byte_challenge, TimeoutLock};
+use crate::library::util::util::{TimeoutLock, generate_byte_challenge};
 use crate::library::wire::api::ServerMessage;
 
 use super::action_client::ClientAction;
-use super::action_p2p::NetworkNodeAction;
+use super::action_p2p::{NetworkNodeAction, PubkeyFetchReceiveRequest, SyncReceiveRequest};
 use super::error::FilerequestError;
+use super::types::FilerequestResult;
+use crate::core::sync::{
+    self, DocKind, SyncId, add_or_update_owned_device, is_owned_device, list_owned_devices,
+    remove_owned_device, sync_doc_err,
+};
+
+pub(crate) struct SyncMessage {
+    pub(crate) sync_id: SyncId,
+    pub(crate) message: Option<Vec<u8>>,
+}
 
 impl GigaBrain {
     #[instrument(skip(self), level = "trace")]
@@ -82,58 +98,65 @@ impl GigaBrain {
     async fn handle_client_action(&self, action: ClientAction) {
         match action {
             ClientAction::CreateFilerequest(create_filerequest) => {
-                let result = self
-                    .db
-                    .create_filerequest(&create_filerequest.request)
+                // Filesystem first, then DB: generate the id, atomically create
+                // and claim the directory, and only persist the row once that
+                // succeeds. Nothing to roll back.
+                let id = FylesId::new();
+                let title = create_filerequest.request.title.clone();
+                let dir_ns = || FileNamespace::Namespace {
+                    namespace: title.clone(),
+                    child: None,
+                };
+
+                let persist = async {
+                    self.db
+                        .create_filerequest(&id, &create_filerequest.request)
+                        .await
+                        .auto_map_err()
+                        .map(|()| id.clone())
+                };
+
+                let reply: CreationResult = match self
+                    .host_controller
+                    .ensure_exists_and_is_owned(dir_ns(), &id.0, false)
                     .await
-                    .auto_map_err();
-                match result {
-                    Err(e) => {
-                        if let Some(sender) = create_filerequest
-                            .response_sender
-                            .timeout_lock()
-                            .await
-                            .take()
-                        {
-                            let _ = sender.send(Err(e));
+                {
+                    Ok(OwnershipOutcome::Owned) | Ok(OwnershipOutcome::Adopted) => persist.await,
+                    Ok(OwnershipOutcome::Conflict { other_id }) => {
+                        // Look the owner up only to decide ghost-vs-live
+                        match self.db.get_filerequest(&FylesId(other_id.clone())).await {
+                            // Live owner: hard block, no row created.
+                            Ok(_) => Err(FilerequestError::FolderClaimed {
+                                folder: title.clone(),
+                            }),
+                            // Ghost marker (owner row is gone): reclaim, then persist.
+                            // Only a genuine "not found" justifies reclaiming — any
+                            // other DB error must surface, not silently steal the dir.
+                            Err(DbError::NotFound { .. }) => {
+                                info!("Reclaiming directory '{title}' from stale owner {other_id}");
+                                match self
+                                    .host_controller
+                                    .ensure_exists_and_is_owned(dir_ns(), &id.0, true)
+                                    .await
+                                {
+                                    Ok(_) => persist.await,
+                                    Err(e) => Err(FilerequestError::HostError { source: e }),
+                                }
+                            }
+                            // A real DB error looking up the owner: surface it.
+                            Err(e) => Err(FilerequestError::DatabaseError(e)),
                         }
                     }
-                    Ok(ref id) => {
-                        let creation_result = self
-                            .host_controller
-                            .create_filerequest_resource(FileNamespace::Namespace {
-                                namespace: create_filerequest.request.title,
-                                child: None,
-                            })
-                            .await;
-                        if let Err(e) = creation_result {
-                            error!("Failed to create filerequest directory: {:?}", e);
-                            // Rollback DB entry
-                            if let Err(e) = self.db.delete_filerequest(id).await {
-                                error!(
-                                    "Failed to rollback filerequest after directory creation failure: {:?}",
-                                    e
-                                );
-                            }
-                            if let Some(sender) = create_filerequest
-                                .response_sender
-                                .timeout_lock()
-                                .await
-                                .take()
-                            {
-                                let _ = sender.send(Err(FilerequestError::GenericError { msg: "Unable to create Filerequest because directory cannot be created".into(), source: None }));
-                            }
-                            return;
-                        }
-                        if let Some(sender) = create_filerequest
-                            .response_sender
-                            .timeout_lock()
-                            .await
-                            .take()
-                        {
-                            let _ = sender.send(result);
-                        }
-                    }
+                    Err(e) => Err(FilerequestError::HostError { source: e }),
+                };
+
+                if let Some(sender) = create_filerequest
+                    .response_sender
+                    .timeout_lock()
+                    .await
+                    .take()
+                {
+                    let _ = sender.send(reply);
                 }
             }
             ClientAction::UpdateFilerequest(update_filerequest) => {
@@ -156,21 +179,38 @@ impl GigaBrain {
                     Ok(filerequest) => filerequest,
                 };
                 if filerequest.title != update_filerequest.request.title {
+                    let new_title = update_filerequest.request.title.clone();
+
                     let mut filerequest_handler =
                         FilerequestDriveHandler::new(self.host_controller.clone(), filerequest);
-                    if let Err(()) = filerequest_handler
+                    // The rename atomically refuses to overwrite an existing
+                    // directory and reports it as `DestinationOccupied` — the
+                    // same conflict path creation uses.
+                    match filerequest_handler
                         .rename_filerquest(&update_filerequest.request.title)
                         .await
                     {
-                        if let Some(sender) = update_filerequest
-                            .response_sender
-                            .timeout_lock()
-                            .await
-                            .take()
-                        {
-                            let _ = sender.send(Err(FilerequestError::GenericError { msg: "Unable to rename Filerequest because directory cannot be renamed".into(), source: None }));
+                        Ok(()) => {}
+                        Err(e) => {
+                            let err = match e {
+                                RenameFilerequestError::DestinationOccupied => {
+                                    FilerequestError::FolderClaimed { folder: new_title }
+                                }
+                                RenameFilerequestError::Failed => FilerequestError::GenericError {
+                                    msg: "Unable to rename Filerequest because directory cannot be renamed".into(),
+                                    source: None,
+                                },
+                            };
+                            if let Some(sender) = update_filerequest
+                                .response_sender
+                                .timeout_lock()
+                                .await
+                                .take()
+                            {
+                                let _ = sender.send(Err(err));
+                            }
+                            return;
                         }
-                        return;
                     }
                 }
                 let result = self
@@ -188,11 +228,33 @@ impl GigaBrain {
                 }
             }
             ClientAction::DeleteFilerequest(delete_filerequest) => {
-                let result = self
-                    .db
-                    .delete_filerequest(&delete_filerequest.request)
-                    .await
-                    .auto_map_err();
+                // Filesystem first, then DB. Remove the directory (idempotent —
+                // an already-missing directory counts as success) and only delete
+                // the row once that succeeds. Nothing to roll back.
+                let result = match self.db.get_filerequest(&delete_filerequest.request).await {
+                    Ok(fr) => {
+                        match self
+                            .host_controller
+                            .remove_filerequest_resource(FileNamespace::Namespace {
+                                namespace: fr.title,
+                                child: None,
+                            })
+                            .await
+                        {
+                            Ok(()) => self
+                                .db
+                                .delete_filerequest(&delete_filerequest.request)
+                                .await
+                                .auto_map_err(),
+                            Err(e) => {
+                                error!("Failed to remove filerequest directory on delete: {e:?}");
+                                Err(FilerequestError::HostError { source: e })
+                            }
+                        }
+                    }
+                    // No such row: deleting it is a no-op success.
+                    Err(_) => Ok(()),
+                };
                 if let Some(sender) = delete_filerequest
                     .response_sender
                     .timeout_lock()
@@ -267,30 +329,53 @@ impl GigaBrain {
                 }
             }
             ClientAction::UpdateContact(update_contact) => {
-                let result = self
-                    .db
-                    .update_contact(&update_contact.request)
-                    .await
-                    .auto_map_err();
-                if let Some(sender) = update_contact.response_sender.timeout_lock().await.take() {
-                    let _ = sender.send(result);
+                let result = self.db.update_contact(&update_contact.request).await;
+                match result {
+                    Ok(write) => {
+                        self.announce(write);
+                        if let Some(sender) =
+                            update_contact.response_sender.timeout_lock().await.take()
+                        {
+                            let _ = sender.send(Ok(()));
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(sender) =
+                            update_contact.response_sender.timeout_lock().await.take()
+                        {
+                            let _ = sender.send(Err(e).auto_map_err());
+                        }
+                    }
                 }
             }
             ClientAction::DeleteContact(delete_contact) => {
-                let result = self
-                    .db
-                    .delete_contact(&delete_contact.request)
-                    .await
-                    .auto_map_err();
-                if let Some(sender) = delete_contact.response_sender.timeout_lock().await.take() {
-                    let _ = sender.send(result);
+                match self.db.delete_contact(&delete_contact.request).await {
+                    Ok(write) => {
+                        self.announce(write);
+                        if let Some(sender) =
+                            delete_contact.response_sender.timeout_lock().await.take()
+                        {
+                            let _ = sender.send(Ok(()));
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(sender) =
+                            delete_contact.response_sender.timeout_lock().await.take()
+                        {
+                            let _ = sender.send(Err(e).auto_map_err());
+                        }
+                    }
                 }
             }
-            ClientAction::Shutdown(shutdown) => {
-                // For now just return success
-                if let Some(sender) = shutdown.response_sender.timeout_lock().await.take() {
+            ClientAction::Shutdown(request) => {
+                // Answer before shutting down: the wait would outlive the response channel.
+                if let Some(sender) = request.response_sender.timeout_lock().await.take() {
                     let _ = sender.send(Ok(true));
                 }
+                self.shutdown_workloads().await;
+            }
+            ClientAction::ClientHeartbeat { foreground } => {
+                self.observe_client_heartbeat(foreground).await;
             }
             ClientAction::GetNodeStatus(request) => {
                 let result = self
@@ -305,13 +390,18 @@ impl GigaBrain {
                 }
             }
             ClientAction::CreateRemoteFilerequest(req) => {
-                let result = self
-                    .db
-                    .create_remote_filerequest(&req.request)
-                    .await
-                    .auto_map_err();
-                if let Some(sender) = req.response_sender.timeout_lock().await.take() {
-                    let _ = sender.send(result);
+                match self.db.create_remote_filerequest(&req.request).await {
+                    Ok((id, write)) => {
+                        self.announce(write);
+                        if let Some(sender) = req.response_sender.timeout_lock().await.take() {
+                            let _ = sender.send(Ok(id));
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(sender) = req.response_sender.timeout_lock().await.take() {
+                            let _ = sender.send(Err(e).auto_map_err());
+                        }
+                    }
                 }
             }
             ClientAction::GetRemoteFilerequest(req) => {
@@ -354,7 +444,10 @@ impl GigaBrain {
                     .network
                     .read()
                     .await
-                    .cancel_files_for_remote_filerequest(filerequest.filerequest_id, filerequest.peer_id)
+                    .cancel_files_for_remote_filerequest(
+                        filerequest.filerequest_id,
+                        filerequest.peer_id,
+                    )
                     .await
                     .auto_map_err();
                 let result: Result<_, FilerequestError> = match result {
@@ -363,11 +456,13 @@ impl GigaBrain {
                         debug!(
                             "Cancelled files before deleting remote filerequest: {deleted_request}"
                         );
-                        self.db
-                            .delete_remote_filerequest(&req.request)
-                            .await
-                            .map(|_| true)
-                            .auto_map_err()
+                        match self.db.delete_remote_filerequest(&req.request).await {
+                            Ok(write) => {
+                                self.announce(write);
+                                Ok(true)
+                            }
+                            Err(e) => Err(e).auto_map_err(),
+                        }
                     }
                 };
                 if let Some(sender) = req.response_sender.timeout_lock().await.take() {
@@ -375,13 +470,22 @@ impl GigaBrain {
                 }
             }
             ClientAction::UpdateRemoteFilerequest(req) => {
-                let result = self
+                match self
                     .db
                     .update_remote_filerequest(req.request.0, req.request.1)
                     .await
-                    .auto_map_err();
-                if let Some(sender) = req.response_sender.timeout_lock().await.take() {
-                    let _ = sender.send(result);
+                {
+                    Ok(write) => {
+                        self.announce(write);
+                        if let Some(sender) = req.response_sender.timeout_lock().await.take() {
+                            let _ = sender.send(Ok(()));
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(sender) = req.response_sender.timeout_lock().await.take() {
+                            let _ = sender.send(Err(e).auto_map_err());
+                        }
+                    }
                 }
             }
             ClientAction::CreatePendingFiles(req) => {
@@ -397,12 +501,10 @@ impl GigaBrain {
                     Err(e) => {
                         warn!("Failed to get remote filerequest: {:?}", e);
                         if let Some(sender) = req.response_sender.timeout_lock().await.take() {
-                            let _ = sender.send(Err(FilerequestError::InputError(
-                                format!(
-                                    "No filerequest known with id {}",
-                                    &req.request.target_filerequest_id
-                                ),
-                            )));
+                            let _ = sender.send(Err(FilerequestError::InputError(format!(
+                                "No filerequest known with id {}",
+                                &req.request.target_filerequest_id
+                            ))));
                         }
                         return;
                     }
@@ -509,10 +611,7 @@ impl GigaBrain {
                                 })
                                 .auto_map_err();
                                 // We'll delete it anyway but report the error
-                                let _ = self
-                                    .db
-                                    .delete_pending_file(&req.request)
-                                    .await;
+                                let _ = self.db.delete_pending_file(&req.request).await;
 
                                 if let Some(sender) =
                                     req.response_sender.timeout_lock().await.take()
@@ -594,6 +693,36 @@ impl GigaBrain {
                     let _ = sender.send(result);
                 }
             }
+            ClientAction::ResolveFilerequestLocation(req) => {
+                // Resolve the sanitized on-disk folder name for a filerequest,
+                // reusing the same logic that created the directory (incl. the
+                // empty-title -> id fallback) so the result matches disk exactly.
+                let result = match self.db.get_filerequest(&req.request).await {
+                    Ok(filerequest) => {
+                        let handler =
+                            FilerequestDriveHandler::new(self.host_controller.clone(), filerequest);
+                        let relative = handler.safe_dir_name().to_string();
+                        // Either-or: on a directly-accessible filesystem (desktop)
+                        // hand the UI the absolute path, so it need not know where
+                        // the daemon was pointed; otherwise the relative path for
+                        // the client to compose (scoped-storage hosts).
+                        let location = match self.host_controller.drop_dir_absolute_path() {
+                            Some(base) => FilerequestLocation::Absolute(
+                                std::path::Path::new(&base)
+                                    .join(&relative)
+                                    .to_string_lossy()
+                                    .into_owned(),
+                            ),
+                            None => FilerequestLocation::Relative(relative),
+                        };
+                        Ok(location)
+                    }
+                    Err(e) => Err(e.into()),
+                };
+                if let Some(sender) = req.response_sender.timeout_lock().await.take() {
+                    let _ = sender.send(result);
+                }
+            }
             ClientAction::UpdateSelfContactName(req) => {
                 let result = self
                     .db
@@ -633,22 +762,21 @@ impl GigaBrain {
                 }
             }
             ClientAction::GetFullSelfContact(brain_request) => {
-                let self_contact = self.db.get_self_contact().await;
+                let invite = self.build_self_contact_invite().await;
                 if let Some(sender) = brain_request.response_sender.timeout_lock().await.take() {
-                    let _ = sender.send(self_contact.auto_map_err());
+                    let _ = sender.send(invite);
                 }
             }
             ClientAction::UpdateIdentity(brain_request) => {
+                let SelfContactInvite {
+                    contact,
+                    inviter_peer_id,
+                    inviter_device_name,
+                } = brain_request.request;
                 let result = self
-                    .db
-                    .update_identity(brain_request.request.clone())
+                    .adopt_shared_identity(contact, inviter_peer_id, Some(inviter_device_name))
                     .await
                     .auto_map_err();
-                self.network
-                    .read()
-                    .await
-                    .update_identity(brain_request.request.id, brain_request.request.keys)
-                    .await;
                 if let Some(sender) = brain_request.response_sender.timeout_lock().await.take() {
                     let _ = sender.send(result);
                 }
@@ -670,13 +798,26 @@ impl GigaBrain {
                 }
             }
             ClientAction::RegisterContact(brain_request) => {
-                let result = self
+                match self
                     .db
-                    .register_contact(brain_request.request)
+                    .update_contact_projection(brain_request.request)
                     .await
-                    .auto_map_err();
-                if let Some(sender) = brain_request.response_sender.timeout_lock().await.take() {
-                    let _ = sender.send(result);
+                {
+                    Ok(write) => {
+                        self.announce(write);
+                        if let Some(sender) =
+                            brain_request.response_sender.timeout_lock().await.take()
+                        {
+                            let _ = sender.send(Ok(()));
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(sender) =
+                            brain_request.response_sender.timeout_lock().await.take()
+                        {
+                            let _ = sender.send(Err(e).auto_map_err());
+                        }
+                    }
                 }
             }
             ClientAction::RegisterSelfContactInviteChallenge(brain_request) => {
@@ -709,6 +850,57 @@ impl GigaBrain {
                     .await;
                 if let Some(sender) = brain_request.response_sender.timeout_lock().await.take() {
                     let _ = sender.send(());
+                }
+            }
+            ClientAction::RenameThisDevice(brain_request) => {
+                let name = brain_request.request;
+                // We may only rename our *own* device entry; resolve our own peer id.
+                let result: FilerequestResult<LocalDocWrite> = async {
+                    let info = self.network.read().await.get_node_info().await?;
+                    Ok(add_or_update_owned_device(self.db.as_ref(), info.peer_id, name).await?)
+                }
+                .await;
+                match result {
+                    Ok(write) => {
+                        self.announce(write);
+                        if let Some(sender) =
+                            brain_request.response_sender.timeout_lock().await.take()
+                        {
+                            let _ = sender.send(Ok(()));
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(sender) =
+                            brain_request.response_sender.timeout_lock().await.take()
+                        {
+                            let _ = sender.send(Err(e));
+                        }
+                    }
+                }
+            }
+            ClientAction::RemoveOwnedDevice(brain_request) => {
+                match remove_owned_device(self.db.as_ref(), &brain_request.request).await {
+                    Ok(write) => {
+                        self.announce(write);
+                        if let Some(sender) =
+                            brain_request.response_sender.timeout_lock().await.take()
+                        {
+                            let _ = sender.send(Ok(()));
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(sender) =
+                            brain_request.response_sender.timeout_lock().await.take()
+                        {
+                            let _ = sender.send(Err(e).auto_map_err());
+                        }
+                    }
+                }
+            }
+            ClientAction::ListOwnedDevices(brain_request) => {
+                let result = list_owned_devices(self.db.as_ref()).await.auto_map_err();
+                if let Some(sender) = brain_request.response_sender.timeout_lock().await.take() {
+                    let _ = sender.send(result);
                 }
             }
             ClientAction::RegisterContactShareChallenge(brain_request) => {
@@ -801,6 +993,14 @@ impl GigaBrain {
                         if let Some(sender) = request.response_sender.timeout_lock().await.take() {
                             let _ = sender.send(Ok(()));
                         }
+                        // The restored DB may reference directories that don't
+                        // exist (or aren't claimed) on this device — re-establish
+                        // ownership idempotently.
+                        stale_cleanup::reconcile_filerequest_dirs(
+                            self.db.clone(),
+                            self.host_controller.clone(),
+                        )
+                        .await;
                         self.client_push_sender
                             .send(ServerMessage::database_restored())
                             .await
@@ -808,31 +1008,17 @@ impl GigaBrain {
                     }
                 };
             }
-            ClientAction::UpdateSettings(request) => {
-                let settings = request.request.clone();
-
-                let apply_result = self
+            ClientAction::Settings(request) => {
+                // Opaque relay: forward the serialized request to the network node and
+                // return its serialized response. The network node interprets the bytes
+                // and owns any persistence (via NetworkNodeAction::PersistSettings).
+                let result = self
                     .network
                     .read()
                     .await
-                    .apply_settings(&settings)
+                    .process_settings_request(&request.request)
                     .await
                     .auto_map_err();
-                if let Err(e) = &apply_result {
-                    error!("Failed to apply settings to network: {e}");
-                    if let Some(sender) = request.response_sender.timeout_lock().await.take() {
-                        let _ = sender.send(apply_result.map(|_| ()));
-                    }
-                    return;
-                }
-
-                let db_result = self.db.store_settings(settings).await.auto_map_err();
-                if let Some(sender) = request.response_sender.timeout_lock().await.take() {
-                    let _ = sender.send(db_result);
-                }
-            }
-            ClientAction::GetSettings(request) => {
-                let result = self.db.get_settings().await.auto_map_err();
                 if let Some(sender) = request.response_sender.timeout_lock().await.take() {
                     let _ = sender.send(result);
                 }
@@ -1006,6 +1192,30 @@ impl GigaBrain {
                                 let _ = sender.send(Ok((node_info, persisted_settings)));
                             }
                         }
+                        DbError::SigningKeysMissing => {
+                            // The node keypair (PeerId) and contact id exist but the signing keys
+                            // are absent; regenerate them in place, keeping the other identity parts.
+                            let (node_key_pair, self_contact_id) = self
+                                .db
+                                .get_node_and_self_contact_id()
+                                .await
+                                .expect("Node keypair and contact id must be readable when signing keys are missing. Aborting.");
+                            let self_contact_keys = ContactKeys::new();
+                            self.db
+                                .store_signing_keys(self_contact_keys.clone())
+                                .await
+                                .expect("Storing regenerated signing keys failed. This is essential for operation. Aborting.");
+                            let node_info = NodeInfo {
+                                node_key_pair,
+                                self_contact_id,
+                                self_contact_keys,
+                            };
+                            if let Some(sender) =
+                                request.response_sender.timeout_lock().await.take()
+                            {
+                                let _ = sender.send(Ok((node_info, persisted_settings)));
+                            }
+                        }
                         e => {
                             panic!(
                                 "Problem querying cryptographic identity of the node. Aborting: {e:?}"
@@ -1013,6 +1223,22 @@ impl GigaBrain {
                         }
                     },
                 };
+            }
+            NetworkNodeAction::PersistSettings(request) => {
+                // Store-only: the network node owns settings persistence and asks us to
+                // durably store an opaque blob. Awaitable so the network node knows the
+                // write landed before reporting success.
+                let result = self
+                    .db
+                    .store_settings(request.request.clone())
+                    .await
+                    .auto_map_err();
+                if let Err(e) = &result {
+                    error!("Failed to persist settings: {e}");
+                }
+                if let Some(sender) = request.response_sender.timeout_lock().await.take() {
+                    let _ = sender.send(result);
+                }
             }
             NetworkNodeAction::Ready => {
                 let remote_file_requests_list = self
@@ -1062,11 +1288,7 @@ impl GigaBrain {
                                 );
                                 in_progress.status = InProgressSendStatus::Interrupted;
                                 self.db
-                                    .handle_update_pending_file_status(
-                                        &file.id,
-                                        &file.status,
-                                        None,
-                                    )
+                                    .handle_update_pending_file_status(&file.id, &file.status, None)
                                     .await
                                     .expect("Pending file status to be updatable");
                             }
@@ -1089,7 +1311,7 @@ impl GigaBrain {
                     })
                     .collect::<Vec<_>>();
 
-                let mut ephemeral_data = self.ephemeral_data.timeout_lock().await;
+                let mut ephemeral_data = self.ephemeral().await;
                 ephemeral_data.successfully_started = true;
                 if let Some(senders) = ephemeral_data.queued_wait_for_ready_requests.take() {
                     senders.into_iter().for_each(|sender| {
@@ -1111,11 +1333,15 @@ impl GigaBrain {
                         error!("Failed to send initial files to P2P node: {:?}", e);
                     }
                 };
+
+                // Ensure this device appears in the synced owned-device list.
+                self.ensure_own_device_registered().await;
             }
             NetworkNodeAction::FileSent { pending_file_id } => {
                 info!(?pending_file_id, "File sent");
                 let status = SendStatus::Sent;
-                let target_filerequest_id = self.db
+                let target_filerequest_id = self
+                    .db
                     .handle_update_pending_file_status(&pending_file_id, &status, None)
                     .await
                     .expect("Pending file status to be updated");
@@ -1134,7 +1360,8 @@ impl GigaBrain {
                 status,
             } => {
                 trace!("File sending");
-                let target_filerequest_id = self.db
+                let target_filerequest_id = self
+                    .db
                     .handle_update_pending_file_status(&pending_file_id, &status, None)
                     .await
                     .expect("Pending file status to be updated");
@@ -1153,12 +1380,18 @@ impl GigaBrain {
                 retry_count,
                 reason,
             } => {
-                warn!(?pending_file_id, ?retry_count, ?reason, "File send is being reset");
-                let target_filerequest_id = self.db
+                warn!(
+                    ?pending_file_id,
+                    ?retry_count,
+                    ?reason,
+                    "File send is being reset"
+                );
+                let target_filerequest_id = self
+                    .db
                     .handle_update_pending_file_status(&pending_file_id, &status, retry_count)
                     .await
                     .expect("Pending file status to be updated");
-                
+
                 if let Some(r) = reason {
                     let _ = self.db.add_interruption_reason(&pending_file_id, r).await;
                 }
@@ -1178,7 +1411,8 @@ impl GigaBrain {
                     pending_file_id
                 );
                 let status = SendStatus::Rejected;
-                let target_filerequest_id = self.db
+                let target_filerequest_id = self
+                    .db
                     .handle_update_pending_file_status(&pending_file_id, &status, None)
                     .await
                     .expect("Pending file status to be updated");
@@ -1187,7 +1421,7 @@ impl GigaBrain {
                     .send(ServerMessage::pending_file_status_changed(
                         &pending_file_id,
                         &status,
-                        &target_filerequest_id
+                        &target_filerequest_id,
                     ))
                     .await;
                 self.try_cleanup_source_file(&pending_file_id).await;
@@ -1198,7 +1432,8 @@ impl GigaBrain {
                     pending_file_id
                 );
                 let status = SendStatus::Failed;
-                let target_filerequest_id = self.db
+                let target_filerequest_id = self
+                    .db
                     .handle_update_pending_file_status(&pending_file_id, &status, None)
                     .await
                     .expect("Pending file status to be updated");
@@ -1215,7 +1450,8 @@ impl GigaBrain {
             NetworkNodeAction::FileMissing { pending_file_id } => {
                 error!("File missing for pending file ID: {:?}", pending_file_id);
                 let status = SendStatus::Failed;
-                let target_filerequest_id = self.db
+                let target_filerequest_id = self
+                    .db
                     .handle_update_pending_file_status(&pending_file_id, &status, None)
                     .await
                     .expect("Pending file status to be updated");
@@ -1264,16 +1500,25 @@ impl GigaBrain {
                     return;
                 };
 
-                let contact_name = if let Some(ref id) = rf.contact_id {
-                    match self.db.get_contact_name(id).await {
-                        Ok(name) => Some(name),
+                let self_contact_id = match self.db.get_self_contact().await {
+                    Ok(self_contact) => Some(self_contact.id),
+                    Err(e) => {
+                        error!("Could not retrieve self contact: {e:?}");
+                        None
+                    }
+                };
+
+                let sender = match rf.contact_id {
+                    // The file was sent from another of the user's own devices.
+                    Some(ref id) if self_contact_id.as_ref() == Some(id) => FileSender::SelfDevice,
+                    Some(ref id) => match self.db.get_contact_name(id).await {
+                        Ok(name) => FileSender::Contact(name),
                         Err(e) => {
                             error!("Could not retrieve contact name for {id}: {e:?}");
-                            None
+                            FileSender::Unknown
                         }
-                    }
-                } else {
-                    None
+                    },
+                    None => FileSender::Unknown,
                 };
 
                 let filerequest_name = match self.db.get_filerequest(&rf.filerequest_id).await {
@@ -1288,7 +1533,7 @@ impl GigaBrain {
                 };
                 self.host_controller
                     .send_notification(Notification::FileReceived {
-                        contact_name,
+                        sender,
                         filerequest_name,
                         file_name: rf.file_name.clone(),
                         file_size: rf.file_size_bytes,
@@ -1312,6 +1557,7 @@ impl GigaBrain {
                         contact_id: request.request.contact_id.clone(),
                         peer_id: request.request.peer_id.clone(),
                         file_name: request.request.file_name.clone(),
+                        persisted_as_name: request.request.persisted_as_name.clone(),
                         file_path: None,
                         file_size_bytes: request.request.file_size_bytes,
                         progress_bytes: 0,
@@ -1364,13 +1610,18 @@ impl GigaBrain {
             NetworkNodeAction::FileIoError { file, error } => {
                 error!("File IO error for file {:?}: {:?}", file, error);
                 let status = SendStatus::Failed;
-                let target_filerequest_id = self.db
+                let target_filerequest_id = self
+                    .db
                     .handle_update_pending_file_status(&file, &status, None)
                     .await
                     .expect("Pending file status to be updated");
                 let _ = self
                     .client_push_sender
-                    .send(ServerMessage::pending_file_status_changed(&file, &status, &target_filerequest_id))
+                    .send(ServerMessage::pending_file_status_changed(
+                        &file,
+                        &status,
+                        &target_filerequest_id,
+                    ))
                     .await;
                 self.try_cleanup_source_file(&file).await;
             }
@@ -1401,13 +1652,34 @@ impl GigaBrain {
                     let _ = sender.send(keys);
                 }
             }
+            NetworkNodeAction::GetContactsPublicKeys(brain_request) => {
+                let PubkeyFetchReceiveRequest {
+                    contact_id,
+                    wanted_contact_ids,
+                } = &brain_request.request;
+                let self_id = self.db.get_self_contact_id().await.ok();
+                let keys = if self_id.as_ref() != Some(contact_id) {
+                    warn!("Declining pubkey fetch from a peer that isn't one of our devices");
+                    None
+                } else {
+                    Some(
+                        self.db
+                            .get_contacts_public_keys(wanted_contact_ids.clone())
+                            .await
+                            .unwrap_or_default(),
+                    )
+                };
+                if let Some(sender) = brain_request.response_sender.timeout_lock().await.take() {
+                    let _ = sender.send(keys);
+                }
+            }
             NetworkNodeAction::IsContactKnown(brain_request) => {
                 let contact_name = self.db.get_contact_name(&brain_request.request).await;
                 let is_known = match contact_name {
                     Ok(_) => {
                         // if we know the name, we know the contact
                         Ok(true)
-                    },
+                    }
                     Err(DbError::NotFound { .. }) => {
                         // We don't know that contact
                         Ok(false)
@@ -1429,7 +1701,8 @@ impl GigaBrain {
                 if let Err(ref e) = file {
                     error!("Could not open file for reading: {e}");
                     let status = SendStatus::Failed;
-                    let target_filerequest_id = self.db
+                    let target_filerequest_id = self
+                        .db
                         .handle_update_pending_file_status(&brain_request.request.id, &status, None)
                         .await
                         .expect("Pending file status to be updated");
@@ -1441,7 +1714,8 @@ impl GigaBrain {
                             &target_filerequest_id,
                         ))
                         .await;
-                    self.try_cleanup_source_file(&brain_request.request.id).await;
+                    self.try_cleanup_source_file(&brain_request.request.id)
+                        .await;
                 }
                 if let Some(sender) = brain_request.response_sender.timeout_lock().await.take() {
                     let _ = sender.send(file.map_err(|e| {
@@ -1481,23 +1755,22 @@ impl GigaBrain {
                     }
                 }
             }
-            NetworkNodeAction::UpdateIdentity(new_identity) => {
-                match self.db.update_identity(new_identity.clone()).await {
+            NetworkNodeAction::UpdateIdentity(new_identity, inviter_peer) => {
+                // The peers are already connected here, so sync runs immediately and the inviter's
+                // entry arrives via the Devices doc — no need to pre-register it (unlike the
+                // out-of-band QR path, which may be offline; see `ClientAction::UpdateIdentity`).
+                match self
+                    .adopt_shared_identity(new_identity, inviter_peer, None)
+                    .await
+                {
                     Ok(()) => {
-                        self.network
-                            .read()
-                            .await
-                            .update_identity(new_identity.id, new_identity.keys)
-                            .await;
                         self.client_push_sender
                             .send(ServerMessage::received_self_contact_invite_over_network())
                             .await
                             .expect("Sending to work");
                     }
-                    Err(e) => {
-                        error!("Failed to update identity in DB: {:?}", e);
-                    }
-                };
+                    Err(e) => error!("Failed to update identity in DB: {e:?}"),
+                }
             }
             NetworkNodeAction::AnsweredSelfContactInvite => {
                 self.client_push_sender
@@ -1540,8 +1813,9 @@ impl GigaBrain {
                 }
             },
             NetworkNodeAction::CreateContact(contact) => {
-                match self.db.register_contact(contact).await {
-                    Ok(()) => {
+                match self.db.update_contact_projection(contact).await {
+                    Ok(write) => {
+                        self.announce(write);
                         self.client_push_sender
                             .send(ServerMessage::contact_share_accepted_over_network())
                             .await
@@ -1561,14 +1835,119 @@ impl GigaBrain {
             NetworkNodeAction::RejectedContactShare => {
                 // DoNothing
             }
+            NetworkNodeAction::SyncReceive(brain_request) => {
+                let SyncReceiveRequest {
+                    contact_id,
+                    peer,
+                    wire,
+                } = brain_request.request;
+                let reply = self.handle_sync_receive(contact_id, peer, wire).await;
+                if let Some(sender) = brain_request.response_sender.timeout_lock().await.take() {
+                    let _ = sender.send(reply);
+                }
+            }
+            NetworkNodeAction::SyncReplyReceived { peer, reply } => {
+                self.handle_sync_reply(peer, reply).await;
+            }
+            NetworkNodeAction::SyncOnPeerConnect(peer_id) => {
+                // Push only to devices on our owned-device list. The accept side
+                // independently requires the session to prove it carries our contact id
+                // (i.e. the peer is one of our own devices too).
+                match is_owned_device(self.db.as_ref(), &peer_id).await {
+                    Ok(true) => self.initiate_sync(&peer_id).await,
+                    Ok(false) => {}
+                    Err(e) => error!("Failed to check owned-device status: {e:?}"),
+                }
+            }
+            NetworkNodeAction::SyncDocWithPeer { peer, kind } => {
+                self.initiate_sync_if_dirty(&peer, kind).await;
+            }
+            NetworkNodeAction::SyncTransportFailed { peer } => {
+                // Drop the peer's exchange slots so the next connect re-syncs from scratch.
+                self.ephemeral_data
+                    .timeout_lock()
+                    .await
+                    .sync_slots
+                    .retain(|(p, _), _| p != &peer);
+            }
+            NetworkNodeAction::StoreFetchedContactKeys(response) => {
+                self.handle_store_fetched_contact_keys(response).await;
+            }
         }
     }
 
-    async fn try_cleanup_source_file(&self, pending_file_id: &crate::core::domain_models::FylesId) {
+
+    /// Adopt a shared identity (from a network invite or an out-of-band QR): switch our
+    /// contact id/keys, reset the old identity's owned-device list, re-register ourselves,
+    /// and initiate a sync with the inviter. When `inviter_device_name` is given, the inviter is
+    /// also recorded as an owned device up front — required for the offline QR case, where sync
+    /// can only happen on a later connect (gated on `is_owned_device`).
+    async fn adopt_shared_identity(
+        &self,
+        identity: SelfContact,
+        inviter_peer: PeerIdWrapper,
+        inviter_device_name: Option<String>,
+    ) -> Result<(), DbError> {
+        self.db.update_identity(identity.clone()).await?;
+        self.network
+            .read()
+            .await
+            .update_identity(identity.id, identity.keys)
+            .await;
+        // Reset the (old identity's) device list atomically so it can't race a concurrent write.
+        if let Err(e) = self
+            .db
+            .mutate_sync_doc(
+                DocKind::Devices,
+                Box::new(|_old| sync::empty_blob(DocKind::Devices).map_err(sync_doc_err)),
+            )
+            .await
+        {
+            error!("Failed to reset devices doc on identity change: {e:?}");
+        }
+        self.ensure_own_device_registered().await;
+        if let Some(name) = inviter_device_name {
+            // Not announced: the full `initiate_sync` below covers every document for this peer,
+            // so announcing the devices document separately would only duplicate it.
+            match add_or_update_owned_device(self.db.as_ref(), inviter_peer.clone(), name).await {
+                Ok(_write) => {}
+                Err(e) => error!("Failed to register inviter as an owned device: {e:?}"),
+            }
+        }
+        self.initiate_sync(&inviter_peer).await;
+        Ok(())
+    }
+
+    async fn build_self_contact_invite(&self) -> FilerequestResult<SelfContactInvite> {
+        let contact = self.db.get_self_contact().await?;
+        let info = self.network.read().await.get_node_info().await?;
+        let peer_id = info.peer_id;
+        let inviter_device_name = list_owned_devices(self.db.as_ref())
+            .await?
+            .into_iter()
+            .find(|(p, _)| *p == peer_id)
+            .map(|(_, name)| name)
+            .unwrap_or_default();
+        Ok(SelfContactInvite {
+            contact,
+            inviter_peer_id: peer_id,
+            inviter_device_name,
+        })
+    }
+
+    async fn try_cleanup_source_file(&self, pending_file_id: &FylesId) {
         if let Ok(pending_file) = self.db.get_pending_file(pending_file_id).await
-            && let Ok(count) = self.db.count_non_terminal_pending_files_for_path(pending_file_id).await
-                && count == 0 {
-                    let _ = self.host_controller.remove_source_file_if_temporary(&pending_file.file_path).await;
-                }
+            && let Ok(count) = self
+                .db
+                .count_non_terminal_pending_files_for_path(pending_file_id)
+                .await
+            && count == 0
+        {
+            let _ = self
+                .host_controller
+                .remove_source_file_if_temporary(&pending_file.file_path)
+                .await;
+        }
     }
 }
+

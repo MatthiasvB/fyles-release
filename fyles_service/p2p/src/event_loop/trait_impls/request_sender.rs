@@ -5,9 +5,12 @@ use crate::send_receive_traits::request_sender::RequestSender;
 use crate::types::FileRequest;
 use async_trait::async_trait;
 use crypto::Encrypted;
-use fyles_core::core::brain::types::{ContactShareChallenge, SelfContactInviteChallenge};
-use libp2p::request_response::OutboundRequestId;
+use fyles_core::core::brain::types::{
+    ContactShareChallenge, PubkeyFetchRequest, SelfContactInviteChallenge,
+};
+use fyles_core::core::sync::SyncRequest;
 use libp2p::PeerId;
+use libp2p::request_response::OutboundRequestId;
 
 #[async_trait]
 impl<T: FileTracker, S: LocalNetworkSwarm + 'static> RequestSender<Encrypted<FileRequest>>
@@ -45,6 +48,44 @@ impl<T: FileTracker, S: LocalNetworkSwarm + 'static> RequestSender<Encrypted<Con
         self.with_swarm_res(move |swarm| {
             swarm
                 .get_contact_share_behaviour()
+                .send_request(&node, request)
+        })
+        .await
+    }
+}
+
+#[async_trait]
+impl<T: FileTracker, S: LocalNetworkSwarm + 'static> RequestSender<Encrypted<SyncRequest>>
+    for RefCountEventLoopData<T, S>
+{
+    type RequestId = OutboundRequestId;
+    type NodeId = PeerId;
+
+    async fn send_encrypted_request(
+        &self,
+        node: Self::NodeId,
+        request: Encrypted<SyncRequest>,
+    ) -> Self::RequestId {
+        self.with_swarm_res(move |swarm| swarm.get_sync_behaviour().send_request(&node, request))
+            .await
+    }
+}
+
+#[async_trait]
+impl<T: FileTracker, S: LocalNetworkSwarm + 'static> RequestSender<Encrypted<PubkeyFetchRequest>>
+    for RefCountEventLoopData<T, S>
+{
+    type RequestId = OutboundRequestId;
+    type NodeId = PeerId;
+
+    async fn send_encrypted_request(
+        &self,
+        node: Self::NodeId,
+        request: Encrypted<PubkeyFetchRequest>,
+    ) -> Self::RequestId {
+        self.with_swarm_res(move |swarm| {
+            swarm
+                .get_pubkey_fetch_behaviour()
                 .send_request(&node, request)
         })
         .await

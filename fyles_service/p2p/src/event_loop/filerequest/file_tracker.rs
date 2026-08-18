@@ -1,7 +1,5 @@
 use crate::crypto::SessionEstablishmentError;
-use crate::event_loop::filerequest::send_manager::{
-    LockedSendData, SendDataMut, SendRes,
-};
+use crate::event_loop::filerequest::send_manager::{LockedSendData, SendDataMut, SendRes};
 use crate::send_receive_traits::response_receiver::ResponseReceiver;
 use crate::send_receive_traits::session_send_receive::{
     LocalReceiveError, ReceiveError, SessionSendError,
@@ -29,6 +27,7 @@ use std::{
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::instrument::Instrumented;
 use tracing::{Instrument, Span, debug, debug_span, error, info, trace, warn};
+use crate::constants::STALL_ERROR_AFTER;
 
 pub enum FileTrackerReceivePayload {
     Response(FileResponse),
@@ -75,8 +74,6 @@ pub trait FileTracker:
 
     async fn has_pending_files_for(&self, peer: &PeerId) -> bool;
 
-    async fn has_sending_files_for(&self, peer: &PeerId) -> bool;
-
     async fn cancel_file(&self, file_id: FylesId) -> Option<PeerId>;
 
     /// Returns the peer id for which a file was cancelled, if any
@@ -85,10 +82,6 @@ pub trait FileTracker:
         target_filerequest_id: FylesId,
         peer_id: PeerId,
     ) -> Option<PeerId>;
-
-    /// Reset any active sending state for a peer (e.g., on connection loss).
-    /// Files in sending state are moved back to the pending queue.
-    async fn reset_for_disconnected_peer(&self, peer: PeerId);
 
     async fn handle_outgoing_connection_error(&self, peer: PeerId, address: &Multiaddr);
 
@@ -251,6 +244,7 @@ macro_rules! light_ref {
 }
 
 impl<P: FileTrackerPlugin> CoreFileTracker<P> {
+    #[allow(clippy::type_complexity)]
     fn send_instrumented(
         &self,
         peer_id: PeerId,
@@ -277,6 +271,7 @@ impl<P: FileTrackerPlugin> CoreFileTracker<P> {
         future.instrument(span)
     }
 
+    #[allow(clippy::type_complexity)]
     fn send_idempotent_instrumented(
         &self,
         peer_id: PeerId,
@@ -682,8 +677,7 @@ impl<'a, P: FileTrackerPlugin + Send> CoreFileTrackerRef<'a, P> {
                 }
             }
             SendStatus::InProgress(InProgress {
-                ref transfer_data,
-                ..
+                ref transfer_data, ..
             }) => SendStatus::InProgress(InProgress {
                 status: InProgressSendStatus::Interrupted,
                 transfer_data: transfer_data.clone(),
@@ -893,11 +887,7 @@ impl<P: FileTrackerPlugin + Send> CoreFileTracker<P> {
                         .await;
                     // Notify brain and advance to next file
                     light_ref!(self)
-                        .complete_file(
-                            entry,
-                            file_id,
-                            FileOutcome::IoError(io_error),
-                        )
+                        .complete_file(entry, file_id, FileOutcome::IoError(io_error))
                         .await;
                     break;
                 }
@@ -1022,6 +1012,8 @@ impl<P: FileTrackerPlugin + Send> CoreFileTracker<P> {
         let mut files = self.files.write().await;
         let mut span = None;
         let mut path = None;
+        // Named, so the peer drops this transfer rather than every transfer with us.
+        let mut transfer_uuid = None;
         if let Entry::Occupied(mut entry) = files.entry(peer) {
             span = Some(entry.get().span.clone());
             path = entry
@@ -1033,6 +1025,7 @@ impl<P: FileTrackerPlugin + Send> CoreFileTracker<P> {
                 warn!("Resetting on protocol violation");
             });
             if let Some(ref mut sending) = entry.get_mut().sending {
+                transfer_uuid = Some(sending.get_transfer_id().clone());
                 sending.pending_file.retry_count += 1;
                 warn!(
                     retry_count = sending.pending_file.retry_count,
@@ -1046,9 +1039,7 @@ impl<P: FileTrackerPlugin + Send> CoreFileTracker<P> {
                 .send_instrumented(
                     peer,
                     contact_id,
-                    FileRequest::ProtocolViolation {
-                        transfer_uuid: None,
-                    },
+                    FileRequest::ProtocolViolation { transfer_uuid },
                     span,
                     path.as_deref(),
                 )
@@ -1057,9 +1048,7 @@ impl<P: FileTrackerPlugin + Send> CoreFileTracker<P> {
             let _ = (self.send)(
                 peer,
                 contact_id,
-                FileRequest::ProtocolViolation {
-                    transfer_uuid: None,
-                },
+                FileRequest::ProtocolViolation { transfer_uuid },
             )
             .await;
         }
@@ -1130,9 +1119,9 @@ impl<P: FileTrackerPlugin + Send + Sync> ResponseReceiver<FileResponse> for Core
                         ContactVerificationResult::ContactIsUnknown => {
                             *must_verify_contact_id = false;
                         }
-                        ContactVerificationResult::Verified => {},
+                        ContactVerificationResult::Verified => {}
                         ContactVerificationResult::VerificationFailed => {
-                        light_ref!(self).reset_all(Entry::Occupied(entry)).await;
+                            light_ref!(self).reset_all(Entry::Occupied(entry)).await;
                             return;
                         }
                         ContactVerificationResult::InternalError => {
@@ -1201,16 +1190,16 @@ impl<P: FileTrackerPlugin + Send + Sync> ResponseReceiver<FileResponse> for Core
                     ContactVerificationResult::ContactIsUnknown => {
                         locked_send_data.must_verify_contact_id = false;
                     }
-                    ContactVerificationResult::Verified => {},
+                    ContactVerificationResult::Verified => {}
                     ContactVerificationResult::VerificationFailed => {
                         // put the thing back. Otherwise attackers can permanently stuck this app
-                    peer_files.sending = Some(locked_send_data);
+                        peer_files.sending = Some(locked_send_data);
                         light_ref!(self).reset_all(Entry::Occupied(entry)).await;
                         return;
                     }
                     ContactVerificationResult::InternalError => {
                         // put the thing back. Otherwise attackers can permanently stuck this app
-                    peer_files.sending = Some(locked_send_data);
+                        peer_files.sending = Some(locked_send_data);
                         drop(files);
                         self.reset_all_on_internal_error_for(node_id).await;
                         return;
@@ -1266,15 +1255,15 @@ impl<P: FileTrackerPlugin + Send + Sync> ResponseReceiver<FileResponse> for Core
                     ContactVerificationResult::ContactIsUnknown => {
                         locked_send_data.must_verify_contact_id = false;
                     }
-                    ContactVerificationResult::Verified => {},
+                    ContactVerificationResult::Verified => {}
                     ContactVerificationResult::VerificationFailed => {
                         light_ref!(self).reset_all(Entry::Occupied(entry)).await;
-                        return
+                        return;
                     }
                     ContactVerificationResult::InternalError => {
                         drop(files);
                         self.reset_all_on_internal_error_for(node_id).await;
-                        return
+                        return;
                     }
                 };
 
@@ -1346,12 +1335,7 @@ impl<P: FileTrackerPlugin + Send + Sync> ResponseReceiver<FileResponse> for Core
                     };
                     let Some(SendDataMut {
                         send_manager: sending,
-                        pending_file:
-                            PendingFile {
-                                status,
-                                id,
-                                ..
-                            },
+                        pending_file: PendingFile { status, id, .. },
                     }) = opt
                     else {
                         peer_files.span.in_scope(|| {
@@ -1616,14 +1600,14 @@ impl<P: FileTrackerPlugin + Send + Sync> ResponseReceiver<FileResponse> for Core
                         // put the thing back. Otherwise attackers can permanently stuck this app
                         entry.get_mut().sending = Some(locked_send_data);
                         light_ref!(self).reset_all(Entry::Occupied(entry)).await;
-                        return
+                        return;
                     }
                     ContactVerificationResult::InternalError => {
                         // put the thing back. Otherwise attackers can permanently stuck this app
                         entry.get_mut().sending = Some(locked_send_data);
                         drop(files);
                         self.reset_all_on_internal_error_for(node_id).await;
-                        return
+                        return;
                     }
                 };
 
@@ -1755,11 +1739,27 @@ impl<P: FileTrackerPlugin + Send + Sync> FileTracker for CoreFileTracker<P> {
                 .map(|it| (&it.pending, it.sending.is_some()))
                 .collect::<Vec<_>>()
         );
-        let Entry::Occupied(peer_files) = files.entry(peer) else {
+        let Entry::Occupied(mut peer_files) = files.entry(peer) else {
             trace!(?peer, "No files for peer");
             return;
         };
-        if peer_files.get().sending.is_some() {
+        if let Some(sending) = peer_files.get_mut().sending.as_mut() {
+            // This early return is what a wedged slot hides behind: while `sending` is occupied,
+            // every future interaction with this peer is refused. A slot that is genuinely in
+            // flight either advances or has its request time out well inside STALL_ERROR_AFTER, so
+            // crossing that threshold is never a transient condition — it means the send path lost
+            // track of the slot and left it occupied with nothing outstanding. Report it loudly
+            // and leave it alone: repairing it here would hide the defect that caused it.
+            if sending.should_report_stall(STALL_ERROR_AFTER) {
+                error!(
+                    ?peer,
+                    transfer = ?sending.get_transfer_id(),
+                    stalled_for = ?sending.stalled_for(),
+                    held_for = ?sending.held_for(),
+                    "Send slot has made no progress and is blocking every send to this peer. \
+                     This is a bug in the send path, not a transient failure."
+                );
+            }
             peer_files.get().span.in_scope(|| {
                 trace!(?peer, "Already sending files to peer");
             });
@@ -1779,14 +1779,6 @@ impl<P: FileTrackerPlugin + Send + Sync> FileTracker for CoreFileTracker<P> {
         }
     }
 
-    async fn has_sending_files_for(&self, peer: &PeerId) -> bool {
-        if let Some(peer_files) = self.files.read().await.get(peer) {
-            peer_files.sending.is_some()
-        } else {
-            false
-        }
-    }
-
     async fn cancel_file(&self, file_id: FylesId) -> Option<PeerId> {
         let mut files = self.files.write().await;
         // Find which peer has this file
@@ -1798,7 +1790,7 @@ impl<P: FileTrackerPlugin + Send + Sync> FileTracker for CoreFileTracker<P> {
             let in_pending = pf.pending.iter().any(|p| p.id == file_id);
             (in_sending || in_pending).then_some(*peer)
         });
-        let Some(peer) = peer else { return None };
+        let peer = peer?;
         let Entry::Occupied(mut entry) = files.entry(peer) else {
             return None;
         };
@@ -1892,7 +1884,11 @@ impl<P: FileTrackerPlugin + Send + Sync> FileTracker for CoreFileTracker<P> {
             self.plugin
                 .timeout_lock()
                 .await
-                .pending_file_removed_for_peer(&peer_id, !peer_files.get().pending.is_empty(), false)
+                .pending_file_removed_for_peer(
+                    &peer_id,
+                    !peer_files.get().pending.is_empty(),
+                    false,
+                )
                 .await;
             // No brain notification — cancel is brain-initiated
             light_ref!(self).send_next(peer_id, peer_files).await;
@@ -1918,23 +1914,6 @@ impl<P: FileTrackerPlugin + Send + Sync> FileTracker for CoreFileTracker<P> {
             return Some(peer_id);
         }
         None
-    }
-
-    async fn reset_for_disconnected_peer(&self, peer: PeerId) {
-        if !self.has_sending_files_for(&peer).await {
-            return;
-        }
-        let mut files = self.files.write().await;
-        let entry = files.entry(peer);
-        match entry {
-            Entry::Occupied(ref occupied_entry) => occupied_entry.get().span.in_scope(|| {
-                warn!(?peer, "Connection closed while sending file — resetting");
-            }),
-            Entry::Vacant(_) => {
-                warn!(?peer, "Connection closed while sending file — resetting");
-            }
-        }
-        light_ref!(self).reset_all(entry).await;
     }
 
     async fn handle_outgoing_connection_error(&self, peer: PeerId, address: &Multiaddr) {

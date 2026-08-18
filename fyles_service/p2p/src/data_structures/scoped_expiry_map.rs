@@ -364,12 +364,18 @@ mod tests {
         // T=0.5s: ConfirmChunk response arrives, needs to decrypt with S0
         advance(ms(500)).await;
         let sessions = map.get(&peer).await;
-        assert!(sessions.contains(&"S0".to_string()), "S0 should be available at T=0.5s");
+        assert!(
+            sessions.contains(&"S0".to_string()),
+            "S0 should be available at T=0.5s"
+        );
 
         // T=14s: Late response still works
         advance(ms(13_500)).await;
         let sessions = map.get(&peer).await;
-        assert!(sessions.contains(&"S0".to_string()), "S0 should be available at T=14s");
+        assert!(
+            sessions.contains(&"S0".to_string()),
+            "S0 should be available at T=14s"
+        );
 
         // T=16s: S0 expired (value_ttl=15s)
         advance(ms(2_000)).await;
@@ -383,12 +389,18 @@ mod tests {
         // T=30min+0.5s: ConfirmChunk response arrives, needs S1
         advance(ms(500)).await;
         let sessions = map.get(&peer).await;
-        assert!(sessions.contains(&"S1".to_string()), "S1 should be available at T=30min+0.5s");
+        assert!(
+            sessions.contains(&"S1".to_string()),
+            "S1 should be available at T=30min+0.5s"
+        );
 
         // T=30min+14s: Late response still works
         advance(ms(13_500)).await;
         let sessions = map.get(&peer).await;
-        assert!(sessions.contains(&"S1".to_string()), "S1 should be available at T=30min+14s");
+        assert!(
+            sessions.contains(&"S1".to_string()),
+            "S1 should be available at T=30min+14s"
+        );
 
         // T=60min: Third session renegotiation — old session S2 pushed to cache
         advance(Duration::from_secs(30 * 60) - ms(14_000)).await;
@@ -397,7 +409,10 @@ mod tests {
         // T=60min+0.5s: ConfirmChunk response arrives, needs S2
         advance(ms(500)).await;
         let sessions = map.get(&peer).await;
-        assert!(sessions.contains(&"S2".to_string()), "S2 should be available at T=60min+0.5s");
+        assert!(
+            sessions.contains(&"S2".to_string()),
+            "S2 should be available at T=60min+0.5s"
+        );
     }
 
     /// Tests that a push after a long idle period (where cleanup could remove the
@@ -497,20 +512,29 @@ mod tests {
         map.push(peer, "S1".to_string()).await;
         advance(ms(500)).await;
         let sessions = map.get(&peer).await;
-        assert!(sessions.contains(&"S1".to_string()), "S1 must be available after second push");
+        assert!(
+            sessions.contains(&"S1".to_string()),
+            "S1 must be available after second push"
+        );
 
         // Cycle 3: T=60min (cleanup WILL fire, 60min > 60s since T=0)
         advance(Duration::from_secs(30 * 60) - ms(500)).await;
         map.push(peer, "S2".to_string()).await;
         advance(ms(500)).await;
         let sessions = map.get(&peer).await;
-        assert!(sessions.contains(&"S2".to_string()), "S2 must be available after third push");
+        assert!(
+            sessions.contains(&"S2".to_string()),
+            "S2 must be available after third push"
+        );
 
         // Cycle 4: T=90min
         advance(Duration::from_secs(30 * 60) - ms(500)).await;
         map.push(peer, "S3".to_string()).await;
         advance(ms(500)).await;
         let sessions = map.get(&peer).await;
-        assert!(sessions.contains(&"S3".to_string()), "S3 must be available after fourth push");
+        assert!(
+            sessions.contains(&"S3".to_string()),
+            "S3 must be available after fourth push"
+        );
     }
 }

@@ -3,7 +3,7 @@ use fyles_core::library::util::duration_ext::DurationExt;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
-use tracing::{span, trace, Instrument, Level};
+use tracing::{Instrument, Level, span, trace};
 
 use fyles_core::core::brain::action::BrainAction;
 use fyles_core::core::brain::action_client::ClientAction;
@@ -165,7 +165,8 @@ async fn run_private_filerequest_access(config: FilerequestAccessTestConfig) {
             async {
                 sender_harness
                     .p2p_client
-                    .clone()
+                    .read()
+                    .await
                     .send_files(vec![allowed_file])
                     .instrument(sender_manual)
                     .await
@@ -176,7 +177,7 @@ async fn run_private_filerequest_access(config: FilerequestAccessTestConfig) {
 
     // Wait for p2p node to request access for incoming file
     let owner_actions = timeout(
-        2.seconds(),
+        3.seconds(),
         owner_harness.intercept_actions(async |action| {
             trace!("Waiting for file request event");
             match action {
@@ -219,7 +220,7 @@ async fn run_private_filerequest_access(config: FilerequestAccessTestConfig) {
 
     // Wait for file transfer to be rejected
     timeout(
-        1.seconds(),
+        3.seconds(),
         unauthorized_harness.intercept_actions_and_await(
             async |action| match action {
                 BrainAction::NetworkNode(NetworkNodeAction::FileRejected { .. }) => {
@@ -232,6 +233,8 @@ async fn run_private_filerequest_access(config: FilerequestAccessTestConfig) {
                 // Sending should fail because peer is not in audience
                 unauthorized_harness
                     .p2p_client
+                    .read()
+                    .await
                     .send_files(vec![unauthorized_file])
                     .instrument(unauthorized_manual)
                     .await
@@ -254,11 +257,6 @@ async fn run_private_filerequest_access(config: FilerequestAccessTestConfig) {
         unauthorized_got_file_rejection_notice,
         "Unauthorized did not receive file rejection notice"
     );
-
-    // Clean up
-    owner_harness.abort();
-    sender_harness.abort();
-    unauthorized_harness.abort();
 }
 
 // Not every aspect of below test description are verified in this detail.

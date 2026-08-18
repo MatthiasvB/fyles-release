@@ -37,9 +37,9 @@ pub(super) fn db_op<T>(
 }
 
 impl From<SendError<SqliteMsg>> for DbError {
-    fn from(e: SendError<SqliteMsg>) -> Self {
+    fn from(_e: SendError<SqliteMsg>) -> Self {
         DbError::Communication {
-            source: Arc::new(e),
+            source: Arc::new(std::io::Error::other("sqlite actor channel closed")),
         }
     }
 }

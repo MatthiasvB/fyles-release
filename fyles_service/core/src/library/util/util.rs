@@ -1,17 +1,16 @@
 use tokio::{sync::MutexGuard, time::timeout};
 
-use crate::{core::brain::types::ByteChallenge, library::util::duration_ext::DurationExt};
+use crate::core::brain::types::ByteChallenge;
+use crate::constants::LOCK_TIMEOUT;
 
 pub fn generate_random_bytes(length: usize) -> Vec<u8> {
     generate_random_bytes_internal(length)
 }
 
 fn generate_random_bytes_internal(length: usize) -> Vec<u8> {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    // Should be able to call rng.random() but rust analyzer claims it does not exist.
-    // But it does. Idk
-    (0..length).map(|_| rng.r#gen()).collect()
+    use rand::RngExt;
+    let mut rng = rand::rng();
+    (0..length).map(|_| rng.random()).collect()
 }
 
 pub fn generate_byte_challenge() -> ByteChallenge {
@@ -81,7 +80,7 @@ pub trait TimeoutLock<T> {
 impl<T: Send> TimeoutLock<T> for tokio::sync::Mutex<T> {
     async fn timeout_lock(&self) -> MutexGuard<'_, T> {
         if cfg!(debug_assertions) {
-            timeout(5.seconds(), self.lock())
+            timeout(LOCK_TIMEOUT, self.lock())
                 .await
                 .expect("Locking timed out")
         } else {

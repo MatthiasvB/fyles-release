@@ -2,8 +2,6 @@ use derive_more::{Deref, DerefMut, From};
 use fyles_core::core::p2p::NodeKeyPairBinary;
 use libp2p::identity::{DecodingError, Keypair};
 
-
-
 pub fn decode_stored_keys(key_bytes: &NodeKeyPairBinary) -> Result<Keypair, DecodingError> {
     Keypair::from_protobuf_encoding(key_bytes)
 }

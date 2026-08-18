@@ -1,27 +1,66 @@
 use std::sync::Arc;
-use std::time::Duration;
 use tracing::{error, info, warn};
 
 use crate::core::db::FilerequestDb;
-use crate::io_controller::HostController;
 use crate::core::domain_models::ReceiveStatus;
+use crate::io_controller::{FileNamespace, HostController, OwnershipOutcome};
 use crate::library::util::epoch::unix_epoch_millis;
 use crate::library::util::part_file::parse_part_file_started_at_ms;
 
 /// Files (stale `.part` partials and orphaned outgoing copies) older than this are swept.
-const DEFAULT_STALE_THRESHOLD: Duration = Duration::from_secs(7 * 24 * 60 * 60); // 7 days
+use crate::constants::DEFAULT_STALE_THRESHOLD;
 
 pub async fn run_cleanups(db: Arc<dyn FilerequestDb>, hc: Arc<dyn HostController>) {
     info!("Running storage cleanups");
-    
+
+    // 0. Make sure every filerequest owns its on-disk directory.
+    reconcile_filerequest_dirs(db.clone(), hc.clone()).await;
+
     // 1. Structured partial cleanup
     structured_partial_cleanup(db.clone(), hc.clone()).await;
-    
+
     // 2. Sweep partial cleanup
     sweep_partial_cleanup(hc.clone()).await;
-    
+
     // 3. Sweep outgoing files cleanup
     sweep_outgoing_files_cleanup(hc.clone()).await;
+}
+
+/// Ensure every filerequest in the DB owns its on-disk directory via the
+/// `.fyles-owner` marker. Idempotent: creates+claims missing or unclaimed
+/// directories and leaves already-owned ones untouched. A directory owned by a
+/// *different* filerequest (e.g. after a cross-platform restore where two titles
+/// now sanitize to the same name) is left alone and logged — its files will fail
+/// to land there rather than being mixed in.
+pub async fn reconcile_filerequest_dirs(db: Arc<dyn FilerequestDb>, hc: Arc<dyn HostController>) {
+    let filerequests = match db.get_filerequests().await {
+        Ok(f) => f,
+        Err(e) => {
+            error!(
+                ?e,
+                "Failed to list filerequests for directory reconciliation"
+            );
+            return;
+        }
+    };
+    for fr in filerequests {
+        let ns = FileNamespace::Namespace {
+            namespace: fr.title.clone(),
+            child: None,
+        };
+        // ensure_exists_and_is_owned creates the directory if missing and claims it.
+        match hc.ensure_exists_and_is_owned(ns, &fr.id.0, false).await {
+            Ok(OwnershipOutcome::Conflict { other_id }) => warn!(
+                "Reconcile: directory for filerequest '{}' ({}) is owned by {other_id}; its files will not land here",
+                fr.title, fr.id.0
+            ),
+            Ok(_) => {}
+            Err(e) => warn!(
+                "Reconcile: could not claim directory for '{}': {e:?}",
+                fr.title
+            ),
+        }
+    }
 }
 
 async fn structured_partial_cleanup(db: Arc<dyn FilerequestDb>, hc: Arc<dyn HostController>) {
@@ -29,7 +68,7 @@ async fn structured_partial_cleanup(db: Arc<dyn FilerequestDb>, hc: Arc<dyn Host
         Ok(ms) => ms,
         Err(_) => return,
     };
-    
+
     let threshold = now - DEFAULT_STALE_THRESHOLD.as_millis() as i64;
     let stale_files = match db.get_stale_received_files(threshold).await {
         Ok(files) => files,
@@ -38,10 +77,13 @@ async fn structured_partial_cleanup(db: Arc<dyn FilerequestDb>, hc: Arc<dyn Host
             return;
         }
     };
-    
+
     for file in stale_files {
         let Some(transfer_id) = &file.transfer_id else {
-            warn!("Skipping stale received file with no transfer_id: {:?}", file.id);
+            warn!(
+                "Skipping stale received file with no transfer_id: {:?}",
+                file.id
+            );
             continue;
         };
 
@@ -53,7 +95,9 @@ async fn structured_partial_cleanup(db: Arc<dyn FilerequestDb>, hc: Arc<dyn Host
         );
 
         let _ = hc.remove_partial_file(&part_filename).await;
-        let _ = db.update_received_file_status(transfer_id, &ReceiveStatus::Failed, file.progress_bytes).await;
+        let _ = db
+            .update_received_file_status(transfer_id, &ReceiveStatus::Failed, file.progress_bytes)
+            .await;
     }
 }
 
@@ -62,7 +106,7 @@ async fn sweep_partial_cleanup(hc: Arc<dyn HostController>) {
         Ok(ms) => ms,
         Err(_) => return,
     };
-    
+
     let threshold = now - DEFAULT_STALE_THRESHOLD.as_millis() as i64;
     let partial_files = match hc.list_partial_files().await {
         Ok(files) => files,
@@ -71,7 +115,7 @@ async fn sweep_partial_cleanup(hc: Arc<dyn HostController>) {
             return;
         }
     };
-    
+
     for file in partial_files {
         if parse_part_file_started_at_ms(&file).is_some_and(|started_at| started_at < threshold) {
             warn!("Found orphaned stale partial file: {}", file);
@@ -85,7 +129,7 @@ async fn sweep_outgoing_files_cleanup(hc: Arc<dyn HostController>) {
         Ok(ms) => ms,
         Err(_) => return,
     };
-    
+
     let threshold = now - DEFAULT_STALE_THRESHOLD.as_millis() as i64;
     let temp_files = match hc.list_temporary_outgoing_files().await {
         Ok(files) => files,
@@ -94,7 +138,7 @@ async fn sweep_outgoing_files_cleanup(hc: Arc<dyn HostController>) {
             return;
         }
     };
-    
+
     for file in temp_files {
         if file.modified_ms < threshold {
             warn!("Found stale outgoing temporary file: {}", file.path);

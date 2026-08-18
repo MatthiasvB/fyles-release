@@ -41,10 +41,12 @@ message ContactProto {
   string name = 2;
 }
 
-message SelfContactProto {
+message SelfContactInviteProto {
   string id = 1;
   string name = 2;
   ContactKeysProto keys = 3;
+  string inviter_peer_id = 4;
+  string inviter_device_name = 5;
 }
 
 message CreatePeerProto {
@@ -280,6 +282,9 @@ message ReceivedFileProto {
   string file_path = 5;
   int64 size = 6;
   int64 received_at_ms = 7; // ms since Unix epoch
+  // The name the file is actually stored under on disk (after sanitization/
+  // deduplication). This is what the UI should display.
+  string persisted_as_name = 8;
 }
 
 // Request to list received files for a remote request
@@ -298,6 +303,27 @@ message DeleteReceivedFileRequest {
 
 message DeleteReceivedFileResponse {
   bool success = 1;
+}
+
+// Resolve the on-disk directory of a (local) filerequest, relative to the host's
+// drop directory (i.e. below the platform-specific "Received" folder). Returns
+// the "<sanitized-filerequest-title>" folder name. The client combines this with
+// the base directory it manages — and, for a single file, with that file's
+// persisted_as_name basename — to open/reveal it per platform.
+message ResolveFilerequestLocationRequest {
+  string filerequest_id = 1;
+}
+
+message ResolveFilerequestLocationResponse {
+  // The filerequest folder's location — genuinely either-or:
+  oneof location {
+    // Complete absolute filesystem path, when the daemon runs on a directly
+    // accessible filesystem (desktop). The client opens it as-is.
+    string absolute_path = 1;
+    // Path relative to the host drop root, on hosts with scoped/opaque storage
+    // (Android SAF, iOS sandbox); the client composes the full path itself.
+    string relative_path = 2;
+  }
 }
 
 message GetSelfContactRequest {
@@ -345,21 +371,15 @@ message WaitForReadyResponse {
   bool successfully_started = 1;
 }
 
-// Opaque settings messages
-message UpdateSettingsRequest {
-  bytes settings = 1;
+// Opaque settings command interface. The request/response bytes are a serialized
+// internet_settings.SettingsRequest / SettingsResponse; core never interprets
+// them, it only relays them to the network node.
+message SettingsRequestEnvelope {
+  bytes request = 1;
 }
 
-message UpdateSettingsResponse {
-  bool success = 1;
-}
-
-message GetSettingsRequest {
-  // empty
-}
-
-message GetSettingsResponse {
-  bytes settings = 1;
+message SettingsResponseEnvelope {
+  bytes response = 1;
 }
 
 // Define a service for the server
@@ -417,6 +437,10 @@ service FileRequestService {
 
   rpc DeleteReceivedFile (DeleteReceivedFileRequest) returns (DeleteReceivedFileResponse);
 
+  // Resolve a filerequest's on-disk folder (relative to the host drop dir) for
+  // opening files and filerequest folders from the UI.
+  rpc ResolveFilerequestLocation (ResolveFilerequestLocationRequest) returns (ResolveFilerequestLocationResponse);
+
   rpc GetSelfContactInviteChallenge (GetSelfContactInviteChallengeRequest) returns (GetSelfContactInviteChallengeResponse);
   rpc UnregisterSelfContactInviteChallenge (UnregisterSelfContactInviteChallengeRequest) returns (UnregisterSelfContactInviteChallengeResponse);
   rpc UseSelfContactInvite (UseSelfContactInviteRequest) returns (UseSelfContactInviteResponse);
@@ -428,11 +452,45 @@ service FileRequestService {
   rpc BackupData (BackupDataRequest) returns (BackupDataResponse);
   rpc RestoreData (RestoreDataRequest) returns (RestoreDataResponse);
 
+  // Owned devices (this user's other devices)
+  rpc ListOwnedDevices (ListOwnedDevicesRequest) returns (ListOwnedDevicesResponse);
+  // Renames *this* device only; other devices are renamed on the device itself and synced.
+  rpc RenameThisDevice (RenameThisDeviceRequest) returns (RenameThisDeviceResponse);
+  rpc RemoveOwnedDevice (RemoveOwnedDeviceRequest) returns (RemoveOwnedDeviceResponse);
+
   // Opaque settings
-  rpc UpdateSettings (UpdateSettingsRequest) returns (UpdateSettingsResponse);
-  rpc GetSettings (GetSettingsRequest) returns (GetSettingsResponse);
+  rpc Settings (SettingsRequestEnvelope) returns (SettingsResponseEnvelope);
 
   rpc Stream (stream ClientMessage) returns (stream ServerMessage);
+}
+
+message OwnedDeviceProto {
+  string peer_id = 1;
+  string name = 2;
+}
+
+message ListOwnedDevicesRequest {
+  // empty
+}
+
+message ListOwnedDevicesResponse {
+  repeated OwnedDeviceProto devices = 1;
+}
+
+message RenameThisDeviceRequest {
+  string name = 1;
+}
+
+message RenameThisDeviceResponse {
+  bool success = 1;
+}
+
+message RemoveOwnedDeviceRequest {
+  string peer_id = 1;
+}
+
+message RemoveOwnedDeviceResponse {
+  bool success = 1;
 }
 
 message BackupDataRequest {
@@ -454,7 +512,18 @@ message RestoreDataResponse {
 message ClientMessage {
   oneof message {
     StoreRemoteFileRequestRequest store_remote_file_request = 1;
+    ClientHeartbeat heartbeat = 2;
   }
+}
+
+// Sent by an attached client on stream open, on every app-lifecycle transition, and periodically
+// while attached. The service uses it to decide how eagerly the node should re-poke its peers: a
+// client that stops beating decays to "absent" and the node drops to its background cadence, which
+// is what makes a crashed or force-killed client indistinguishable from a cleanly closed one.
+message ClientHeartbeat {
+  // Whether a human is actually looking at the app right now. Derived by the client from its own
+  // lifecycle state — the service cannot observe this and must not guess at it.
+  bool foreground = 1;
 }
 
 message ServerMessage {
@@ -465,6 +534,12 @@ message ServerMessage {
     DatabaseRestoredFromBackup database_restored_from_backup = 4;
     PendingFileStatusChanged pending_file_status_changed = 5;
     ReceivedFileStatusChanged received_file_status_changed = 6;
+    // Emitted after a synced document converges (add/remove on another of the user's devices).
+    // Each carries the full new state for that concern so the client can replace it directly,
+    // without issuing any follow-up fetch.
+    ContactsChanged contacts_changed = 7;
+    RemoteFilerequestsChanged remote_filerequests_changed = 8;
+    OwnedDevicesChanged owned_devices_changed = 9;
   }
 }
 
@@ -472,6 +547,24 @@ message ReceivedSelfContactInviteOverNetwork {}
 message SelfContactInviteAcceptedOverNetwork {}
 message ReceivedContactShareOverNetwork {}
 message DatabaseRestoredFromBackup {}
+
+// The synced contacts document changed; carries the full contact list.
+message ContactsChanged {
+  repeated ContactProto contacts = 1;
+}
+
+// The synced remote-filerequests document changed; carries the full remote-filerequest list plus
+// every pending file (each tagged with its target_file_request_id) so the client can rebuild the
+// nested structure. Pending files for a remote filerequest removed elsewhere are already gone.
+message RemoteFilerequestsChanged {
+  repeated RemoteFileRequestProto remote_file_requests = 1;
+  repeated PendingFileProto pending_files = 2;
+}
+
+// The synced owned-devices document changed; carries the full owned-device list.
+message OwnedDevicesChanged {
+  repeated OwnedDeviceProto devices = 1;
+}
 
 message PendingFileStatusChanged {
   string pending_file_id = 1;
@@ -490,6 +583,9 @@ message ReceivedFileStatusChanged {
   uint64 progress_bytes = 4;
   uint64 file_size_bytes = 5;
   string file_name = 6;
+  // The name the file is actually stored under on disk (after sanitization/
+  // deduplication). This is what the UI should display.
+  string persisted_as_name = 7;
 }
 
 message GetSelfContactInviteChallengeRequest {
@@ -601,17 +697,17 @@ message GetAllContactsResponse {
 }
 
 message ContactPublicKeysProto {
-  bytes dilithium = 1;
+  bytes pq_signing = 1;
   bytes ed25519 = 2;
 }
 
 message ContactPrivateKeysProto {
-  bytes dilithium = 1;
+  bytes pq_signing = 1;
   bytes ed25519 = 2;
 }
 
+// Only the private keys are carried; the public keys are derived from them.
 message ContactKeysProto {
-  ContactPublicKeysProto public_keys = 1;
   ContactPrivateKeysProto private_keys = 2;
 }
 
@@ -678,11 +774,11 @@ message GetFullSelfContactRequest {
 }
 
 message GetFullSelfContactResponse {
-  SelfContactProto contact = 1;
+  SelfContactInviteProto invite = 1;
 }
 
 message UpdateIdentityRequest {
-  SelfContactProto self_contact = 1;
+  SelfContactInviteProto invite = 1;
 }
 
 message UpdateIdentityResponse {
