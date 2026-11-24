@@ -72,10 +72,19 @@ fyles-daemon [OPTIONS]
 3. Flutter app reads this file via `TcpConfig.get()` to discover port and auth token
 4. All gRPC calls include `Bearer <passcode>` in metadata
 
-**Linux** (UDS): nothing in the repository starts the daemon on Linux, so whatever launches it
-(a systemd user unit, say) passes `--endpoint uds:$XDG_RUNTIME_DIR/fyles.sock`. The Flutter app
-connects to that path. Where `XDG_RUNTIME_DIR` is unset, it falls back to
-`~/.local/share/app.fyles.fyles/fyles.sock`.
+**Linux** (UDS): the daemon binds `$XDG_RUNTIME_DIR/fyles.sock`, and the Flutter app connects to
+that path. Where `XDG_RUNTIME_DIR` is unset, both use `~/.local/share/app.fyles.fyles/fyles.sock`.
+Fyles reaches Linux as a Nix package ([ADR 0013](adr/0013-linux-through-nix.md)):
+- `fyles-daemon-start` chooses the daemon's paths. The database lives in `$XDG_DATA_HOME/fyles`,
+  and received files go to `~/Downloads/Fyles` unless `FYLES_OUTPUT_DIR` names another folder.
+- `fyles` starts the daemon in the background and opens the app.
+- A systemd user unit, from the package or from the NixOS or Home Manager module, keeps the daemon
+  running from login.
+- The daemon holds `<db-path>.lock`, and `<socket>.lock` for a Unix socket, for its life. A
+  second daemon on the same database or socket exits with 75. The units count that as a clean
+  exit, so they neither restart nor show as failed, and starting a daemon needs no check.
+- `--listen-port` (or `FYLES_LISTEN_PORT`) pins the peer port, which the modules also open in the
+  NixOS firewall.
 
 **macOS** (UDS): the daemon binds gRPC to a Unix Domain Socket at
 `~/Library/Application Support/Fyles/fyles.sock`, and the Flutter app connects to the same fixed path

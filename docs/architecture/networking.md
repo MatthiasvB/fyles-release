@@ -280,7 +280,11 @@ See [Security & Cryptography](security.md) for details.
 
 Peers reach a node on one port, over TCP and QUIC alike. Each user has their own port, stored in
 the database (`listen_port` table), so two users signed in on one machine each run their own node.
-See [ADR 0010](adr/0010-per-user-listen-port.md) for why it is shaped this way.
+See [ADR 0010](adr/0010-per-user-listen-port.md) for why it is shaped this way. A daemon started
+with `--listen-port` uses that port instead, so that a system configuration can open it in a
+firewall ([ADR 0013](adr/0013-linux-through-nix.md)). The brain then never stores it, refuses to
+change it, and sets `GetListenStatusResponse.port_pinned`, so the app shows the port as set by
+the system.
 
 **Who decides.** The brain (`core/src/core/brain/listen_port.rs`). The network node only binds the
 port it is asked for (`NetworkNode::listen_on_port`) and knows nothing of choices or fallbacks.

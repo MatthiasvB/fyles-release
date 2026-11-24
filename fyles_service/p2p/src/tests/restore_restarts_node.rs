@@ -6,11 +6,11 @@ use fyles_core::core::backup::test_support::{TEST_PASSWORD, write_backup};
 use fyles_core::core::backup::{
     Password, RestoreOutcome, RestoreRequest, UnpackedFormat, VerificationSchedule,
 };
-use fyles_core::core::brain::BrainNetwork;
 use fyles_core::core::brain::action::BrainAction;
 use fyles_core::core::brain::action_client::ClientAction;
 use fyles_core::core::brain::plugin::{BrainPluginRef, NoOpBrainPlugin};
 use fyles_core::core::brain::types::BrainRequest;
+use fyles_core::core::brain::{BrainNetwork, NodeSettings};
 use fyles_core::core::db::test::setup_test_db;
 use fyles_core::entrypoint;
 use fyles_core::io_controller::Uri;
@@ -67,7 +67,7 @@ async fn a_restore_restarts_the_node_under_the_restored_peer_id() {
 
     std::thread::spawn(move || {
         entrypoint(
-            PathBuf::from("."),
+            NodeSettings::with_stored_port(PathBuf::from(".")),
             async || db.clone(),
             async || host.clone() as _,
             async |sender, shutdown| {

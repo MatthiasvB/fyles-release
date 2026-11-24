@@ -27,7 +27,7 @@ libp2p.workspace = true
 [features]
 default = []
 dev-keys = ["fyles-core/dev-keys"]
-console = ["tracing-subscriber/fmt", "direct_host_utils/console"]
+console = ["tracing-subscriber/fmt", "direct_host_utils/console", "fyles-core/console"]
 otel-jaeger = ["opentelemetry", "opentelemetry-otlp", "tracing-opentelemetry", "opentelemetry-stdout", "opentelemetry_sdk"]
 
 [dev-dependencies]

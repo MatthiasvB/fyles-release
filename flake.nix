@@ -36,11 +36,38 @@
 
       checks.formatting = treefmtEval.config.build.check self;
 
+      packages = nixpkgs.lib.optionalAttrs (system == "x86_64-linux") rec {
+        fyles = pkgs.callPackage ./nix/fyles-app.nix {};
+        default = fyles;
+      };
+
       devShells.default = pkgs.mkShell {
         packages = rustEnv.shellPackages;
         shellHook = ''
           echo "Using Rust from: $(command -v rustc)"
         '';
       };
+    })
+    // (let
+      # The app is patched against this flake's nixpkgs, which its binaries were built with, but
+      # only under the user's own unfree policy.
+      fylesFor = userPkgs: let
+        userConfig = userPkgs.config;
+      in
+        (import nixpkgs {
+          inherit (userPkgs.stdenv.hostPlatform) system;
+          config =
+            {
+              allowUnfree = userConfig.allowUnfree or false;
+              allowUnfreePackages = userConfig.allowUnfreePackages or [];
+            }
+            // nixpkgs.lib.optionalAttrs (userConfig ? allowUnfreePredicate) {
+              inherit (userConfig) allowUnfreePredicate;
+            };
+        }).callPackage
+        ./nix/fyles-app.nix {};
+    in {
+      homeManagerModules.default = import ./nix/home-manager-module.nix {inherit fylesFor;};
+      nixosModules.default = import ./nix/nixos-module.nix {inherit self fylesFor;};
     });
 }

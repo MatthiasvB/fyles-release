@@ -1089,9 +1089,9 @@ impl GigaBrain {
                 }
             }
             ClientAction::GetListenStatus(request) => {
-                let status = self.listen_status().await;
+                let report = self.listen_report().await;
                 if let Some(sender) = request.response_sender.timeout_lock().await.take() {
-                    let _ = sender.send(status);
+                    let _ = sender.send(report);
                 }
             }
             ClientAction::SetListenPort(request) => {

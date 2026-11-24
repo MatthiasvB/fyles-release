@@ -17,7 +17,8 @@ use fyles_core::{
     Endpoint,
     core::{
         api_server::ApiServer,
-        brain::{BrainApiServer, BrainDb, BrainNetwork},
+        brain::{BrainApiServer, BrainDb, BrainNetwork, NodeSettings},
+        listen::{ListenPort, ListenPortChoice},
     },
     entrypoint,
     library::sqlite::{Sqlite, SqliteConfig},
@@ -26,12 +27,13 @@ use p2p::{P2pClient, event_loop::LocalEventLoop, types::Config};
 
 use direct_host_utils::{
     direct_fs_controller::DirectFsController,
-    host_state,
+    host_state, instance_lock,
     tracing::{TracingConfig, init_tracing},
 };
 
 struct DaemonConfig {
     config: Config,
+    listen_port: ListenPortChoice,
     #[cfg(feature = "otel-jaeger")]
     otel_endpoint: String,
 }
@@ -73,10 +75,14 @@ fn main() {
     );
 
     let endpoint = Endpoint::parse(&config.config.endpoint).unwrap();
+    let _instance = instance_lock::claim_or_exit(&config.config.db_path, &endpoint);
 
     let db_path = config.config.db_path.clone();
     entrypoint(
-        config.config.internal_data_dir.clone(),
+        NodeSettings {
+            internal_data_dir: config.config.internal_data_dir.clone(),
+            listen_port: config.listen_port,
+        },
         async || {
             Sqlite::spawn(SqliteConfig {
                 path: SqlitePath::File(db_path.clone()),
@@ -137,6 +143,9 @@ impl From<Args> for DaemonConfig {
             );
         }
         DaemonConfig {
+            listen_port: args
+                .listen_port
+                .map_or(ListenPortChoice::Stored, ListenPortChoice::Pinned),
             config: Config {
                 db_path,
                 internal_data_dir,
@@ -194,6 +203,10 @@ Forms:
     /// Android's persisted SAF tree, iOS's Documents/Drop.)
     #[clap(short = 'o', long, default_value = ".", env = "OUTPUT_DIR")]
     output_dir: String,
+
+    /// Pins the port peers reach this node on. The app then shows it but cannot change it.
+    #[clap(long, env = "FYLES_LISTEN_PORT")]
+    listen_port: Option<ListenPort>,
 
     #[cfg(feature = "otel-jaeger")]
     /// OTLP/HTTP endpoint for Jaeger or Collector

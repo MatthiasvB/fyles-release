@@ -11,13 +11,13 @@ use crate::core::backup::test_support::{TEST_PASSWORD, write_backup};
 use crate::core::backup::{
     Password, RestoreOutcome, RestoreRefusal, RestoreRequest, UnpackedFormat, VerificationSchedule,
 };
-use crate::core::brain::BrainNetwork;
 use crate::core::brain::action::BrainAction;
 use crate::core::brain::action_client::ClientAction;
 use crate::core::brain::action_p2p::{NetworkNodeAction, NodeInfo};
 use crate::core::brain::error::FilerequestError;
 use crate::core::brain::plugin::BrainPluginRef;
 use crate::core::brain::types::BrainRequest;
+use crate::core::brain::{BrainNetwork, NodeSettings};
 use crate::core::db::test::setup_test_db;
 use crate::core::domain_models::PeerIdWrapper;
 use crate::core::p2p::NodeStatusInfo;
@@ -50,7 +50,7 @@ impl Generations {
             let tokens = tokens.clone();
             move || {
                 entrypoint(
-                    PathBuf::from("."),
+                    NodeSettings::with_stored_port(PathBuf::from(".")),
                     async || db.clone(),
                     async || host.clone() as _,
                     async |_, shutdown| {

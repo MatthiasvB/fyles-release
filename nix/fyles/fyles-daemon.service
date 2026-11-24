@@ -1,0 +1,10 @@
+[Unit]
+Description=Fyles daemon
+
+[Service]
+ExecStart=@out@/bin/fyles-daemon-start
+Restart=on-failure
+SuccessExitStatus=@exitAlreadyRunning@
+
+[Install]
+WantedBy=default.target

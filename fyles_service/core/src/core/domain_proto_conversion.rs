@@ -2,7 +2,7 @@ use crate::core::backup::{
     BackupOutcome, BackupPasswordStatus, PasswordCheck, PasswordSuggestion, PasswordWarning,
     RestoreOutcome, RestoreRefusal, UnpackedFormat,
 };
-use crate::core::listen::{ListenFailure, ListenStatus};
+use crate::core::listen::{ListenFailure, ListenReport, ListenStatus, PortSetBy};
 use crate::core::settings::SettingsView;
 use crypto::{
     ContactKeys, ContactPrivateKeys, ContactPublicKeys, PqSigningPrivateKeyDeserializationError,
@@ -100,13 +100,16 @@ impl From<ListenStatus> for ListenStatusProto {
     }
 }
 
-impl From<Option<ListenStatus>> for GetListenStatusResponse {
-    fn from(status: Option<ListenStatus>) -> Self {
-        let state = match status {
+impl From<ListenReport> for GetListenStatusResponse {
+    fn from(report: ListenReport) -> Self {
+        let state = match report.status {
             Some(status) => get_listen_status_response::State::Status(status.into()),
             None => get_listen_status_response::State::Starting(ListenStarting {}),
         };
-        GetListenStatusResponse { state: Some(state) }
+        GetListenStatusResponse {
+            state: Some(state),
+            port_pinned: report.set_by == PortSetBy::System,
+        }
     }
 }
 

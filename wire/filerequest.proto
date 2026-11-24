@@ -427,11 +427,14 @@ message GetListenStatusRequest {}
 
 message ListenStarting {}
 
+// `port_pinned` is set when the daemon's --listen-port decides the port, so the app cannot change
+// it.
 message GetListenStatusResponse {
   oneof state {
     ListenStarting starting = 1;
     ListenStatusProto status = 2;
   }
+  bool port_pinned = 3;
 }
 
 message SetListenPortRequest {

@@ -5,8 +5,11 @@ use crate::constants::{
     LISTEN_PORT_PICKS, LISTEN_RECLAIM_BACKOFF, RANDOM_LISTEN_PORTS, RELISTEN_DELAYS,
 };
 use crate::core::brain::GigaBrain;
+use crate::core::brain::error::FilerequestError;
 use crate::core::brain::types::FilerequestResult;
-use crate::core::listen::{ListenFailure, ListenPort, ListenStatus, TemporaryPort};
+use crate::core::listen::{
+    ListenFailure, ListenPort, ListenPortChoice, ListenReport, ListenStatus, TemporaryPort,
+};
 use crate::core::p2p::NodeConfig;
 use crate::library::util::util::TimeoutLock;
 
@@ -29,6 +32,9 @@ impl GigaBrain {
     }
 
     pub(super) async fn set_listen_port(&self, port: ListenPort) -> FilerequestResult<()> {
+        self.listen_port
+            .allow_change()
+            .map_err(|pinned| FilerequestError::InputError(pinned.to_string()))?;
         let mut status = self.listen_status.timeout_lock().await;
         self.db.store_listen_port(port).await?;
         if self.establish(&mut status).await {
@@ -39,6 +45,13 @@ impl GigaBrain {
 
     pub(super) async fn listen_status(&self) -> Option<ListenStatus> {
         self.listen_status.timeout_lock().await.clone()
+    }
+
+    pub(super) async fn listen_report(&self) -> ListenReport {
+        ListenReport {
+            status: self.listen_status().await,
+            set_by: self.listen_port.set_by(),
+        }
     }
 
     /// Retries a degraded status until the configured port is back, backing off while it is not.
@@ -70,7 +83,11 @@ impl GigaBrain {
 
     /// Returns whether the status changed, which the clients have then been told.
     async fn establish(&self, status: &mut Option<ListenStatus>) -> bool {
-        let next = match self.db.get_listen_port().await {
+        let configured = match self.listen_port {
+            ListenPortChoice::Pinned(port) => Ok(Some(port)),
+            ListenPortChoice::Stored => self.db.get_listen_port().await,
+        };
+        let next = match configured {
             Ok(Some(configured)) => {
                 let held = status.as_ref().and_then(ListenStatus::active_port);
                 self.listen_on_configured(configured, held).await
@@ -88,10 +105,14 @@ impl GigaBrain {
         }
         match &next {
             ListenStatus::Listening(port) => info!(%port, "Listening for peers"),
-            degraded => warn!(
-                ?degraded,
-                "Peers cannot reach the node on its configured port"
-            ),
+            degraded => {
+                warn!(
+                    ?degraded,
+                    "Peers cannot reach the node on its configured port"
+                );
+                #[cfg(not(feature = "console"))]
+                eprintln!("Peers cannot reach the node on its configured port: {degraded:?}");
+            }
         }
         *status = Some(next.clone());
         self.push_listen_status(next).await;

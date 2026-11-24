@@ -14,7 +14,7 @@ use tracing::{Instrument, Level, debug, instrument, span};
 
 use crate::core::brain::client_presence::ClientPresence;
 use crate::core::brain::plugin::BrainPluginRef;
-use crate::core::listen::ListenStatus;
+use crate::core::listen::{ListenPortChoice, ListenStatus};
 use crate::core::{brain::types::SelfContactInviteChallenge, p2p::RunnableNetworkNode};
 use crate::library::util::util::TimeoutLock;
 use crate::{
@@ -114,9 +114,26 @@ pub struct Brain {
     /// Cancelled before the workloads are awaited, so tasks spawned by the p2p loop stop before
     /// their counterparties disappear rather than sending into a dropped receiver.
     shutdown: CancellationToken,
-    internal_data_dir: std::path::PathBuf,
+    internal_data_dir: PathBuf,
+    listen_port: ListenPortChoice,
     #[cfg(any(test, feature = "test-support"))]
     pub action_interceptor: Arc<Mutex<Option<ActionInterceptor>>>,
+}
+
+/// What the host decides about a node before it starts.
+#[derive(Debug, Clone)]
+pub struct NodeSettings {
+    pub internal_data_dir: PathBuf,
+    pub listen_port: ListenPortChoice,
+}
+
+impl NodeSettings {
+    pub fn with_stored_port(internal_data_dir: PathBuf) -> Self {
+        Self {
+            internal_data_dir,
+            listen_port: ListenPortChoice::Stored,
+        }
+    }
 }
 
 #[derive(Clone, Deref)]
@@ -153,7 +170,7 @@ impl Brain {
     #[allow(clippy::too_many_arguments)]
     #[instrument(skip_all, level = "trace")]
     pub async fn run(
-        internal_data_dir: PathBuf,
+        settings: NodeSettings,
         run_db: impl AsyncFn() -> BrainDb,
         host_controller_factory: impl AsyncFn() -> BrainHostController,
         network_factory: impl AsyncFn() -> BrainNetwork,
@@ -228,7 +245,8 @@ impl Brain {
             tasks,
             end,
             shutdown: shutdown.clone(),
-            internal_data_dir,
+            internal_data_dir: settings.internal_data_dir,
+            listen_port: settings.listen_port,
             #[cfg(any(test, feature = "test-support"))]
             action_interceptor: Arc::new(Mutex::new(None)),
         }));
@@ -451,9 +469,10 @@ mod test {
         CLIENT_HEARTBEAT_TTL, LISTEN_PORT_PICKS, RANDOM_LISTEN_PORTS, SWEEP_INTERVAL_ACTIVE,
         SWEEP_JITTER_FRACTION,
     };
+    use crate::core::brain::error::FilerequestError;
     use crate::core::brain::types::{ContactRegistration, SignedContactShare};
     use crate::core::db::test::setup_test_db;
-    use crate::core::listen::{ListenFailure, ListenPort, TemporaryPort};
+    use crate::core::listen::{ListenFailure, ListenPort, ListenReport, PortSetBy, TemporaryPort};
     use crate::core::sync;
     use crate::library::util::epoch::unix_epoch_millis;
     use crate::{
@@ -500,6 +519,20 @@ mod test {
         Arc<TestHostController>,
         MockBrainPlugin,
     ) {
+        setup_brain_watching_pushes_with(ListenPortChoice::Stored).await
+    }
+
+    async fn setup_brain_watching_pushes_with(
+        listen_port: ListenPortChoice,
+    ) -> (
+        GigaBrain,
+        mpsc::Sender<BrainAction>,
+        Arc<MockP2pNode>,
+        CancellationToken,
+        mpsc::Receiver<ServerMessage>,
+        Arc<TestHostController>,
+        MockBrainPlugin,
+    ) {
         let host_controller = Arc::new(TestHostController::new(None));
         let out_dir_handler = host_controller.clone();
         let node_info = NodeStatusInfo {
@@ -519,7 +552,10 @@ mod test {
         let shutdown = CancellationToken::new();
         let (sender, receiver) = mpsc::channel(16);
         let brain = Brain::run(
-            PathBuf::from("."),
+            NodeSettings {
+                internal_data_dir: PathBuf::from("."),
+                listen_port,
+            },
             async || setup_test_db(None).await,
             async || out_dir_handler.clone() as _,
             async || Arc::new(RwLock::new(MockP2pNode::clone(&node_for_factory))) as _,
@@ -1518,6 +1554,82 @@ mod test {
         );
         assert_eq!(brain.db.get_listen_port().await.unwrap(), Some(taken));
         assert_eq!(node.listen_calls().last(), Some(&before));
+    }
+
+    #[tokio::test]
+    async fn a_pinned_port_wins_over_the_stored_one_and_is_not_stored() {
+        let pinned = listen_port(24301);
+        let (brain, sender, node, _shutdown, mut pushes, _host, _plugin) =
+            setup_brain_watching_pushes_with(ListenPortChoice::Pinned(pinned)).await;
+        let stored = listen_port(24256);
+        brain.db.store_listen_port(stored).await.unwrap();
+
+        report_ready(&sender).await;
+        await_listen_push(&mut pushes).await;
+
+        assert_eq!(node.listen_calls(), vec![pinned]);
+        assert_eq!(
+            brain.listen_status().await,
+            Some(ListenStatus::Listening(pinned))
+        );
+        assert_eq!(brain.db.get_listen_port().await.unwrap(), Some(stored));
+    }
+
+    #[tokio::test]
+    async fn a_taken_pinned_port_falls_back_to_a_temporary_one_that_is_not_stored() {
+        let pinned = listen_port(24301);
+        let (brain, sender, node, _shutdown, mut pushes, _host, _plugin) =
+            setup_brain_watching_pushes_with(ListenPortChoice::Pinned(pinned)).await;
+        node.set_listen_outcome(move |port| {
+            if port == pinned {
+                Err(ListenFailure::AddressInUse)
+            } else {
+                Ok(())
+            }
+        });
+
+        report_ready(&sender).await;
+        await_listen_push(&mut pushes).await;
+
+        let Some(ListenStatus::Temporary(temporary)) = brain.listen_status().await else {
+            panic!("a taken pinned port should fall back to a temporary one");
+        };
+        assert_eq!(temporary.configured(), pinned);
+        assert_eq!(brain.db.get_listen_port().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_pinned_port_cannot_be_changed_and_is_reported() {
+        let pinned = listen_port(24301);
+        let (brain, sender, node, _shutdown, mut pushes, _host, _plugin) =
+            setup_brain_watching_pushes_with(ListenPortChoice::Pinned(pinned)).await;
+        report_ready(&sender).await;
+        await_listen_push(&mut pushes).await;
+
+        let (request, response) = BrainRequest::with_receiver(listen_port(30000));
+        sender
+            .send(BrainAction::Client(ClientAction::SetListenPort(request)))
+            .await
+            .unwrap();
+        assert!(matches!(
+            response.await.unwrap(),
+            Err(FilerequestError::InputError(_))
+        ));
+
+        assert_eq!(node.listen_calls(), vec![pinned]);
+        assert_eq!(brain.db.get_listen_port().await.unwrap(), None);
+        let (request, response) = BrainRequest::with_receiver(());
+        sender
+            .send(BrainAction::Client(ClientAction::GetListenStatus(request)))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.await.unwrap(),
+            ListenReport {
+                status: Some(ListenStatus::Listening(pinned)),
+                set_by: PortSetBy::System,
+            }
+        );
     }
 
     #[tokio::test]

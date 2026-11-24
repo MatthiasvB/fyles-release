@@ -1,0 +1,50 @@
+{fylesFor}: {
+  config,
+  lib,
+  pkgs,
+  ...
+}: let
+  cfg = config.programs.fyles;
+in {
+  # Home Manager inside NixOS also gets this module from the NixOS module. The key loads it once.
+  key = "fyles-home-manager-module";
+
+  options.programs.fyles = {
+    enable = lib.mkEnableOption "Fyles and its daemon as a user service";
+    package = lib.mkOption {
+      type = lib.types.package;
+      default = fylesFor pkgs;
+      defaultText = lib.literalMD "the flake's package, allowed by this configuration's unfree policy";
+    };
+    outputDir = lib.mkOption {
+      type = lib.types.nullOr (lib.types.strMatching "/.*");
+      default = null;
+      description = "The absolute path received files go to. Unset means ~/Downloads/Fyles.";
+    };
+    listenPort = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 1024 65535);
+      default = null;
+      description = ''
+        Pins the port other devices reach this user's node on, over TCP and UDP. Unset leaves it
+        to the app. A firewall must let it in, which the Fyles NixOS module does when Home Manager
+        runs inside NixOS.
+      '';
+    };
+  };
+
+  config = lib.mkIf cfg.enable {
+    home.packages = [cfg.package];
+    systemd.user.services.fyles-daemon = {
+      Unit.Description = "Fyles daemon";
+      Service = {
+        ExecStart = lib.getExe' cfg.package "fyles-daemon-start";
+        Restart = "on-failure";
+        SuccessExitStatus = toString cfg.package.passthru.exitAlreadyRunning;
+        Environment =
+          lib.optional (cfg.outputDir != null) "FYLES_OUTPUT_DIR=${cfg.outputDir}"
+          ++ lib.optional (cfg.listenPort != null) "FYLES_LISTEN_PORT=${toString cfg.listenPort}";
+      };
+      Install.WantedBy = ["default.target"];
+    };
+  };
+}

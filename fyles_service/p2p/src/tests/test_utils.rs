@@ -3,7 +3,9 @@ use futures::StreamExt;
 use fyles_core::core::api_server::MockRunnableFilerequestServer;
 use fyles_core::core::brain::action_test::TestAction;
 use fyles_core::core::brain::plugin::{BrainPluginRef, NoOpBrainPlugin};
-use fyles_core::core::brain::{ActionInterceptor, BrainNetwork, GenerationEnd, GigaBrain};
+use fyles_core::core::brain::{
+    ActionInterceptor, BrainNetwork, GenerationEnd, GigaBrain, NodeSettings,
+};
 use fyles_core::core::db::test::{DbRef, setup_test_db};
 use fyles_core::core::p2p::{NetworkNode, NodeConfig, Runnable};
 use fyles_core::io_controller::HostController;
@@ -198,7 +200,7 @@ impl IdleP2pTestHarness {
         let out_dir_handler = self.out_dir_handler.clone();
         let internal_data_dir = self.temp_dir.path().to_path_buf();
         let brain_runner = Brain::run(
-            internal_data_dir,
+            NodeSettings::with_stored_port(internal_data_dir),
             async move || db.clone(),
             async move || out_dir_handler.clone(),
             async move || p2p_clone.clone() as BrainNetwork,

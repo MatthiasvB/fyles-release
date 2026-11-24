@@ -1,5 +1,6 @@
 use std::fmt;
 use std::io;
+use std::str::FromStr;
 
 use thiserror::Error;
 
@@ -34,6 +35,17 @@ impl TryFrom<u16> for ListenPort {
         } else {
             Err(InvalidListenPort(port.into()))
         }
+    }
+}
+
+impl FromStr for ListenPort {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let port: u32 = raw
+            .parse()
+            .map_err(|_| format!("{raw} is not a port number"))?;
+        ListenPort::try_from(port).map_err(|e| e.to_string())
     }
 }
 
@@ -98,6 +110,50 @@ impl TemporaryPort {
     }
 }
 
+/// Who decides the port peers reach the node on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenPortChoice {
+    /// The user, in the app. The port is stored in the database.
+    Stored,
+    /// The daemon's `--listen-port`, so that the system's firewall and the node agree.
+    Pinned(ListenPort),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("the listen port is pinned to {0} by the daemon's --listen-port")]
+pub struct ListenPortPinned(pub ListenPort);
+
+impl ListenPortChoice {
+    pub fn allow_change(self) -> Result<(), ListenPortPinned> {
+        match self {
+            ListenPortChoice::Stored => Ok(()),
+            ListenPortChoice::Pinned(port) => Err(ListenPortPinned(port)),
+        }
+    }
+
+    pub fn set_by(self) -> PortSetBy {
+        match self {
+            ListenPortChoice::Stored => PortSetBy::User,
+            ListenPortChoice::Pinned(_) => PortSetBy::System,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortSetBy {
+    User,
+    System,
+}
+
+/// The listen status together with who decides the port, as the clients are told it. The port
+/// itself is in the status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenReport {
+    /// `None` until the node first reported ready.
+    pub status: Option<ListenStatus>,
+    pub set_by: PortSetBy,
+}
+
 /// Where the node accepts peers, against the port configured for the user.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListenStatus {
@@ -139,6 +195,26 @@ mod tests {
         assert_eq!(
             TemporaryPort::new(port, ListenFailure::AddressInUse, port),
             None
+        );
+    }
+
+    #[test]
+    fn a_port_parses_from_its_digits_only() {
+        assert_eq!(
+            "24301".parse::<ListenPort>().map(ListenPort::get),
+            Ok(24301)
+        );
+        assert!("80".parse::<ListenPort>().is_err());
+        assert!("http".parse::<ListenPort>().is_err());
+    }
+
+    #[test]
+    fn only_a_stored_port_can_be_changed() {
+        let port = ListenPort::try_from(24256u16).unwrap();
+        assert_eq!(ListenPortChoice::Stored.allow_change(), Ok(()));
+        assert_eq!(
+            ListenPortChoice::Pinned(port).allow_change(),
+            Err(ListenPortPinned(port))
         );
     }
 

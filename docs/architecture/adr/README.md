@@ -31,3 +31,4 @@ One file per decision: `NNNN-kebab-case-title.md`, numbered sequentially. Sectio
 | [0010](0010-per-user-listen-port.md) | Each user listens on a port of their own, chosen in the database |
 | [0011](0011-file-data-on-streams.md) | File data travels on one authenticated stream per attempt |
 | [0012](0012-password-encrypted-backups.md) | Backups are encrypted with a password the device remembers as a key |
+| [0013](0013-linux-through-nix.md) | Fyles reaches Linux through Nix, as prebuilt binaries |

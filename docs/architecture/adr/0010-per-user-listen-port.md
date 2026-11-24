@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted (2026-10)
+Accepted (2026-10). Partially superseded by [0013](0013-linux-through-nix.md): a daemon started
+with `--listen-port` uses that port instead of the stored one.
 
 ## Context
 

@@ -2,7 +2,7 @@ use crate::core::backup::{
     BackupOutcome, BackupPasswordStatus, NewBackupPassword, Password, RestoreOutcome,
     RestoreRequest,
 };
-use crate::core::listen::{ListenPort, ListenStatus};
+use crate::core::listen::{ListenPort, ListenReport};
 use crate::core::settings::{SettingsMutation, SettingsView};
 use std::collections::HashMap;
 
@@ -110,7 +110,7 @@ pub enum ClientAction {
     GetSettings(BrainRequest<(), FilerequestResult<SettingsView>>),
     MutateSettings(BrainRequest<SettingsMutation, FilerequestResult<SettingsView>>),
 
-    GetListenStatus(BrainRequest<(), Option<ListenStatus>>),
+    GetListenStatus(BrainRequest<(), ListenReport>),
     SetListenPort(BrainRequest<ListenPort, FilerequestResult<()>>),
 
     GetEntitlements(BrainRequest<(), FilerequestResult<Entitlements>>),

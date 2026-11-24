@@ -1747,23 +1747,7 @@ impl FileRequestService for ApiServer {
     ) -> Result<Response<SetListenPortResponse>, Status> {
         let port = ListenPort::try_from(request.into_inner().port)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let (response_sender, response_receiver) = oneshot::channel();
-
-        self.action_sender
-            .send(BrainAction::Client(ClientAction::SetListenPort(
-                brain::types::BrainRequest {
-                    request: port,
-                    response_sender: Mutex::new(Some(response_sender)),
-                },
-            )))
-            .await
-            .map_err(|_| Status::internal("Failed to send set listen port action"))?;
-
-        response_receiver
-            .await
-            .map_err(|_| Status::internal("Failed to receive response"))?
-            .map_err(|e| Status::internal(e.to_string()))?;
-
+        self.ask_brain(port, ClientAction::SetListenPort).await?;
         Ok(Response::new(SetListenPortResponse {}))
     }
 

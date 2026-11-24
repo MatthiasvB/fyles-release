@@ -1,11 +1,11 @@
 use crate::core::brain::plugin::BrainPluginRef;
 use crate::core::brain::{
-    BrainApiServer, BrainDb, BrainHostController, BrainNetwork, GenerationEnd, action::BrainAction,
+    BrainApiServer, BrainDb, BrainHostController, BrainNetwork, GenerationEnd, NodeSettings,
+    action::BrainAction,
 };
 use crate::library::wire::api::ServerMessage;
 use ::tracing::Instrument;
 use core::brain::Brain;
-use std::path::PathBuf;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
@@ -67,7 +67,7 @@ impl Endpoint {
 }
 
 pub fn entrypoint(
-    internal_data_dir: PathBuf,
+    settings: NodeSettings,
     db_factory: impl AsyncFn() -> BrainDb,
     host_controller_factory: impl AsyncFn() -> BrainHostController,
     network_factory: impl AsyncFn(Sender<BrainAction>, CancellationToken) -> BrainNetwork,
@@ -94,7 +94,7 @@ pub fn entrypoint(
     debug!("Blocking on async workload");
     async_runtime.block_on(
         run_generations(
-            internal_data_dir,
+            settings,
             db_factory,
             host_controller_factory,
             network_factory,
@@ -106,7 +106,7 @@ pub fn entrypoint(
 }
 
 async fn run_generations(
-    internal_data_dir: PathBuf,
+    settings: NodeSettings,
     db_factory: impl AsyncFn() -> BrainDb,
     host_controller_factory: impl AsyncFn() -> BrainHostController,
     network_factory: impl AsyncFn(Sender<BrainAction>, CancellationToken) -> BrainNetwork,
@@ -122,7 +122,7 @@ async fn run_generations(
         let (client_push_sender, client_push_receiver) = mpsc::channel(8);
         let shutdown = CancellationToken::new();
         let (generation, _) = Brain::run(
-            internal_data_dir.clone(),
+            settings.clone(),
             &db_factory,
             &host_controller_factory,
             async || network_factory(brain_sender.clone(), shutdown.clone()).await,
