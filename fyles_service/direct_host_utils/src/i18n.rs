@@ -20,7 +20,6 @@ flate!(static NB_NO_FTL: str from "i18n/nb-NO.ftl");
 flate!(static FI_FI_FTL: str from "i18n/fi-FI.ftl");
 flate!(static IS_IS_FTL: str from "i18n/is-IS.ftl");
 flate!(static GA_IE_FTL: str from "i18n/ga-IE.ftl");
-flate!(static MT_MT_FTL: str from "i18n/mt-MT.ftl");
 flate!(static RU_RU_FTL: str from "i18n/ru-RU.ftl");
 flate!(static UK_UA_FTL: str from "i18n/uk-UA.ftl");
 flate!(static PL_PL_FTL: str from "i18n/pl-PL.ftl");
@@ -53,7 +52,7 @@ struct LanguageSelector<'a> {
     ftl: &'static LazyLock<String>,
 }
 
-static SUPPORTED_LOCALES: [LanguageSelector; 41] = [
+static SUPPORTED_LOCALES: &[LanguageSelector] = &[
     LanguageSelector {
         code: "en-US",
         ftl: &EN_US_FTL,
@@ -109,10 +108,6 @@ static SUPPORTED_LOCALES: [LanguageSelector; 41] = [
     LanguageSelector {
         code: "ga-IE",
         ftl: &GA_IE_FTL,
-    },
-    LanguageSelector {
-        code: "mt-MT",
-        ftl: &MT_MT_FTL,
     },
     LanguageSelector {
         code: "ru-RU",
@@ -426,7 +421,6 @@ mod tests {
             ("fi-FI", &*FI_FI_FTL),
             ("is-IS", &*IS_IS_FTL),
             ("ga-IE", &*GA_IE_FTL),
-            ("mt-MT", &*MT_MT_FTL),
             ("ru-RU", &*RU_RU_FTL),
             ("uk-UA", &*UK_UA_FTL),
             ("pl-PL", &*PL_PL_FTL),

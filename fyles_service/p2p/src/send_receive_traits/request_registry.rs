@@ -6,6 +6,8 @@ use std::collections::hash_map::Entry;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
@@ -107,22 +109,34 @@ pub struct TimeoutRequestRegistryHandle<ExternalRequestId, NodeId> {
 
 impl<ExternalRequestId, NodeId> TimeoutRequestRegistryHandle<ExternalRequestId, NodeId> {
     fn register(&self, request_id: ExternalRequestId, node_id: NodeId) {
-        if self.sender.send(Command::Register {
-            request_id,
-            node_id,
-        }).is_err() {
+        if self
+            .sender
+            .send(Command::Register {
+                request_id,
+                node_id,
+            })
+            .is_err()
+        {
             error!("failed to register request");
         }
     }
 
     fn unregister(&self, request_id: ExternalRequestId) {
-        if self.sender.send(Command::UnRegister { request_id }).is_err() {
+        if self
+            .sender
+            .send(Command::UnRegister { request_id })
+            .is_err()
+        {
             error!("failed to unregister request");
         }
     }
 
     fn reset_timeout(&self, request_id: ExternalRequestId) {
-        if self.sender.send(Command::ResetTimeout { request_id }).is_err() {
+        if self
+            .sender
+            .send(Command::ResetTimeout { request_id })
+            .is_err()
+        {
             error!("failed to reset timeout");
         }
     }
@@ -184,6 +198,7 @@ pub struct TimeoutRequestRegistry<
         TimeoutRequestRegistryData<RequestId, ExternalRequestId, Request, ContactId, Session>,
     >,
     worker_handle: TimeoutRequestRegistryHandle<ExternalRequestId, NodeId>,
+    next_external_request_id: Arc<AtomicUsize>,
 }
 
 pub struct TimeoutRequestRegistryData<
@@ -194,7 +209,6 @@ pub struct TimeoutRequestRegistryData<
     Session,
 > {
     register: HashMap<RequestId, RegisteredRequest<ExternalRequestId, ContactId, Request, Session>>,
-    next_external_request_id: usize,
 }
 
 impl<
@@ -223,13 +237,38 @@ impl<
             Self {
                 data: TimeoutRequestRegistryData {
                     register: Default::default(),
-                    next_external_request_id: 0,
                 }
                 .into(),
                 worker_handle: handle,
+                next_external_request_id: Default::default(),
             },
             worker,
         )
+    }
+
+    /// A registry for another protocol whose requests the same worker times out. Both draw their
+    /// ids from one counter, so whoever handles the worker's timeouts can tell them apart.
+    pub fn sibling<OtherRequest>(
+        &self,
+    ) -> TimeoutRequestRegistry<
+        NodeId,
+        RequestId,
+        ExternalRequestId,
+        OtherRequest,
+        ContactId,
+        Session,
+    >
+    where
+        NodeId: Clone,
+    {
+        TimeoutRequestRegistry {
+            data: TimeoutRequestRegistryData {
+                register: Default::default(),
+            }
+            .into(),
+            worker_handle: self.worker_handle.clone(),
+            next_external_request_id: self.next_external_request_id.clone(),
+        }
     }
 }
 
@@ -341,8 +380,9 @@ where
 
     async fn register_request_id(&self, request_id: RequestId, node_id: NodeId) -> usize {
         let mut data = self.data.timeout_lock().await;
-        let id = data.next_external_request_id;
-        data.next_external_request_id += 1;
+        let id = self
+            .next_external_request_id
+            .fetch_add(1, Ordering::Relaxed);
         data.register
             .insert(request_id, RegisteredRequest::only_id(id));
         self.worker_handle.register(id, node_id);
@@ -359,8 +399,9 @@ where
         idempotent: bool,
     ) -> usize {
         let mut data = self.data.timeout_lock().await;
-        let id = data.next_external_request_id;
-        data.next_external_request_id += 1;
+        let id = self
+            .next_external_request_id
+            .fetch_add(1, Ordering::Relaxed);
         data.register.insert(
             request_id,
             RegisteredRequest::with_data(id, contact_id, request, idempotent, session),

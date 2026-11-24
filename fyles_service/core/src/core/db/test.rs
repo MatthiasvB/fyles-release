@@ -14,6 +14,7 @@ use crate::{
 
 use super::*;
 use crate::core::domain_models::FileInfo;
+use crate::core::listen::ListenPort;
 use rand::Rng;
 use tracing::{debug, instrument};
 // --------------------------- Helpers ---------------------------
@@ -108,9 +109,9 @@ where
     // Audience path
     let c1 = helper_register_contact(&db).await;
     let (aud_id, mut aud_fr) =
-        helper_create_audience_filerequest(&db, "Audience 1", vec![c1.id.clone()]).await;
+        helper_create_audience_filerequest(&db, "Audience 1", vec![c1.id()]).await;
     if let FilerequestAccess::Audience { contact_ids } = &aud_fr.access {
-        assert_eq!(contact_ids, &vec![c1.id.clone()]);
+        assert_eq!(contact_ids, &vec![c1.id()]);
     } else {
         panic!("Expected audience");
     }
@@ -119,7 +120,7 @@ where
     let c2 = helper_register_contact(&db).await;
     aud_fr.title = "Audience 1 Updated".into();
     aud_fr.access = FilerequestAccess::Audience {
-        contact_ids: vec![c1.id.clone(), c2.id.clone()],
+        contact_ids: vec![c1.id(), c2.id()],
     };
     db.update_filerequest(&aud_fr).await.unwrap();
     let aud_fr = db.get_filerequest(&aud_id).await.unwrap();
@@ -140,12 +141,12 @@ where
     let (pub_id, mut pub_fr) = helper_create_public_filerequest(&db, "Public 1").await;
     let c3 = helper_register_contact(&db).await;
     pub_fr.access = FilerequestAccess::Audience {
-        contact_ids: vec![c3.id.clone()],
+        contact_ids: vec![c3.id()],
     };
     db.update_filerequest(&pub_fr).await.unwrap();
     match db.get_filerequest(&pub_id).await.unwrap().access {
         FilerequestAccess::Audience { contact_ids } => {
-            assert_eq!(contact_ids, vec![c3.id.clone()]);
+            assert_eq!(contact_ids, vec![c3.id()]);
         }
         _ => panic!("Expected audience after update"),
     }
@@ -154,14 +155,14 @@ where
     let c4 = helper_register_contact(&db).await;
     let mut fr_second_change = db.get_filerequest(&pub_id).await.unwrap();
     fr_second_change.access = FilerequestAccess::Audience {
-        contact_ids: vec![c4.id.clone()],
+        contact_ids: vec![c4.id()],
     };
     db.update_filerequest(&fr_second_change).await.unwrap();
     match db.get_filerequest(&pub_id).await.unwrap().access {
         FilerequestAccess::Audience { contact_ids } => {
             assert_eq!(
                 contact_ids,
-                vec![c4.id],
+                vec![c4.id()],
                 "Old audience member should be purged"
             );
         }
@@ -197,7 +198,7 @@ where
         description: "Test Description".to_string(),
         is_active: true,
         access: FilerequestAccess::Audience {
-            contact_ids: vec![contact.id.clone()],
+            contact_ids: vec![contact.id()],
         },
     };
     let fr_id = FylesId::new();
@@ -212,7 +213,7 @@ where
         file_name: "test.txt".to_string(),
         file_size_bytes: 1234,
         transfer_id: transfer_id.clone(),
-        contact_id: Some(contact.id.clone()),
+        contact_id: Some(contact.id()),
         peer_id: "test-peer-id".to_string(),
         persisted_as_name: "test.txt".to_string(),
         started_at_ms: 0,
@@ -275,18 +276,12 @@ where
 
     // Pattern sizes
     for size in [32usize, 64usize] {
-        let mut key = vec![0u8; size];
-        for i in 0..size {
-            key[i] = (i % 256) as u8;
-        }
+        let key: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
         write_and_check(&db, key.clone()).await;
     }
 
     // Overwrite with inverse pattern
-    let mut rev = vec![0u8; 64];
-    for i in 0..64 {
-        rev[i] = (255 - i as u16) as u8;
-    }
+    let rev: Vec<u8> = (0..64u16).map(|i| (255 - i) as u8).collect();
     write_and_check(&db, rev).await;
 
     // Random final overwrite
@@ -321,7 +316,7 @@ where
             peer_id: peer_id.clone(),
             filerequest_id: "remote-fr-123".into(),
             name: "Remote Test Filerequest".into(),
-            contact_id: contact.id.clone(),
+            contact_id: contact.id(),
         })
         .await
         .unwrap();
@@ -339,7 +334,7 @@ where
     let first = db.get_pending_file(&pending_ids[0]).await.unwrap();
     assert_eq!(first.status, SendStatus::Pending);
     // contact_id is resolved from the synced remote-fr document (no local projection table).
-    assert_eq!(first.contact_id, contact.id);
+    assert_eq!(first.contact_id, contact.id());
 
     db.handle_update_pending_file_status(
         &pending_ids[0],
@@ -348,6 +343,7 @@ where
             transfer_data: TransferData {
                 progress_bytes: 0,
                 file_size_bytes: 0,
+                source_modified_ms: 1_700_000_000_000,
                 transfer_id: Default::default(),
             },
         }),
@@ -355,10 +351,20 @@ where
     )
     .await
     .unwrap();
-    assert!(matches!(
+    let SendStatus::InProgress(stored) = db.get_pending_file(&pending_ids[0]).await.unwrap().status
+    else {
+        panic!("the transfer to be stored as in progress");
+    };
+    assert_eq!(stored.transfer_data.source_modified_ms, 1_700_000_000_000);
+
+    // Starting over without touching the retry count drops the transfer data with the status.
+    db.handle_update_pending_file_status(&pending_ids[0], &SendStatus::Pending, None)
+        .await
+        .unwrap();
+    assert_eq!(
         db.get_pending_file(&pending_ids[0]).await.unwrap().status,
-        SendStatus::InProgress(_)
-    ));
+        SendStatus::Pending
+    );
 
     // Additional pending
     let _ = db
@@ -374,7 +380,7 @@ where
     let all_pending = db.get_all_pending_files().await.unwrap();
     assert_eq!(all_pending.len(), 2);
     assert!(
-        all_pending.iter().all(|p| p.contact_id == contact.id),
+        all_pending.iter().all(|p| p.contact_id == contact.id()),
         "get_all_pending_files should resolve every contact_id from the document"
     );
 
@@ -410,7 +416,7 @@ where
     // Test storing a received file (create incoming, then complete)
     let transfer_id = FylesId::new();
     let incoming = CreateIncomingFile {
-        contact_id: Some(contact.id.clone()),
+        contact_id: Some(contact.id()),
         filerequest_id: filerequest_id.clone(),
         transfer_id: transfer_id.clone(),
         peer_id: "test-peer-id".to_string(),
@@ -432,7 +438,7 @@ where
     let mut files = db.list_received_files(&filerequest_id).await.unwrap();
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].id, id);
-    assert_eq!(files[0].contact_id.take().unwrap(), contact.id);
+    assert_eq!(files[0].contact_id.take().unwrap(), contact.id());
 }
 
 /// Delete existing received file.
@@ -461,7 +467,7 @@ where
     // Store a received file (create incoming, then complete)
     let transfer_id = FylesId::new();
     let incoming = CreateIncomingFile {
-        contact_id: Some(contact.id.clone()),
+        contact_id: Some(contact.id()),
         filerequest_id: filerequest_id.clone(),
         transfer_id: transfer_id.clone(),
         peer_id: "test-peer-id".to_string(),
@@ -514,7 +520,7 @@ where
             description: "Test".into(),
             is_active: true,
             access: FilerequestAccess::Audience {
-                contact_ids: vec![c1.id.clone(), c2.id.clone()],
+                contact_ids: vec![c1.id(), c2.id()],
             },
         },
     )
@@ -525,18 +531,18 @@ where
         FilerequestAccess::Audience { contact_ids } => assert_eq!(contact_ids.len(), 2),
         _ => panic!("Expected audience"),
     }
-    let _ = db.delete_contact(&c1.id).await.unwrap();
+    let _ = db.delete_contact(&c1.id()).await.unwrap();
     let fr = db.get_filerequest(&fr_id).await.unwrap();
     if let FilerequestAccess::Audience { contact_ids } = fr.access {
-        assert!(!contact_ids.contains(&c1.id));
-        assert!(contact_ids.contains(&c2.id));
+        assert!(!contact_ids.contains(&c1.id()));
+        assert!(contact_ids.contains(&c2.id()));
     }
-    let _ = db.delete_contact(&c2.id).await.unwrap();
+    let _ = db.delete_contact(&c2.id()).await.unwrap();
     let fr = db.get_filerequest(&fr_id).await.unwrap();
     if let FilerequestAccess::Audience { contact_ids } = fr.access {
         assert!(contact_ids.is_empty());
     }
-    let phantom = Contact::for_test().id;
+    let phantom = Contact::for_test().id();
     let res = db.delete_contact(&phantom).await;
     assert!(res.is_err(), "Expected error for deleting unknown contact");
 }
@@ -575,17 +581,17 @@ where
             peer_id: peer.clone(),
             filerequest_id: "remote-1".into(),
             name: "Remote".into(),
-            contact_id: contact.id.clone(),
+            contact_id: contact.id(),
         })
         .await
         .unwrap();
     let list = db
-        .get_remote_filerequests_by_contact(&contact.id)
+        .get_remote_filerequests_by_contact(&contact.id())
         .await
         .unwrap();
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].id, remote_id);
-    let unknown = Contact::for_test().id;
+    let unknown = Contact::for_test().id();
     let empty = db
         .get_remote_filerequests_by_contact(&unknown)
         .await
@@ -599,11 +605,11 @@ where
     D: Deref<Target = dyn FilerequestDb>,
 {
     let contact = Contact::for_test();
-    let unknown = Contact::for_test().id;
+    let unknown = Contact::for_test().id();
     let _ = db.update_contact_projection(contact.clone()).await.unwrap();
 
     let some = db
-        .get_contact_public_keys(contact.id.clone())
+        .get_contact_public_keys(contact.id())
         .await
         .expect("query ok");
     assert!(
@@ -635,28 +641,26 @@ where
     // Listed from the document.
     let all = db.get_contacts().await.unwrap();
     assert_eq!(all.len(), 2);
-    assert!(all.iter().any(|c| c.id == a.id && c.name == a.name));
+    assert!(all.iter().any(|c| c.id == a.id() && c.name == a.name));
 
     // get_contact: name from the document, keys from the local cache.
-    let got = db.get_contact(&a.id).await.unwrap();
+    let got = db.get_contact(&a.id()).await.unwrap();
     assert_eq!(got.name, a.name);
     assert_eq!(got.public_keys.ed25519, a.public_keys.ed25519);
 
-    assert_eq!(db.get_contact_name(&a.id).await.unwrap(), a.name);
-    let names = db
-        .get_contact_names(&[a.id.clone(), b.id.clone()])
-        .await
-        .unwrap();
+    assert_eq!(db.get_contact_name(&a.id()).await.unwrap(), a.name);
+    let names = db.get_contact_names(&[a.id(), b.id()]).await.unwrap();
     assert_eq!(names.len(), 2);
 
     // Rename propagates through the document.
-    let _ = db.update_contact(&DisplayContact {
-        id: a.id.clone(),
-        name: "Renamed".into(),
-    })
-    .await
-    .unwrap();
-    assert_eq!(db.get_contact_name(&a.id).await.unwrap(), "Renamed");
+    let _ = db
+        .update_contact(&DisplayContact {
+            id: a.id(),
+            name: "Renamed".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(db.get_contact_name(&a.id()).await.unwrap(), "Renamed");
 
     // Remote filerequests: create -> read (from the document) -> delete.
     let (rid, _) = db
@@ -664,18 +668,18 @@ where
             peer_id: PeerIdWrapper("peer-1".into()),
             filerequest_id: "fr-remote".into(),
             name: "drop".into(),
-            contact_id: a.id.clone(),
+            contact_id: a.id(),
         })
         .await
         .unwrap();
 
     let one = db.get_remote_filerequest(&rid).await.unwrap();
-    assert_eq!(one.contact_id, a.id);
+    assert_eq!(one.contact_id, a.id());
     assert_eq!(one.peer_id, PeerIdWrapper("peer-1".into()));
     assert_eq!(one.filerequest_id.0, "fr-remote");
     assert_eq!(db.get_all_remote_filerequests().await.unwrap().len(), 1);
     assert_eq!(
-        db.get_remote_filerequests_by_contact(&a.id)
+        db.get_remote_filerequests_by_contact(&a.id())
             .await
             .unwrap()
             .len(),
@@ -687,16 +691,31 @@ where
     assert_eq!(db.get_all_remote_filerequests().await.unwrap().len(), 0);
 
     // Deleting a contact removes it from the document.
-    let _ = db.delete_contact(&a.id).await.unwrap();
+    let _ = db.delete_contact(&a.id()).await.unwrap();
     let after = db.get_contacts().await.unwrap();
     assert_eq!(after.len(), 1);
-    assert!(after.iter().all(|c| c.id != a.id));
+    assert!(after.iter().all(|c| c.id != a.id()));
 }
 
 /// DB initialization & self contact lifecycle:
 /// - Before node keys: all getters error
 /// - After store_node_keys: node keys & self contact accessible
 /// - Name update + identity update work
+pub async fn test_listen_port_roundtrip<D>(db: D)
+where
+    D: Deref<Target = dyn FilerequestDb>,
+{
+    assert_eq!(db.get_listen_port().await.unwrap(), None);
+
+    let first = ListenPort::try_from(24256u16).unwrap();
+    db.store_listen_port(first).await.unwrap();
+    assert_eq!(db.get_listen_port().await.unwrap(), Some(first));
+
+    let second = ListenPort::try_from(31000u16).unwrap();
+    db.store_listen_port(second).await.unwrap();
+    assert_eq!(db.get_listen_port().await.unwrap(), Some(second));
+}
+
 pub async fn test_db_initialization<D>(db: D)
 where
     D: Deref<Target = dyn FilerequestDb>,
@@ -710,7 +729,6 @@ where
     // Absent self_contact yields a database error (row missing). We only assert "is_err".
     assert!(db.get_self_contact().await.is_err());
     assert!(db.get_self_contact_for_display().await.is_err());
-    assert!(db.get_sharable_public_self_contact().await.is_err());
 
     // Store node keys (seeds self_contact in both backends)
     let node_info = NodeInfo::generate_random_bytes(vec![1, 2, 3, 4, 5, 6, 7, 8]);
@@ -722,11 +740,11 @@ where
 
     // Self contact retrievals
     let sc = db.get_self_contact().await.unwrap();
-    assert_eq!(sc.id, node_info.self_contact_id);
+    assert_eq!(sc.id(), node_info.self_contact_keys.id());
     let sc_disp = db.get_self_contact_for_display().await.unwrap();
-    assert_eq!(sc_disp.id, sc.id);
-    let public_sc = db.get_sharable_public_self_contact().await.unwrap();
-    assert_eq!(public_sc.id, sc.id);
+    assert_eq!(sc_disp.id, sc.id());
+    let public_sc = sc.to_public();
+    assert_eq!(public_sc.id(), sc.id());
     assert_eq!(public_sc.public_keys.ed25519, sc.keys.public.ed25519);
 
     // Update name

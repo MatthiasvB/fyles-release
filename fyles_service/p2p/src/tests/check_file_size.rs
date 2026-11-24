@@ -1,3 +1,4 @@
+use crypto::session::Session as CryptoSession;
 use futures::StreamExt;
 use fyles_core::library::util::duration_ext::DurationExt;
 use fyles_core::library::util::util::TimeoutLock;
@@ -23,7 +24,6 @@ use crate::types::{DataChunk, FileRequest, FileResponse};
 use crate::utils::W;
 use crate::{
     behaviour::{LocalNetworkBehaviour, LocalNetworkBehaviourEvent},
-    crypto::Session as CryptoSession,
     tests::test_utils::BrainlessIdleP2pTestHarness,
 };
 
@@ -90,17 +90,16 @@ pub async fn test_reject_oversized_file() {
         loop {
             if let BrainAction::NetworkNode(p2p_node_action) =
                 host.brain_receiver.recv().await.expect("sender dropped")
+                && let NetworkNodeAction::GetContactPublicKeys(brain_request) = p2p_node_action
             {
-                if let NetworkNodeAction::GetContactPublicKeys(brain_request) = p2p_node_action {
-                    let _ = brain_request
-                        .response_sender
-                        .timeout_lock()
-                        .await
-                        .take()
-                        .expect("no channel")
-                        .send(None);
-                    break;
-                }
+                let _ = brain_request
+                    .response_sender
+                    .timeout_lock()
+                    .await
+                    .take()
+                    .expect("no channel")
+                    .send(None);
+                break;
             }
         }
     });
@@ -192,8 +191,8 @@ pub async fn test_reject_oversized_file() {
                         // .encrypt(chunk)
                         .encrypt(&FileRequest::Chunk(DataChunk {
                             transfer_uuid: transfer_uuid.clone(),
+                            offset: i as u64 * chunk_size_bytes as u64,
                             data: vec![0u8; chunk_size_bytes].to_vec(),
-                            idx: i,
                         }))
                         .await
                         .unwrap(),
@@ -213,14 +212,18 @@ pub async fn test_reject_oversized_file() {
                 misbehaved_session
                     .encrypt(&FileRequest::Chunk(DataChunk {
                         transfer_uuid,
+                        offset: (legal_chuck_count * chunk_size_bytes) as u64,
                         data: vec![0u8; 60],
-                        idx: legal_chuck_count as u32,
                     }))
                     .await
                     .unwrap(),
             );
-            wait_for_and_assert_accepted(swarm, FileResponse::RejectChunk, &misbehaved_session)
-                .await;
+            wait_for_and_assert_accepted(
+                swarm,
+                FileResponse::ProtocolViolation,
+                &misbehaved_session,
+            )
+            .await;
             println!("After last accept");
         });
     });

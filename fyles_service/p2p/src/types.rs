@@ -1,9 +1,13 @@
+use crypto::stream::{DirectionKeys, Role};
 use libp2p::PeerId;
 use rand::{Rng, RngExt};
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Formatter};
 use std::{path::PathBuf, str::FromStr};
 use tokio::fs::File;
+use uuid::Uuid;
+use zeroize::Zeroize;
 
 use fyles_core::core::domain_models::{FylesId, PeerIdWrapper};
 
@@ -71,8 +75,8 @@ pub enum FileRequest {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DataChunk {
     pub transfer_uuid: FylesId,
+    pub offset: u64,
     pub data: Vec<u8>,
-    pub idx: u32,
 }
 
 impl Debug for DataChunk {
@@ -89,13 +93,13 @@ impl Debug for DataChunk {
 
         f.debug_struct("DataChunk")
             .field("transfer_uuid", &self.transfer_uuid)
+            .field("offset", &self.offset)
             .field(
                 "data",
                 &OpaqueData {
                     len: self.data.len(),
                 },
             )
-            .field("idx", &self.idx)
             .finish()
     }
 }
@@ -145,6 +149,91 @@ impl FileResponse {
             12 => Self::ProtocolViolation,
             _ => Self::InternalError,
         }
+    }
+}
+
+/// File transfer control for peers that carry the data over a stream. The data itself and the
+/// completion travel on the stream the grant in an accept opens.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileRequestV2 {
+    NewTransfer {
+        filerequest_id: FylesId,
+        file_name: String,
+        file_size_bytes: u64,
+        transfer_uuid: FylesId,
+    },
+    ContinueTransfer {
+        filerequest_id: FylesId,
+        transfer_uuid: FylesId,
+    },
+    AbortTransfer {
+        transfer_uuid: Option<FylesId>,
+    },
+    ProtocolViolation {
+        transfer_uuid: Option<FylesId>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileResponseV2 {
+    AcceptNewTransfer { grant: AttemptGrant },
+    AcceptContinueTransfer { offset: u64, grant: AttemptGrant },
+    RejectNewTransfer,
+    RestartContinueTransfer,
+    RejectContinueTransfer,
+    ConfirmAbort,
+    AcknowledgeProtocolViolation,
+    ProtocolViolation,
+    InternalError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AttemptId(Uuid);
+
+impl AttemptId {
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(Uuid::from_bytes(bytes))
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        self.0.as_bytes()
+    }
+}
+
+/// Admits one stream for one attempt. It only ever travels inside the session-encrypted accept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptGrant {
+    pub attempt: AttemptId,
+    pub key: GrantKey,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantKey(pub [u8; 32]);
+
+impl Drop for GrantKey {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl Debug for GrantKey {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GrantKey(..)")
+    }
+}
+
+impl AttemptGrant {
+    pub fn mint() -> Self {
+        let mut key = GrantKey([0u8; 32]);
+        OsRng.fill_bytes(&mut key.0);
+        Self {
+            attempt: AttemptId(Uuid::new_v4()),
+            key,
+        }
+    }
+
+    pub fn keys(&self, role: Role) -> DirectionKeys {
+        DirectionKeys::derive(self.attempt.as_bytes(), &self.key.0, role)
     }
 }
 

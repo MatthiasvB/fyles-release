@@ -1,16 +1,23 @@
+use crate::core::backup::{
+    BackupOutcome, BackupPasswordStatus, NewBackupPassword, Password, RestoreOutcome,
+    RestoreRequest,
+};
+use crate::core::listen::{ListenPort, ListenStatus};
+use crate::core::settings::{SettingsMutation, SettingsView};
 use std::collections::HashMap;
 
-use crate::{
-    core::{
-        brain::types::{ContactShareChallenge, SelfContactInviteChallenge},
-        domain_models::{
-            Contact, ContactId, CreateFilerequest, CreatePendingFiles, CreateRemoteFilerequest,
-            DisplayContact, Filerequest, FilerequestLocation, FylesId, PeerIdWrapper, PendingFile,
-            ReceivedFile, RemoteFilerequest, SelfContactInvite,
-        },
-        p2p::NodeStatusInfo,
+use crate::core::{
+    brain::types::{
+        ContactRegistration, ContactShareChallenge, SelfContactInviteChallenge, SignedContactShare,
     },
-    io_controller::Uri,
+    domain_models::{
+        Contact, ContactId, CreateFilerequest, CreatePendingFiles, CreateRemoteFilerequest,
+        DisplayContact, Filerequest, FilerequestLocation, FylesId, GivenName, PeerIdWrapper,
+        PendingFile, ReceivedFile, RemoteFilerequest, SelfContactInvite,
+    },
+    license::PreparedLicenseRequest,
+    license::evaluate::Entitlements,
+    p2p::NodeStatusInfo,
 };
 
 use super::types::{BrainRequest, CreationResult, FilerequestResult};
@@ -39,7 +46,9 @@ pub enum ClientAction {
 
     // System operations
     Shutdown(BrainRequest<(), FilerequestResult<bool>>),
-    ClientHeartbeat { foreground: bool },
+    ClientHeartbeat {
+        foreground: bool,
+    },
 
     // P2P operations
     GetNodeStatus(BrainRequest<(), FilerequestResult<NodeStatusInfo>>),
@@ -72,11 +81,12 @@ pub enum ClientAction {
     /// the drop root on scoped-storage hosts (Android/iOS).
     ResolveFilerequestLocation(BrainRequest<FylesId, FilerequestResult<FilerequestLocation>>),
 
-    UpdateSelfContactName(BrainRequest<String, FilerequestResult<()>>),
+    UpdateSelfContactName(BrainRequest<GivenName, FilerequestResult<()>>),
     UpdateIdentity(BrainRequest<SelfContactInvite, FilerequestResult<()>>),
     GetSelfContactDisplay(BrainRequest<(), FilerequestResult<DisplayContact>>),
-    SharePublicSelfContact(BrainRequest<(), FilerequestResult<Contact>>),
-    RegisterContact(BrainRequest<Contact, FilerequestResult<()>>),
+    SharePublicSelfContact(BrainRequest<(), FilerequestResult<SignedContactShare>>),
+    RegisterContact(BrainRequest<ContactRegistration, FilerequestResult<()>>),
+    DecodeSignedContact(BrainRequest<SignedContactShare, Option<DisplayContact>>),
 
     RegisterSelfContactInviteChallenge(BrainRequest<(), SelfContactInviteChallenge>),
     UnregisterSelfContactInviteChallenge(BrainRequest<SelfContactInviteChallenge, ()>),
@@ -86,13 +96,25 @@ pub enum ClientAction {
     UnregisterContactShareChallenge(BrainRequest<ContactShareChallenge, ()>),
     UseContactShareChallenge(BrainRequest<(ContactShareChallenge, PeerIdWrapper), ()>),
 
-    RenameThisDevice(BrainRequest<String, FilerequestResult<()>>),
+    RenameThisDevice(BrainRequest<GivenName, FilerequestResult<()>>),
     RemoveOwnedDevice(BrainRequest<PeerIdWrapper, FilerequestResult<()>>),
     ListOwnedDevices(BrainRequest<(), FilerequestResult<Vec<(PeerIdWrapper, String)>>>),
 
-    BackupData(BrainRequest<(), FilerequestResult<()>>),
-    RestoreData(BrainRequest<Uri, FilerequestResult<()>>),
+    BackupData(BrainRequest<(), FilerequestResult<BackupOutcome>>),
+    RestoreData(BrainRequest<RestoreRequest, FilerequestResult<RestoreOutcome>>),
+    GetBackupPasswordStatus(BrainRequest<(), FilerequestResult<BackupPasswordStatus>>),
+    SetBackupPassword(BrainRequest<NewBackupPassword, FilerequestResult<()>>),
+    VerifyBackupPassword(BrainRequest<Password, FilerequestResult<bool>>),
+    SnoozeBackupPasswordVerification(BrainRequest<(), FilerequestResult<()>>),
 
-    /// Opaque settings request/response relay.
-    Settings(BrainRequest<Vec<u8>, FilerequestResult<Vec<u8>>>),
+    GetSettings(BrainRequest<(), FilerequestResult<SettingsView>>),
+    MutateSettings(BrainRequest<SettingsMutation, FilerequestResult<SettingsView>>),
+
+    GetListenStatus(BrainRequest<(), Option<ListenStatus>>),
+    SetListenPort(BrainRequest<ListenPort, FilerequestResult<()>>),
+
+    GetEntitlements(BrainRequest<(), FilerequestResult<Entitlements>>),
+    GetLicenseIdentity(BrainRequest<(), FilerequestResult<String>>),
+    PrepareLicenseCheck(BrainRequest<bool, FilerequestResult<Option<PreparedLicenseRequest>>>),
+    SubmitLicenseCheckResponse(BrainRequest<(u16, Vec<u8>), FilerequestResult<Entitlements>>),
 }

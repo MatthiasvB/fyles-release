@@ -6,7 +6,7 @@ use fyles_core::core::brain::action::BrainAction;
 use fyles_core::core::brain::action_client::ClientAction;
 use fyles_core::core::brain::action_p2p::NetworkNodeAction;
 use fyles_core::core::brain::types::BrainRequest;
-use fyles_core::core::domain_models::{Contact, PeerIdWrapper};
+use fyles_core::core::domain_models::PeerIdWrapper;
 
 use crate::types::Wrap;
 
@@ -39,8 +39,7 @@ async fn pair_and_assert_convergence(method: PairingMethod) {
     let joiner = joiner.run().instrument(span!(Level::INFO, "Joiner")).await;
 
     // The owner has a contact before anyone pairs.
-    let contact = Contact::for_test();
-    owner.register_contact(contact.clone()).await;
+    let contact = owner.register_new_contact().await;
 
     // Deliver the invite by the method under test — the only step that differs.
     match method {
@@ -88,7 +87,7 @@ async fn pair_and_assert_convergence(method: PairingMethod) {
                 .await
                 .unwrap()
                 .iter()
-                .any(|c| c.id == contact.id);
+                .any(|c| c.id == contact.id());
             if has {
                 break;
             }
@@ -106,7 +105,7 @@ async fn pair_and_assert_convergence(method: PairingMethod) {
         loop {
             if joiner
                 .db
-                .get_contact_public_keys(contact.id.clone())
+                .get_contact_public_keys(contact.id())
                 .await
                 .unwrap()
                 .is_some()
@@ -213,8 +212,7 @@ async fn owned_device_auto_syncs_on_connect() {
     .unwrap();
 
     // A contact exists only on the sender.
-    let contact = Contact::for_test();
-    sender_harness.register_contact(contact.clone()).await;
+    let contact = sender_harness.register_new_contact().await;
 
     // Simulate the owner connecting to the sender: the sender should auto-sync.
     sender_harness
@@ -233,7 +231,7 @@ async fn owned_device_auto_syncs_on_connect() {
                 .await
                 .unwrap()
                 .iter()
-                .any(|c| c.id == contact.id);
+                .any(|c| c.id == contact.id());
             if has {
                 break;
             }
@@ -247,8 +245,7 @@ async fn owned_device_auto_syncs_on_connect() {
     // Dirty-tracking re-syncs on a *subsequent* change: the owner now holds contact1 (persisted
     // only at convergence, so the first exchange has finished), so registering another contact
     // and signalling one more connection converges too.
-    let contact2 = Contact::for_test();
-    sender_harness.register_contact(contact2.clone()).await;
+    let contact2 = sender_harness.register_new_contact().await;
     sender_harness
         .brain_sender
         .send(BrainAction::NetworkNode(
@@ -265,7 +262,7 @@ async fn owned_device_auto_syncs_on_connect() {
                 .await
                 .unwrap()
                 .iter()
-                .any(|c| c.id == contact2.id);
+                .any(|c| c.id == contact2.id());
             if has {
                 break;
             }

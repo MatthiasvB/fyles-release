@@ -7,10 +7,11 @@ use std::{
     task::{Context, Poll},
 };
 
-use tokio::{select, sync::Mutex};
+use tokio::{select, sync::Mutex, sync::mpsc::error::TrySendError};
 use tokio_stream::{StreamExt, StreamMap};
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use tonic::{Status, Streaming};
-use tracing::{Instrument, error, span, trace};
+use tracing::{Instrument, span, trace, warn};
 use uuid::Uuid;
 use zip_clone::ZipClone;
 
@@ -21,6 +22,7 @@ pub type StreamId = Uuid;
 pub struct StreamRegistryInner<S: Clone, C> {
     out_streams: HashMap<StreamId, tokio::sync::mpsc::Sender<S>>,
     stream_cmd_sender: tokio::sync::mpsc::Sender<StreamCommand<C>>,
+    shutdown: CancellationToken,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -32,7 +34,7 @@ enum StreamCommand<C> {
 pub struct StreamRegistry<S: Clone, C>(Arc<Mutex<StreamRegistryInner<S, C>>>);
 
 impl<S: Clone + Send + 'static, C: Send + 'static> StreamRegistry<S, C> {
-    pub(super) fn new<H>(message_handler: H) -> Self
+    pub(super) fn new<H>(message_handler: H, shutdown: CancellationToken) -> Self
     where
         H: Fn(Option<(StreamId, Result<C, Status>)>) -> Pin<Box<dyn Future<Output = ()> + Send>>
             + Send
@@ -42,6 +44,7 @@ impl<S: Clone + Send + 'static, C: Send + 'static> StreamRegistry<S, C> {
         let registry = Self(Arc::new(Mutex::new(StreamRegistryInner {
             out_streams: Default::default(),
             stream_cmd_sender,
+            shutdown,
         })));
         let mut in_streams: StreamMap<StreamId, Streaming<C>> = Default::default();
         tokio::task::spawn(
@@ -119,28 +122,39 @@ impl<S: Clone + Send + 'static, C: Send + 'static> StreamRegistry<S, C> {
         let (sender, receiver) = tokio::sync::mpsc::channel(5);
         let stream_id = uuid::Uuid::new_v4();
         self.register_stream(stream_id, incoming).await;
-        self.timeout_lock()
-            .await
-            .out_streams
-            .insert(stream_id, sender);
+        let mut registry = self.timeout_lock().await;
+        registry.out_streams.insert(stream_id, sender);
         DroppableStream {
             registry: self.clone(),
             messages: receiver,
+            ended: Box::pin(registry.shutdown.clone().cancelled_owned()),
             id: stream_id,
         }
     }
 
+    /// Fan a message out to every attached client.
+    ///
+    /// Never blocks on a slow client: this is local IPC, so a client that cannot keep up with its
+    /// buffer is broken rather than busy, and awaiting it would stall every other window and
+    /// back-pressure the brain. Such a connection is dropped instead — the client reconnects and
+    /// re-bootstraps, which is the same recovery as any other stream loss.
     pub(super) async fn send(&self, message: S) {
-        for (connection, message) in self
-            .timeout_lock()
-            .await
-            .out_streams
-            .values()
-            .zip_clone(message)
+        let mut overflowed = Vec::new();
         {
-            if let Err(e) = connection.send(message).await {
-                error!("Failed to send message to stream: {}", e);
+            let registry = self.timeout_lock().await;
+            for ((id, connection), message) in registry.out_streams.iter().zip_clone(message) {
+                match connection.try_send(message) {
+                    Ok(()) => {}
+                    Err(TrySendError::Full(_)) => {
+                        warn!("Stream {id} is not draining its messages, dropping it");
+                        overflowed.push(*id);
+                    }
+                    Err(TrySendError::Closed(_)) => {}
+                }
             }
+        }
+        for id in overflowed {
+            self.unregister_stream(id);
         }
     }
 }
@@ -159,16 +173,22 @@ impl<S: Clone, C> Deref for StreamRegistry<S, C> {
     }
 }
 
+/// Ends with the server's generation. A stream still open would keep its connection, and with it
+/// the graceful shutdown of the server, waiting forever.
 pub struct DroppableStream<S: Clone + Send + 'static, C: Send + 'static> {
     id: StreamId,
     registry: StreamRegistry<S, C>,
     messages: tokio::sync::mpsc::Receiver<S>,
+    ended: Pin<Box<WaitForCancellationFutureOwned>>,
 }
 
 impl<S: Clone + Send + 'static, C: Send + 'static> tokio_stream::Stream for DroppableStream<S, C> {
     type Item = S;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.ended.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(None);
+        }
         self.messages.poll_recv(cx)
     }
 }

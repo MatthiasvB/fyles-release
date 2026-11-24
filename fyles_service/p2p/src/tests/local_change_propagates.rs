@@ -99,7 +99,10 @@ async fn paired_devices() -> (Device, Device) {
         ("owner", &mut owner, joiner_peer),
     ] {
         let listed = await_push(device, |m| lists_device(m, &wanted)).await;
-        assert!(listed, "{label} should list the other device before we start");
+        assert!(
+            listed,
+            "{label} should list the other device before we start"
+        );
     }
 
     (owner, joiner)
@@ -124,8 +127,9 @@ fn contacts_in(message: &Message) -> Option<&Vec<ContactProto>> {
 }
 
 async fn await_contact(device: &mut Device, contact: &Contact) -> bool {
+    let wanted = contact.id().to_string();
     await_push(device, |m| {
-        contacts_in(m).is_some_and(|cs| cs.iter().any(|c| c.id == contact.id.0))
+        contacts_in(m).is_some_and(|cs| cs.iter().any(|c| c.id == wanted))
     })
     .await
 }
@@ -137,8 +141,7 @@ async fn await_contact(device: &mut Device, contact: &Contact) -> bool {
 async fn a_local_write_reaches_the_other_device_with_no_connection_event() {
     let (owner, mut joiner) = paired_devices().await;
 
-    let contact = Contact::for_test();
-    owner.harness.register_contact(contact.clone()).await;
+    let contact = owner.harness.register_new_contact().await;
 
     assert!(
         await_contact(&mut joiner, &contact).await,
@@ -153,12 +156,10 @@ async fn a_local_write_reaches_the_other_device_with_no_connection_event() {
 async fn a_local_write_propagates_in_both_directions() {
     let (mut owner, mut joiner) = paired_devices().await;
 
-    let first = Contact::for_test();
-    owner.harness.register_contact(first.clone()).await;
+    let first = owner.harness.register_new_contact().await;
     assert!(await_contact(&mut joiner, &first).await);
 
-    let second = Contact::for_test();
-    joiner.harness.register_contact(second.clone()).await;
+    let second = joiner.harness.register_new_contact().await;
     assert!(
         await_contact(&mut owner, &second).await,
         "a change on the joiner should propagate back to the owner"
@@ -221,17 +222,21 @@ async fn a_sweep_tick_recovers_a_drifted_pair() {
 async fn a_local_delete_also_propagates() {
     let (owner, mut joiner) = paired_devices().await;
 
-    let contact = Contact::for_test();
-    owner.harness.register_contact(contact.clone()).await;
+    let contact = owner.harness.register_new_contact().await;
     assert!(await_contact(&mut joiner, &contact).await);
 
-    let (request, response) = BrainRequest::with_receiver(contact.id.clone());
-    owner.harness.act(ClientAction::DeleteContact(request)).await;
+    let deleted = contact.id();
+    let (request, response) = BrainRequest::with_receiver(deleted.clone());
+    owner
+        .harness
+        .act(ClientAction::DeleteContact(request))
+        .await;
     response.await.unwrap().unwrap();
 
+    let deleted = deleted.to_string();
     assert!(
         await_push(&mut joiner, |m| {
-            contacts_in(m).is_some_and(|cs| cs.iter().all(|c| c.id != contact.id.0))
+            contacts_in(m).is_some_and(|cs| cs.iter().all(|c| c.id != deleted))
         })
         .await,
         "a deletion should be announced to the paired device too"

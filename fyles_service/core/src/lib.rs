@@ -1,19 +1,21 @@
+use crate::core::brain::plugin::BrainPluginRef;
 use crate::core::brain::{
-    BrainApiServer, BrainClientPushSender, BrainDb, BrainHostController, BrainNetwork,
-    action::BrainAction,
+    BrainApiServer, BrainDb, BrainHostController, BrainNetwork, GenerationEnd, action::BrainAction,
 };
+use crate::library::wire::api::ServerMessage;
 use ::tracing::Instrument;
 use core::brain::Brain;
 use std::path::PathBuf;
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
+use tracing::{debug, info};
 
-use tokio::sync::mpsc::Receiver;
-
+pub mod constants;
 pub mod core;
+#[cfg(test)]
+mod generation_tests;
 pub mod io_controller;
 pub mod library;
-pub mod constants;
 #[cfg(any(test, feature = "test-support"))]
 pub mod mocks;
 
@@ -64,17 +66,17 @@ impl Endpoint {
     }
 }
 
-// A dependency-injection seam; the argument count is the point.
-#[allow(clippy::too_many_arguments)]
 pub fn entrypoint(
     internal_data_dir: PathBuf,
     db_factory: impl AsyncFn() -> BrainDb,
     host_controller_factory: impl AsyncFn() -> BrainHostController,
-    p2p_factory: impl AsyncFn() -> BrainNetwork,
-    api_server_factory: impl AsyncFnOnce() -> BrainApiServer,
-    brain_receiver: Receiver<BrainAction>,
-    client_push_sender: BrainClientPushSender,
-    shutdown: CancellationToken,
+    network_factory: impl AsyncFn(Sender<BrainAction>, CancellationToken) -> BrainNetwork,
+    plugin_factory: impl AsyncFn(Sender<BrainAction>) -> BrainPluginRef,
+    api_server_factory: impl AsyncFn(
+        Sender<BrainAction>,
+        Receiver<ServerMessage>,
+        CancellationToken,
+    ) -> BrainApiServer,
 ) {
     debug!("Running entrypoint");
 
@@ -91,43 +93,53 @@ pub fn entrypoint(
 
     debug!("Blocking on async workload");
     async_runtime.block_on(
-        execute(
+        run_generations(
             internal_data_dir,
             db_factory,
             host_controller_factory,
-            p2p_factory,
+            network_factory,
+            plugin_factory,
             api_server_factory,
-            brain_receiver,
-            client_push_sender,
-            shutdown,
         )
         .in_current_span(),
     );
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn execute(
+async fn run_generations(
     internal_data_dir: PathBuf,
     db_factory: impl AsyncFn() -> BrainDb,
     host_controller_factory: impl AsyncFn() -> BrainHostController,
-    p2p_factory: impl AsyncFn() -> BrainNetwork,
-    api_server_factory: impl AsyncFnOnce() -> BrainApiServer,
-    brain_receiver: Receiver<BrainAction>,
-    client_push_sender: BrainClientPushSender,
-    shutdown: CancellationToken,
-) -> () {
-    Brain::run(
-        internal_data_dir,
-        db_factory,
-        host_controller_factory,
-        p2p_factory,
-        api_server_factory,
-        brain_receiver,
-        client_push_sender,
-        shutdown,
-    )
-    .await
-    .0
-    .await
-    .unwrap();
+    network_factory: impl AsyncFn(Sender<BrainAction>, CancellationToken) -> BrainNetwork,
+    plugin_factory: impl AsyncFn(Sender<BrainAction>) -> BrainPluginRef,
+    api_server_factory: impl AsyncFn(
+        Sender<BrainAction>,
+        Receiver<ServerMessage>,
+        CancellationToken,
+    ) -> BrainApiServer,
+) {
+    loop {
+        let (brain_sender, brain_receiver) = mpsc::channel(16);
+        let (client_push_sender, client_push_receiver) = mpsc::channel(8);
+        let shutdown = CancellationToken::new();
+        let (generation, _) = Brain::run(
+            internal_data_dir.clone(),
+            &db_factory,
+            &host_controller_factory,
+            async || network_factory(brain_sender.clone(), shutdown.clone()).await,
+            async || plugin_factory(brain_sender.clone()).await,
+            async || {
+                api_server_factory(brain_sender.clone(), client_push_receiver, shutdown.clone())
+                    .await
+            },
+            brain_receiver,
+            brain_sender.clone(),
+            client_push_sender,
+            shutdown.clone(),
+        )
+        .await;
+        match generation.await.expect("the brain loop not to panic") {
+            GenerationEnd::Stop => return,
+            GenerationEnd::Restart => info!("Restarting the brain"),
+        }
+    }
 }

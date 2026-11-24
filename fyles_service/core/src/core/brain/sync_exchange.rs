@@ -11,7 +11,188 @@ use crate::core::sync::{
     self, ContactsDoc, DocKind, LocalDocWrite, SyncId, SyncPayload, SyncRequest, SyncResponse,
     ensure_own_device_registered, list_owned_devices, sync_doc_err,
 };
-use crate::library::wire::api::ServerMessage;
+
+enum Claim {
+    Continue(Box<ActiveExchange>),
+    Fresh {
+        sync_id: SyncId,
+        last_synced: Option<Vec<u8>>,
+    },
+    Bail,
+}
+
+enum Settlement {
+    Converged(Vec<u8>),
+    Parked(Box<ActiveExchange>),
+}
+
+enum Release {
+    Abandoned,
+    /// The peer cannot handle this document, so its current version counts as synced.
+    Declined(Vec<u8>),
+}
+
+impl ExchangeSlot {
+    /// Claims the slot for one step. `incoming` is `None` to initiate. `Fresh` carries
+    /// `last_synced` for the dirty gate only for an initiation or an empty message, since a peer's
+    /// real message is always serviced.
+    fn claim(
+        &mut self,
+        incoming: Option<&SyncId>,
+        empty_message: bool,
+        peer: &PeerIdWrapper,
+        kind: DocKind,
+    ) -> Claim {
+        let Some(in_id) = incoming else {
+            if !matches!(self.state(), SlotState::Idle) {
+                return self.bail(peer, kind);
+            }
+            let sync_id = SyncId::new();
+            let last_synced = self.last_synced.clone();
+            self.set_state(SlotState::InFlight {
+                sync_id: sync_id.clone(),
+            });
+            return Claim::Fresh {
+                sync_id,
+                last_synced,
+            };
+        };
+        match std::mem::take(&mut self.state) {
+            SlotState::Idle => {
+                let last_synced = self.last_synced.clone();
+                self.set_state(SlotState::InFlight {
+                    sync_id: in_id.clone(),
+                });
+                Claim::Fresh {
+                    sync_id: in_id.clone(),
+                    last_synced: empty_message.then_some(last_synced).flatten(),
+                }
+            }
+            SlotState::Parked(active) => {
+                if active.sync_id == *in_id {
+                    self.set_state(SlotState::InFlight {
+                        sync_id: in_id.clone(),
+                    });
+                    Claim::Continue(active)
+                } else {
+                    let ours = active.sync_id.clone();
+                    self.glare(in_id, ours, SlotState::Parked(active), peer, kind)
+                }
+            }
+            SlotState::InFlight { sync_id } => {
+                let ours = sync_id.clone();
+                self.glare(in_id, ours, SlotState::InFlight { sync_id }, peer, kind)
+            }
+        }
+    }
+
+    /// Both ends compare the same pair of ids and agree that the lower one wins. A losing or
+    /// duplicate id leaves the slot as it was.
+    fn glare(
+        &mut self,
+        theirs: &SyncId,
+        ours: SyncId,
+        current: SlotState,
+        peer: &PeerIdWrapper,
+        kind: DocKind,
+    ) -> Claim {
+        if *theirs < ours {
+            warn!(?peer, ?kind, %ours, %theirs, "sync glare: adopting peer's exchange");
+            self.set_state(SlotState::InFlight {
+                sync_id: theirs.clone(),
+            });
+            Claim::Fresh {
+                sync_id: theirs.clone(),
+                last_synced: None,
+            }
+        } else {
+            warn!(?peer, ?kind, %ours, %theirs, "sync glare: keeping ours");
+            // Back as it was, so no transition to stamp.
+            self.state = current;
+            self.bail(peer, kind)
+        }
+    }
+
+    /// Every bail is a piece of work we chose not to do because the slot was occupied, which
+    /// makes this exactly the point where a wedged slot does its damage. Reports rather than
+    /// reclaims: a slot that outlives every legitimate exit means one of those exits was missed,
+    /// and repairing it here would hide the defect.
+    fn bail(&mut self, peer: &PeerIdWrapper, kind: DocKind) -> Claim {
+        if self.should_report_stall(SYNC_SLOT_STALL_AFTER) {
+            error!(
+                ?peer,
+                ?kind,
+                state_age = ?self.state_age(),
+                "Sync slot has been non-idle far longer than any exchange can last; sync for \
+                 this document is blocked. An exchange terminated without releasing its slot."
+            );
+        }
+        Claim::Bail
+    }
+
+    /// Only while the slot still carries `sync_id`. Otherwise a glare winner superseded us, and
+    /// our exchange is dropped.
+    fn settle(&mut self, sync_id: &SyncId, settlement: Settlement) {
+        let SlotState::InFlight { sync_id: current } = self.state() else {
+            return;
+        };
+        if current != sync_id {
+            return;
+        }
+        match settlement {
+            Settlement::Converged(shared_heads) => {
+                self.set_state(SlotState::Idle);
+                self.last_synced = Some(shared_heads);
+            }
+            Settlement::Parked(exchange) => {
+                self.set_state(SlotState::Parked(exchange));
+            }
+        }
+    }
+
+    /// Back to `Idle`, but only if the slot still carries `sync_id`, in flight or parked, so a
+    /// glare winner that superseded us is never clobbered.
+    fn release(&mut self, sync_id: &SyncId, release: Release) {
+        let ours = match self.state() {
+            SlotState::InFlight { sync_id: current } => current == sync_id,
+            SlotState::Parked(active) => &active.sync_id == sync_id,
+            SlotState::Idle => false,
+        };
+        if !ours {
+            return;
+        }
+        self.set_state(SlotState::Idle);
+        if let Release::Declined(fingerprint) = release {
+            self.last_synced = Some(fingerprint);
+        }
+    }
+}
+
+/// A responder steps only a document it knows, on the schema major it speaks. Anything else is
+/// declined for that document alone, which is how a newer peer's unknown document is handled.
+fn admit(payload: SyncPayload) -> Result<(DocKind, SyncMessage), SyncResponse> {
+    let Ok(kind) = payload.doc_kind.parse::<DocKind>() else {
+        info!(kind = %payload.doc_kind, "Declining sync for unknown document kind");
+        return Err(SyncResponse::DocumentVersionNotSupported {
+            doc_kind: payload.doc_kind,
+            sync_id: payload.sync_id,
+        });
+    };
+    if payload.schema_major != kind.schema_major() {
+        info!(kind = %payload.doc_kind, "Declining sync for incompatible schema major");
+        return Err(SyncResponse::DocumentVersionNotSupported {
+            doc_kind: payload.doc_kind,
+            sync_id: payload.sync_id,
+        });
+    }
+    Ok((
+        kind,
+        SyncMessage {
+            sync_id: payload.sync_id,
+            message: payload.message,
+        },
+    ))
+}
 
 impl GigaBrain {
     /// Run one automerge step for `(peer, kind)`. `incoming` is `None` to *initiate*, or the
@@ -30,33 +211,6 @@ impl GigaBrain {
         };
         let msg_none = msg.is_none();
 
-        enum Claim {
-            Continue(Box<ActiveExchange>),
-            Fresh {
-                sync_id: SyncId,
-                last_synced: Option<Vec<u8>>,
-            },
-            Bail,
-        }
-        /// Decline to act, reporting the slot first if it has been blocking for far too long.
-        ///
-        /// Every bail is a piece of work we chose not to do because the slot was occupied, which
-        /// makes this exactly the point where a wedged slot does its damage. Deliberately reports
-        /// rather than reclaims: a slot that outlives every legitimate exit means one of those
-        /// exits was missed, and repairing it here would hide the defect.
-        fn bail(slot: &mut ExchangeSlot, peer: &PeerIdWrapper, kind: DocKind) -> Claim {
-            if slot.should_report_stall(SYNC_SLOT_STALL_AFTER) {
-                error!(
-                    ?peer,
-                    ?kind,
-                    state_age = ?slot.state_age(),
-                    "Sync slot has been non-idle far longer than any exchange can last; sync for \
-                     this document is blocked. An exchange terminated without releasing its slot."
-                );
-            }
-            Claim::Bail
-        }
-
         let claim = {
             let mut ephemeral = self.ephemeral().await;
             if ephemeral.sync_slots.len() > SYNC_SLOT_COUNT_WARN
@@ -69,82 +223,11 @@ impl GigaBrain {
                      exist; nothing prunes it, so this is a leak."
                 );
             }
-            let slot = ephemeral
+            ephemeral
                 .sync_slots
                 .entry((peer.clone(), kind))
-                .or_default();
-            match &incoming_id {
-                // Initiation: single-flight; the dirty gate needs the loaded doc, so carry
-                // `last_synced` and check it in phase 2.
-                None => {
-                    if matches!(slot.state(), SlotState::Idle) {
-                        let sync_id = SyncId::new();
-                        let last_synced = slot.last_synced.clone();
-                        slot.set_state(SlotState::InFlight {
-                            sync_id: sync_id.clone(),
-                        });
-                        Claim::Fresh {
-                            sync_id,
-                            last_synced,
-                        }
-                    } else {
-                        bail(slot, peer, kind)
-                    }
-                }
-                Some(in_id) => match slot.state() {
-                    SlotState::Idle => {
-                        let last_synced = slot.last_synced.clone();
-                        slot.set_state(SlotState::InFlight {
-                            sync_id: in_id.clone(),
-                        });
-                        Claim::Fresh {
-                            sync_id: in_id.clone(),
-                            // Carried only for an empty message, which opens no exchange of its
-                            // own; a real message is always serviced.
-                            last_synced: msg_none.then_some(last_synced).flatten(),
-                        }
-                    }
-                    SlotState::Parked(active) if &active.sync_id == in_id => {
-                        let SlotState::Parked(active) = slot.set_state(SlotState::InFlight {
-                            sync_id: in_id.clone(),
-                        }) else {
-                            unreachable!("slot was Parked in the arm guard")
-                        };
-                        Claim::Continue(active)
-                    }
-                    // Glare (parked or in-flight): the lower `sync_id` wins; both ends compare the
-                    // same pair and agree. A losing/duplicate id leaves the slot as it was.
-                    SlotState::Parked(active) => {
-                        if in_id < &active.sync_id {
-                            warn!(?peer, ?kind, ours = %active.sync_id, theirs = %in_id, "sync glare: adopting peer's exchange");
-                            slot.set_state(SlotState::InFlight {
-                                sync_id: in_id.clone(),
-                            });
-                            Claim::Fresh {
-                                sync_id: in_id.clone(),
-                                last_synced: None,
-                            }
-                        } else {
-                            warn!(?peer, ?kind, ours = %active.sync_id, theirs = %in_id, "sync glare: keeping ours, rejecting peer's");
-                            bail(slot, peer, kind)
-                        }
-                    }
-                    SlotState::InFlight { sync_id: other } => {
-                        if other != in_id && in_id < other {
-                            warn!(?peer, ?kind, ours = %other, theirs = %in_id, "sync glare: superseding in-flight exchange");
-                            slot.set_state(SlotState::InFlight {
-                                sync_id: in_id.clone(),
-                            });
-                            Claim::Fresh {
-                                sync_id: in_id.clone(),
-                                last_synced: None,
-                            }
-                        } else {
-                            bail(slot, peer, kind)
-                        }
-                    }
-                },
-            }
+                .or_default()
+                .claim(incoming_id.as_ref(), msg_none, peer, kind)
         };
 
         // Phase 2 — off-lock: load the doc for a fresh exchange, then run one protocol step.
@@ -166,8 +249,7 @@ impl GigaBrain {
                 // trailing empty message — a peer's real message is always serviced — so a
                 // document that has not changed since we last confirmed it synced with this peer
                 // neither initiates nor answers, which is what ends the exchange.
-                if last_synced.as_deref()
-                    == Some(sync::doc_heads_fingerprint(&mut doc).as_slice())
+                if last_synced.as_deref() == Some(sync::doc_heads_fingerprint(&mut doc).as_slice())
                 {
                     self.abandon_sync_claim(peer, kind, &sync_id).await;
                     return Ok(None);
@@ -193,41 +275,24 @@ impl GigaBrain {
         // to send). Persist once and return to `Idle`.
         let converged = msg_none && outgoing.is_none();
 
-        if converged {
+        let settlement = if converged {
+            // The confirmed shared heads, not the merged doc heads, so a local write stays dirty.
             let shared_heads = sync::heads_fingerprint(&exchange.state.shared_heads);
-            let mut from = exchange.doc;
-            if let Err(e) = self
-                .db
-                .mutate_sync_doc(
-                    kind,
-                    Box::new(move |blob| {
-                        let mut stored = sync::load(&blob).map_err(sync_doc_err)?;
-                        sync::merge(&mut stored, &mut from).map_err(sync_doc_err)?;
-                        Ok(stored.save())
-                    }),
-                )
-                .await
-            {
+            if let Err(e) = self.db.merge_sync_doc(kind, Box::new(exchange.doc)).await {
                 self.abandon_sync_claim(peer, kind, &sync_id).await;
                 return Err(e);
             }
-            // Commit iff we still hold the slot (else a glare winner superseded us). Record the
-            // confirmed shared heads, not the merged doc heads — a local write stays dirty.
-            let mut ephemeral = self.ephemeral().await;
-            if let Some(slot) = ephemeral.sync_slots.get_mut(&(peer.clone(), kind))
-                && matches!(slot.state(), SlotState::InFlight { sync_id: s } if *s == sync_id)
-            {
-                slot.set_state(SlotState::Idle);
-                slot.last_synced = Some(shared_heads);
-            }
+            Settlement::Converged(shared_heads)
         } else {
-            // Park for the next step — unless a glare winner superseded us, then drop our exchange.
-            let mut ephemeral = self.ephemeral().await;
-            if let Some(slot) = ephemeral.sync_slots.get_mut(&(peer.clone(), kind))
-                && matches!(slot.state(), SlotState::InFlight { sync_id: s } if *s == sync_id)
-            {
-                slot.set_state(SlotState::Parked(exchange));
-            }
+            Settlement::Parked(exchange)
+        };
+        if let Some(slot) = self
+            .ephemeral()
+            .await
+            .sync_slots
+            .get_mut(&(peer.clone(), kind))
+        {
+            slot.settle(&sync_id, settlement);
         }
         Ok(Some((
             SyncMessage {
@@ -266,35 +331,26 @@ impl GigaBrain {
         sync::load(&self.db.get_sync_doc(kind).await?).map_err(sync_doc_err)
     }
 
-    /// Release our claim on `(peer, kind)` back to `Idle` — but only if the slot still carries our
-    /// `sync_id`, so we never clobber a glare winner that superseded us. The slot may be `InFlight`
-    /// (mid-step) or `Parked` (parked awaiting a reply); both are ours to release. When
-    /// `last_synced` is `Some`, also record it as the dirty-gate high-water mark.
     async fn release_claim(
         &self,
         peer: &PeerIdWrapper,
         kind: DocKind,
         sync_id: &SyncId,
-        last_synced: Option<Vec<u8>>,
+        release: Release,
     ) {
-        let mut ephemeral = self.ephemeral().await;
-        if let Some(slot) = ephemeral.sync_slots.get_mut(&(peer.clone(), kind)) {
-            let ours = match slot.state() {
-                SlotState::InFlight { sync_id: s } => s == sync_id,
-                SlotState::Parked(active) => &active.sync_id == sync_id,
-                SlotState::Idle => false,
-            };
-            if ours {
-                slot.set_state(SlotState::Idle);
-                if let Some(fp) = last_synced {
-                    slot.last_synced = Some(fp);
-                }
-            }
+        if let Some(slot) = self
+            .ephemeral()
+            .await
+            .sync_slots
+            .get_mut(&(peer.clone(), kind))
+        {
+            slot.release(sync_id, release);
         }
     }
 
     async fn abandon_sync_claim(&self, peer: &PeerIdWrapper, kind: DocKind, sync_id: &SyncId) {
-        self.release_claim(peer, kind, sync_id, None).await;
+        self.release_claim(peer, kind, sync_id, Release::Abandoned)
+            .await;
     }
 
     /// A peer permanently can't handle this document (unknown kind / incompatible schema major).
@@ -306,14 +362,14 @@ impl GigaBrain {
         kind: DocKind,
         sync_id: &SyncId,
     ) {
-        let last_synced = match self.load_sync_doc(kind).await {
-            Ok(mut doc) => Some(sync::doc_heads_fingerprint(&mut doc)),
+        let release = match self.load_sync_doc(kind).await {
+            Ok(mut doc) => Release::Declined(sync::doc_heads_fingerprint(&mut doc)),
             Err(e) => {
                 error!("Failed to load {kind:?} to record declined sync version: {e:?}");
-                None
+                Release::Abandoned
             }
         };
-        self.release_claim(peer, kind, sync_id, last_synced).await;
+        self.release_claim(peer, kind, sync_id, release).await;
     }
 
     /// Side effects once a document converges. For contacts, reconcile the public-key cache and
@@ -333,53 +389,12 @@ impl GigaBrain {
                 error!("Failed to prune orphaned pending files: {e:?}");
             }
         }
-        self.push_synced_state(kind).await;
+        self.push_converged_state(kind).await;
         // Re-sync if the document became dirty during this exchange — e.g. a local write that
         // raced it, or an initiation that was single-flight-bailed while this one was in flight.
         // The dirty gate inside `sync_advance` makes this a no-op (no message sent) once the doc
         // is stable, so it settles instead of looping.
         self.initiate_sync_if_dirty(peer, kind).await;
-    }
-
-    /// Push the full current state for `kind` to the client, so the UI reflects a change synced in
-    /// from another of the user's devices without the client having to poll or refetch.
-    async fn push_synced_state(&self, kind: DocKind) {
-        let message = match kind {
-            DocKind::Contacts => match self.db.get_contacts().await {
-                Ok(contacts) => ServerMessage::contacts_changed(contacts),
-                Err(e) => {
-                    error!("Failed to load contacts to push after sync: {e:?}");
-                    return;
-                }
-            },
-            DocKind::RemoteFilerequests => {
-                let remote_frs = match self.db.get_all_remote_filerequests().await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        error!("Failed to load remote filerequests to push after sync: {e:?}");
-                        return;
-                    }
-                };
-                let pending = match self.db.get_all_pending_files().await {
-                    Ok(v) => v,
-                    Err(e) => {
-                        error!("Failed to load pending files to push after sync: {e:?}");
-                        return;
-                    }
-                };
-                ServerMessage::remote_filerequests_changed(remote_frs, pending)
-            }
-            DocKind::Devices => match list_owned_devices(self.db.as_ref()).await {
-                Ok(devices) => ServerMessage::owned_devices_changed(devices),
-                Err(e) => {
-                    error!("Failed to load owned devices to push after sync: {e:?}");
-                    return;
-                }
-            },
-        };
-        if let Err(e) = self.client_push_sender.send(message).await {
-            error!("Failed to push synced state to client: {e:?}");
-        }
     }
 
     async fn fetch_missing_contact_keys(&self, peer: &PeerIdWrapper) {
@@ -416,17 +431,12 @@ impl GigaBrain {
                 return;
             }
         };
-        for FetchedContactKeys { contact_id, keys } in response.keys {
-            let Some(entry) = view.contacts.get(&contact_id) else {
+        for FetchedContactKeys { keys } in response.keys {
+            let Some(entry) = view.contacts.get(&keys.id()) else {
                 warn!("Ignoring fetched keys for a contact not in our synced document");
                 continue;
             };
-            if sync::fingerprint_of(&keys) != entry.key_fingerprint {
-                warn!("Ignoring fetched keys whose fingerprint does not match the synced contact");
-                continue;
-            }
             let contact = Contact {
-                id: contact_id,
                 name: entry.name.clone(),
                 public_keys: keys,
             };
@@ -461,12 +471,20 @@ impl GigaBrain {
         }
     }
 
+    /// Publish a local write to everyone who cares: the attached clients, then the user's other
+    /// devices. The client push is awaited so it is enqueued before the handler answers the
+    /// request that caused the write.
+    pub(super) async fn commit_local_write(&self, write: LocalDocWrite) {
+        self.push_doc_change(write.change()).await;
+        self.announce(write);
+    }
+
     /// Push a local change to the user's other devices instead of waiting for the next sweep.
     ///
     /// Spawned, so a dial and a sync round trip stay off the critical path of the write that
-    /// triggered it. Terminates because a merge cannot mint a [`LocalDocWrite`]; the dirty gate and
+    /// triggered it. Terminates because a merge cannot mint a [`LocalDocWrite`]. The dirty gate and
     /// single-flight in `sync_advance` also absorb bursts, so no debouncing is needed.
-    pub(super) fn announce(&self, write: LocalDocWrite) {
+    fn announce(&self, write: LocalDocWrite) {
         let brain = self.clone();
         let shutdown = self.shutdown.clone();
         tokio::spawn(
@@ -492,7 +510,10 @@ impl GigaBrain {
         self.network
             .read()
             .await
-            .sync_docs_with_reachable(devices.into_iter().map(|(peer, _)| peer).collect(), write.kind())
+            .sync_docs_with_reachable(
+                devices.into_iter().map(|(peer, _)| peer).collect(),
+                write.kind(),
+            )
             .await;
     }
 
@@ -534,28 +555,11 @@ impl GigaBrain {
             SyncRequest::Sync(payload) => payload,
         };
 
-        // Unknown document kind or incompatible schema major — decline *this* document only.
-        // (This is how a newer peer's document unknown to us is handled.)
-        let Ok(kind) = payload.doc_kind.parse::<DocKind>() else {
-            info!(kind = %payload.doc_kind, "Declining sync for unknown document kind");
-            return Some(SyncResponse::DocumentVersionNotSupported {
-                doc_kind: payload.doc_kind,
-                sync_id: payload.sync_id,
-            });
+        let (kind, incoming) = match admit(payload) {
+            Ok(admitted) => admitted,
+            Err(declined) => return Some(declined),
         };
-        if payload.schema_major != kind.schema_major() {
-            info!(kind = %payload.doc_kind, "Declining sync for incompatible schema major");
-            return Some(SyncResponse::DocumentVersionNotSupported {
-                doc_kind: payload.doc_kind,
-                sync_id: payload.sync_id,
-            });
-        }
-
-        let sync_id = payload.sync_id.clone();
-        let incoming = SyncMessage {
-            sync_id: payload.sync_id,
-            message: payload.message,
-        };
+        let sync_id = incoming.sync_id.clone();
         match self.sync_advance(&peer, kind, Some(incoming)).await {
             Ok(Some((outgoing, converged))) => {
                 if converged {
@@ -635,13 +639,206 @@ impl GigaBrain {
 
     pub(super) async fn ensure_own_device_registered(&self) {
         match self.network.read().await.get_node_info().await {
-            Ok(info) => {
-                match ensure_own_device_registered(self.db.as_ref(), info.peer_id).await {
-                    Ok(write) => self.announce(write),
-                    Err(e) => error!("Failed to self-register this device: {e:?}"),
-                }
-            }
+            Ok(info) => match ensure_own_device_registered(self.db.as_ref(), info.peer_id).await {
+                Ok(write) => self.commit_local_write(write).await,
+                Err(e) => error!("Failed to self-register this device: {e:?}"),
+            },
             Err(e) => error!("Failed to get node info for self-registration: {e:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KIND: DocKind = DocKind::Contacts;
+
+    fn peer() -> PeerIdWrapper {
+        PeerIdWrapper::for_test()
+    }
+
+    fn exchange(sync_id: &SyncId) -> Box<ActiveExchange> {
+        Box::new(ActiveExchange {
+            sync_id: sync_id.clone(),
+            state: SyncProtocolState::new(),
+            doc: sync::genesis(KIND).expect("a genesis document"),
+        })
+    }
+
+    /// Two ids, the lower one first.
+    fn ordered_ids() -> (SyncId, SyncId) {
+        let (a, b) = (SyncId::new(), SyncId::new());
+        if a < b { (a, b) } else { (b, a) }
+    }
+
+    fn in_flight(sync_id: &SyncId) -> ExchangeSlot {
+        let mut slot = ExchangeSlot::default();
+        slot.set_state(SlotState::InFlight {
+            sync_id: sync_id.clone(),
+        });
+        slot
+    }
+
+    fn parked(sync_id: &SyncId) -> ExchangeSlot {
+        let mut slot = ExchangeSlot::default();
+        slot.set_state(SlotState::Parked(exchange(sync_id)));
+        slot
+    }
+
+    fn carries(slot: &ExchangeSlot, sync_id: &SyncId) -> bool {
+        match slot.state() {
+            SlotState::InFlight { sync_id: current } => current == sync_id,
+            SlotState::Parked(active) => active.sync_id == *sync_id,
+            SlotState::Idle => false,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_idle_slot_initiates_with_its_dirty_gate() {
+        let mut slot = ExchangeSlot {
+            last_synced: Some(vec![1]),
+            ..Default::default()
+        };
+        let Claim::Fresh {
+            sync_id,
+            last_synced,
+        } = slot.claim(None, true, &peer(), KIND)
+        else {
+            panic!("an idle slot to initiate");
+        };
+        assert_eq!(last_synced, Some(vec![1]));
+        assert!(carries(&slot, &sync_id));
+    }
+
+    #[tokio::test]
+    async fn a_busy_slot_does_not_initiate() {
+        let (ours, _) = ordered_ids();
+        let mut slot = in_flight(&ours);
+        assert!(matches!(slot.claim(None, true, &peer(), KIND), Claim::Bail));
+        assert!(carries(&slot, &ours));
+    }
+
+    #[tokio::test]
+    async fn an_idle_slot_gates_only_an_empty_incoming_message() {
+        let theirs = SyncId::new();
+        for (empty_message, expected) in [(true, Some(vec![1])), (false, None)] {
+            let mut slot = ExchangeSlot {
+                last_synced: Some(vec![1]),
+                ..Default::default()
+            };
+            let Claim::Fresh { last_synced, .. } =
+                slot.claim(Some(&theirs), empty_message, &peer(), KIND)
+            else {
+                panic!("an idle slot to take the peer's exchange");
+            };
+            assert_eq!(last_synced, expected);
+            assert!(carries(&slot, &theirs));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_parked_exchange_continues_with_its_own_id() {
+        let ours = SyncId::new();
+        let mut slot = parked(&ours);
+        let Claim::Continue(active) = slot.claim(Some(&ours), false, &peer(), KIND) else {
+            panic!("the parked exchange to continue");
+        };
+        assert_eq!(active.sync_id, ours);
+        assert!(matches!(slot.state(), SlotState::InFlight { sync_id } if *sync_id == ours));
+    }
+
+    #[tokio::test]
+    async fn in_glare_the_lower_id_wins_on_both_ends() {
+        let (lower, higher) = ordered_ids();
+        for mut slot in [parked(&higher), in_flight(&higher)] {
+            assert!(matches!(
+                slot.claim(Some(&lower), false, &peer(), KIND),
+                Claim::Fresh {
+                    last_synced: None,
+                    ..
+                }
+            ));
+            assert!(carries(&slot, &lower));
+        }
+        for mut slot in [parked(&lower), in_flight(&lower)] {
+            assert!(matches!(
+                slot.claim(Some(&higher), false, &peer(), KIND),
+                Claim::Bail
+            ));
+            assert!(carries(&slot, &lower));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_of_the_exchange_in_flight_bails() {
+        let ours = SyncId::new();
+        let mut slot = in_flight(&ours);
+        assert!(matches!(
+            slot.claim(Some(&ours), false, &peer(), KIND),
+            Claim::Bail
+        ));
+        assert!(carries(&slot, &ours));
+    }
+
+    #[tokio::test]
+    async fn settling_commits_only_while_the_exchange_is_still_ours() {
+        let (lower, higher) = ordered_ids();
+        let mut slot = in_flight(&higher);
+        slot.settle(&higher, Settlement::Converged(vec![7]));
+        assert!(matches!(slot.state(), SlotState::Idle));
+        assert_eq!(slot.last_synced, Some(vec![7]));
+
+        let mut slot = in_flight(&lower);
+        slot.settle(&higher, Settlement::Parked(exchange(&higher)));
+        assert!(carries(&slot, &lower));
+        slot.settle(&higher, Settlement::Converged(vec![7]));
+        assert!(carries(&slot, &lower));
+        assert_eq!(slot.last_synced, None);
+    }
+
+    #[tokio::test]
+    async fn releasing_leaves_a_superseding_exchange_alone() {
+        let (lower, higher) = ordered_ids();
+        let mut slot = in_flight(&lower);
+        slot.release(&higher, Release::Declined(vec![7]));
+        assert!(carries(&slot, &lower));
+        assert_eq!(slot.last_synced, None);
+
+        for mut slot in [in_flight(&lower), parked(&lower)] {
+            slot.release(&lower, Release::Declined(vec![7]));
+            assert!(matches!(slot.state(), SlotState::Idle));
+            assert_eq!(slot.last_synced, Some(vec![7]));
+        }
+
+        let mut slot = in_flight(&lower);
+        slot.release(&lower, Release::Abandoned);
+        assert!(matches!(slot.state(), SlotState::Idle));
+        assert_eq!(slot.last_synced, None);
+    }
+
+    fn payload(doc_kind: &str, schema_major: u32) -> SyncPayload {
+        SyncPayload {
+            doc_kind: doc_kind.into(),
+            schema_major,
+            message: None,
+            sync_id: SyncId::new(),
+        }
+    }
+
+    #[test]
+    fn only_a_known_document_on_our_schema_major_is_admitted() {
+        assert!(matches!(
+            admit(payload(KIND.as_str(), KIND.schema_major())),
+            Ok((DocKind::Contacts, _))
+        ));
+        assert!(matches!(
+            admit(payload("a_document_from_the_future", 1)),
+            Err(SyncResponse::DocumentVersionNotSupported { .. })
+        ));
+        assert!(matches!(
+            admit(payload(KIND.as_str(), KIND.schema_major() + 1)),
+            Err(SyncResponse::DocumentVersionNotSupported { .. })
+        ));
     }
 }

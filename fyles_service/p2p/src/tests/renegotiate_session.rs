@@ -85,7 +85,7 @@ async fn test_upgrade_session_requirement() {
         title: "Private request".into(),
         description: "Is private".into(),
         access: FilerequestAccess::Audience {
-            contact_ids: vec![with_public_request.node_info.self_contact_id.clone()],
+            contact_ids: vec![with_public_request.node_info.self_contact_keys.id()],
         },
         is_active: true,
     });

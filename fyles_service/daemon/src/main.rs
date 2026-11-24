@@ -4,14 +4,14 @@
 )]
 
 use ::tracing::info;
-use tokio_util::sync::CancellationToken;
 use clap::Parser;
 use libp2p::identity::Keypair;
 #[cfg(feature = "otel-jaeger")]
 use std::time::UNIX_EPOCH;
 use std::{path::PathBuf, sync::Arc, time::SystemTime};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::RwLock;
 
+use fyles_core::core::brain::plugin::{BrainPluginRef, NoOpBrainPlugin};
 use fyles_core::library::sqlite::SqlitePath;
 use fyles_core::{
     Endpoint,
@@ -26,6 +26,7 @@ use p2p::{P2pClient, event_loop::LocalEventLoop, types::Config};
 
 use direct_host_utils::{
     direct_fs_controller::DirectFsController,
+    host_state,
     tracing::{TracingConfig, init_tracing},
 };
 
@@ -73,11 +74,6 @@ fn main() {
 
     let endpoint = Endpoint::parse(&config.config.endpoint).unwrap();
 
-    let (brain_sender, brain_receiver) = mpsc::channel(16);
-    let shutdown = CancellationToken::new();
-    let brain_sender_clone = brain_sender.clone();
-    let (client_sender, client_receiver) = mpsc::channel(8);
-
     let db_path = config.config.db_path.clone();
     entrypoint(
         config.config.internal_data_dir.clone(),
@@ -87,16 +83,17 @@ fn main() {
             }) as BrainDb
         },
         async || {
-            DirectFsController::new(output_dir.clone())
+            // the plain daemon does not require host state awareness
+            DirectFsController::new(output_dir.clone(), host_state::unsupported())
                 .await
                 .expect("I/O Controller to initialize fine")
                 .dynamic()
         },
-        async || {
+        async |brain_sender, shutdown| {
             Arc::new(RwLock::new(
                 P2pClient::new(
-                    brain_sender.clone(),
-                    shutdown.clone(),
+                    brain_sender,
+                    shutdown,
                     Arc::new(move |keypair: Keypair, _config: &[u8]| {
                         LocalEventLoop::swarm_factory(keypair)
                     }),
@@ -105,9 +102,10 @@ fn main() {
                 .expect("Creating P2p Client to work"),
             )) as BrainNetwork
         },
-        async || {
+        async |_| Arc::new(RwLock::new(NoOpBrainPlugin)) as BrainPluginRef,
+        async |brain_sender, client_push_receiver, shutdown| {
             Box::new(ApiServer::new(
-                brain_sender_clone.clone(),
+                brain_sender,
                 endpoint.clone(),
                 config
                     .config
@@ -115,13 +113,10 @@ fn main() {
                     .parent()
                     .expect("DB dir to have a parent that can be used as internal data dir")
                     .into(),
-                client_receiver,
-                shutdown.clone(),
+                client_push_receiver,
+                shutdown,
             )) as BrainApiServer
         },
-        brain_receiver,
-        client_sender,
-        shutdown.clone(),
     );
 }
 
@@ -176,7 +171,7 @@ If no values is set, falls back to the parent directory of the db_path."#
 
     /// Listening endpoint (scheme required):
     ///   tcp:HOST:PORT        e.g. tcp:0.0.0.0:50051
-    ///   uds:/path/socket     (unix only) e.g. uds:/tmp/fyles.sock
+    ///   uds:/path/socket     (unix only) e.g. uds:$XDG_RUNTIME_DIR/fyles.sock
     #[clap(
         long,
         short = 'e',
@@ -186,7 +181,7 @@ If no values is set, falls back to the parent directory of the db_path."#
 
 Forms:
   tcp:HOST:PORT          (TCP listener, e.g. tcp:127.0.0.1:50051 or tcp:127.0.0.1 for auto port)
-  uds:/path/to/socket    (Unix only, e.g. uds:/tmp/fyles.sock)
+  uds:/path/to/socket    (Unix only, e.g. uds:$XDG_RUNTIME_DIR/fyles.sock)
 "#
     )]
     endpoint: String,

@@ -1,5 +1,9 @@
 use async_trait::async_trait;
 use crypto::ContactKeys;
+#[cfg(feature = "debug-server")]
+use erased_serde::Serialize;
+#[cfg(feature = "debug-server")]
+use serde::Serialize as DeriveSerialize;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
@@ -9,13 +13,14 @@ use crate::{
     core::{
         brain::types::{ContactShareChallenge, SelfContactInviteChallenge},
         domain_models::{ContactId, FylesId, PeerIdWrapper},
-        p2p::{
-            FileToSend, NetworkNode, NodeStatusInfo, P2pError, P2pResult, Runnable,
-        },
+        listen::{ListenFailure, ListenPort},
+        p2p::{FileToSend, NetworkNode, NodeConfig, NodeStatusInfo, P2pError, P2pResult, Runnable},
         sync::SyncRequest,
     },
     library::util::{duration_ext::DurationExt, util::generate_random_bytes},
 };
+
+type SyncAnnouncement = (Vec<PeerIdWrapper>, DocKind);
 
 #[derive(Clone)]
 pub struct MockP2pNode {
@@ -30,12 +35,17 @@ pub struct MockP2pNode {
     response_delay_ms: Arc<Mutex<u64>>,
 
     /// Every announcement the brain pushed, in order.
-    sync_with_reachable_calls: Arc<Mutex<Vec<(Vec<PeerIdWrapper>, DocKind)>>>,
+    sync_with_reachable_calls: Arc<Mutex<Vec<SyncAnnouncement>>>,
     /// How many sweeps the brain has asked for.
     sweep_calls: Arc<Mutex<usize>>,
     /// Every sync frame the brain handed to the network, in order.
     sync_messages: Arc<Mutex<VecDeque<(PeerIdWrapper, SyncRequest)>>>,
+    restarts: Arc<Mutex<Vec<NodeConfig>>>,
+    listen_outcome: Arc<Mutex<ListenOutcome>>,
+    listen_calls: Arc<Mutex<Vec<ListenPort>>>,
 }
+
+type ListenOutcome = Box<dyn FnMut(ListenPort) -> Result<(), ListenFailure> + Send>;
 
 impl MockP2pNode {
     pub fn new(node_info: NodeStatusInfo) -> Self {
@@ -48,15 +58,29 @@ impl MockP2pNode {
             sync_with_reachable_calls: Arc::new(Mutex::new(Vec::new())),
             sweep_calls: Arc::new(Mutex::new(0)),
             sync_messages: Arc::new(Mutex::new(VecDeque::new())),
+            restarts: Arc::new(Mutex::new(Vec::new())),
+            listen_outcome: Arc::new(Mutex::new(Box::new(|_| Ok(())))),
+            listen_calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
+    pub fn set_listen_outcome(
+        &self,
+        outcome: impl FnMut(ListenPort) -> Result<(), ListenFailure> + Send + 'static,
+    ) {
+        *self.listen_outcome.lock().unwrap() = Box::new(outcome);
+    }
+
+    pub fn listen_calls(&self) -> Vec<ListenPort> {
+        self.listen_calls.lock().unwrap().clone()
+    }
+
     /// Every announcement pushed so far, in order.
-    pub fn sync_with_reachable_calls(&self) -> Vec<(Vec<PeerIdWrapper>, DocKind)> {
+    pub fn sync_with_reachable_calls(&self) -> Vec<SyncAnnouncement> {
         self.sync_with_reachable_calls.lock().unwrap().clone()
     }
 
-    pub fn take_sync_with_reachable_calls(&self) -> Vec<(Vec<PeerIdWrapper>, DocKind)> {
+    pub fn take_sync_with_reachable_calls(&self) -> Vec<SyncAnnouncement> {
         std::mem::take(&mut self.sync_with_reachable_calls.lock().unwrap())
     }
 
@@ -69,6 +93,10 @@ impl MockP2pNode {
     pub fn pop_sync_message(&self) -> Option<(PeerIdWrapper, SyncRequest)> {
         let mut queued = self.sync_messages.lock().unwrap();
         queued.pop_front()
+    }
+
+    pub fn restarts(&self) -> Vec<NodeConfig> {
+        self.restarts.lock().unwrap().clone()
     }
 
     async fn maybe_delay(&self) {
@@ -101,7 +129,7 @@ impl NetworkNode for MockP2pNode {
         if *self.should_fail.lock().unwrap() {
             return Err(P2pError::NetworkError {
                 msg: "Mock failure".into(),
-                source: Arc::new(std::io::Error::new(std::io::ErrorKind::Other, "Mock error")),
+                source: Arc::new(std::io::Error::other("Mock error")),
             });
         }
 
@@ -119,7 +147,7 @@ impl NetworkNode for MockP2pNode {
         if *self.should_fail.lock().unwrap() {
             return Err(P2pError::NetworkError {
                 msg: "Mock failure".into(),
-                source: Arc::new(std::io::Error::new(std::io::ErrorKind::Other, "Mock error")),
+                source: Arc::new(std::io::Error::other("Mock error")),
             });
         }
 
@@ -142,7 +170,7 @@ impl NetworkNode for MockP2pNode {
         if *self.should_fail.lock().unwrap() {
             return Err(P2pError::NetworkError {
                 msg: "Mock failure".into(),
-                source: Arc::new(std::io::Error::new(std::io::ErrorKind::Other, "Mock error")),
+                source: Arc::new(std::io::Error::other("Mock error")),
             });
         }
 
@@ -160,7 +188,7 @@ impl NetworkNode for MockP2pNode {
         if *self.should_fail.lock().unwrap() {
             return Err(P2pError::NetworkError {
                 msg: "Mock failure".into(),
-                source: Arc::new(std::io::Error::new(std::io::ErrorKind::Other, "Mock error")),
+                source: Arc::new(std::io::Error::other("Mock error")),
             });
         }
 
@@ -193,9 +221,13 @@ impl NetworkNode for MockP2pNode {
         // The mock performs no networking.
     }
 
-    async fn process_settings_request(&self, _request: &[u8]) -> P2pResult<Vec<u8>> {
-        // The mock has no schema knowledge; return an empty response.
-        Ok(Vec::new())
+    async fn restart(&self, config: NodeConfig) {
+        self.restarts.lock().unwrap().push(config);
+    }
+
+    async fn listen_on_port(&self, port: ListenPort) -> Result<(), ListenFailure> {
+        self.listen_calls.lock().unwrap().push(port);
+        (self.listen_outcome.lock().unwrap())(port)
     }
 
     async fn trigger_interactions_with_visible_peers(&self) {
@@ -208,4 +240,13 @@ impl NetworkNode for MockP2pNode {
             .unwrap()
             .push((devices, kind));
     }
+
+    #[cfg(feature = "debug-server")]
+    async fn get_debug_blob(&self) -> Box<dyn Serialize + Send> {
+        Box::new(NoContent)
+    }
 }
+
+#[cfg(feature = "debug-server")]
+#[derive(DeriveSerialize)]
+struct NoContent;

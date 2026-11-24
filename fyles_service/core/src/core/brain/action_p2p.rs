@@ -1,9 +1,13 @@
+use crate::core::p2p::NodeConfig;
 use crypto::{ContactKeys, ContactPublicKeys};
 
 use crate::{
     core::{
-        brain::types::{ContactShareChallenge, PubkeyFetchResponse, SelfContactInviteChallenge},
-        domain_models::{Contact, ContactId, FylesId, SelfContact},
+        brain::types::{
+            ContactShareChallenge, PubkeyFetchResponse, SelfContactInviteChallenge,
+            SignedContactShare,
+        },
+        domain_models::{ContactId, FylesId, SelfContact},
         filerequest_drive_handler::FilerequestDriveHandler,
         p2p::NodeKeyPairBinary,
     },
@@ -34,7 +38,6 @@ pub struct PubkeyFetchReceiveRequest {
 #[cfg_attr(any(test, feature = "test-support"), derive(PartialEq, Debug))]
 pub struct NodeInfo {
     pub node_key_pair: NodeKeyPairBinary,
-    pub self_contact_id: ContactId,
     pub self_contact_keys: ContactKeys,
 }
 
@@ -42,7 +45,6 @@ impl NodeInfo {
     pub fn generate_random_bytes(node_key_pair: Vec<u8>) -> Self {
         Self {
             node_key_pair,
-            self_contact_id: ContactId::new(),
             self_contact_keys: ContactKeys::new(),
         }
     }
@@ -65,11 +67,7 @@ pub enum NetworkNodeAction {
     RequestFileTransferContinuation(
         BrainRequest<FilerequestContinueRequest, Option<FilerequestContinueResponse>>,
     ),
-    GetNodeInfo(BrainRequest<(), FilerequestResult<(NodeInfo, Vec<u8>)>>),
-    /// Persist an opaque settings blob. Store-only (no apply) — the network node is
-    /// the applier and owns settings persistence. Awaitable so the caller can be
-    /// sure the write is durable (e.g. before telling the UI a change succeeded).
-    PersistSettings(BrainRequest<Vec<u8>, FilerequestResult<()>>),
+    GetNodeInfo(BrainRequest<(), FilerequestResult<(NodeInfo, NodeConfig)>>),
     Ready,
     FileSending {
         pending_file_id: FylesId,
@@ -107,9 +105,12 @@ pub enum NetworkNodeAction {
         status: ReceiveStatus,
         progress_bytes: u64,
     },
-    /// Remove a completed/failed received file entry from the table.
-    DeleteReceivedFile {
+    /// The sending peer withdrew this transfer. Its partial file and its record go, as long as it is
+    /// still in progress and belongs to that peer and contact.
+    DropIncomingTransfer {
         transfer_id: FylesId,
+        peer_id: String,
+        contact_id: Option<ContactId>,
     },
     GetContactPublicKeys(BrainRequest<ContactId, Option<ContactPublicKeys>>),
     /// Batched key lookup for the pubkey-fetch responder. `None` means decline to answer at all —
@@ -117,7 +118,8 @@ pub enum NetworkNodeAction {
     GetContactsPublicKeys(
         BrainRequest<PubkeyFetchReceiveRequest, Option<Vec<(ContactId, ContactPublicKeys)>>>,
     ),
-    IsContactKnown(BrainRequest<ContactId, Result<bool, String>>),
+    /// Whether a session could prove this contact, which takes its keys. Our own identity counts.
+    HoldsContactKeys(BrainRequest<ContactId, Result<bool, String>>),
     OpenFileForReading(BrainRequest<OpenFileForReadingRequest, Result<FileMeta, ()>>),
     ValidateSelfContactInviteChallenge(
         BrainRequest<SelfContactInviteChallenge, Option<SelfContact>>,
@@ -126,8 +128,8 @@ pub enum NetworkNodeAction {
     AnsweredSelfContactInvite,
     RejectedSelfContactInvite,
     SelfContactInviteGotRejected,
-    ValidateContactShareChallenge(BrainRequest<ContactShareChallenge, Option<Contact>>),
-    CreateContact(Contact),
+    ValidateContactShareChallenge(BrainRequest<ContactShareChallenge, Option<SignedContactShare>>),
+    ContactShareReceived(SignedContactShare),
     AnsweredContactShare,
     RejectedContactShare,
     ContactShareGotRejected,

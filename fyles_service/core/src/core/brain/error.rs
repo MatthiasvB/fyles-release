@@ -1,4 +1,8 @@
+use std::error::Error;
+
+use crypto::signed::SignError;
 use thiserror::Error;
+use tokio::task::JoinError;
 
 use crate::{
     core::{db::DbError, p2p::P2pError, sync::CrdtPersistenceError},
@@ -23,10 +27,27 @@ pub enum FilerequestError {
     },
     #[error("Host error: {source}")]
     HostError { source: BoxedError },
+    #[error("Signing error: {0}")]
+    Sign(#[from] SignError),
     #[error("Input error: {0}")]
     InputError(String),
     // Message is English and used only for logs; the UI builds a localized
     // message off the gRPC ALREADY_EXISTS status code, not this string.
     #[error("The folder \"{folder}\" is already used by another file request.")]
     FolderClaimed { folder: String },
+}
+
+impl FilerequestError {
+    pub fn generic(msg: &str, source: impl Error + Send + Sync + 'static) -> Self {
+        Self::GenericError {
+            msg: msg.to_string(),
+            source: Some(Box::new(source)),
+        }
+    }
+}
+
+impl From<JoinError> for FilerequestError {
+    fn from(error: JoinError) -> Self {
+        Self::InternalCommunicationError(Box::new(error))
+    }
 }

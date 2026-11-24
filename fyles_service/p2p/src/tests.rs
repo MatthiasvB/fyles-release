@@ -1,11 +1,14 @@
 mod can_send_file_to_self_right_after_identity_change;
 mod cancel_file;
 mod check_file_size;
+mod fall_back_to_chunks;
 mod filerequest_access;
 mod local_change_propagates;
 mod reconnect_reestablish_session;
 mod renegotiate_session;
+mod restore_restarts_node;
 mod send_file_to_owned_device;
 mod sync_between_owned_devices;
 pub mod test_utils;
+mod use_contact_share_challenge;
 mod use_invite_challenge;

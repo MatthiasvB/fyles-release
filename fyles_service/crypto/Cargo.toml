@@ -1,6 +1,6 @@
 [package]
 name = "crypto"
-version = "0.1.0"
+version = "0.2.0"
 rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,18 +9,23 @@ license.workspace = true
 tap = { workspace = true }
 thiserror = { workspace = true }
 aes-gcm = { workspace = true }
-chacha20poly1305 = { workspace = true }
+chacha20poly1305 = { workspace = true, features = ["stream"] }
+argon2 = { workspace = true }
+subtle = { workspace = true }
 x25519-dalek = { workspace = true, features = ["serde", "static_secrets"] }
 ed25519-dalek = { workspace = true, features = ["serde", "rand_core"] }
 hkdf = { workspace = true }
 rand_core.workspace = true
 serde = { workspace = true }
 sha2 = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 bincode = { workspace = true }
 serde_bytes = { workspace = true }
 ml-dsa = { workspace = true }
+data-encoding = { workspace = true }
+ml-kem = { workspace = true }
+zeroize = { workspace = true }
 
 [features]
 test-support = []

@@ -1,10 +1,40 @@
-use rusqlite::{Connection, Result};
+use crate::core::sync::SyncDocError;
+use crypto::{PqSigningPrivateKeyDeserializationError, PrivateEd25519DeserializationError};
+use rusqlite::Connection;
 use semver::Version;
 use std::fmt;
+use thiserror::Error;
 use tracing::info;
 
 mod all_migrations;
+mod doc_v1;
 pub use all_migrations::get_migrations;
+use doc_v1::{FingerprintLengthError, NotAnFc1IdError};
+
+#[derive(Debug, Error)]
+pub enum MigrationError {
+    #[error("SQLite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("Sync document error: {0}")]
+    SyncDoc(Box<SyncDocError>),
+    #[error("Key fingerprint error: {0}")]
+    Fingerprint(#[from] FingerprintLengthError),
+    #[error("Contact id error: {0}")]
+    ContactId(#[from] NotAnFc1IdError),
+    #[error("Ed25519 signing key error: {0}")]
+    Ed25519Key(#[from] PrivateEd25519DeserializationError),
+    #[error("ML-DSA signing key error: {0}")]
+    PqSigningKey(#[from] PqSigningPrivateKeyDeserializationError),
+}
+
+/// Boxed so that `MigrationError` stays small enough to sit in every migration's `Result`.
+impl From<SyncDocError> for MigrationError {
+    fn from(error: SyncDocError) -> Self {
+        Self::SyncDoc(Box::new(error))
+    }
+}
+
+type Result<T> = std::result::Result<T, MigrationError>;
 
 #[allow(unused)]
 pub struct Migration {
@@ -102,12 +132,18 @@ pub fn run_migrations(conn: &mut Connection) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::all_migrations::pending_files_1_25;
+    use super::doc_v1::{
+        ContactEntryV1, ContactsDocV1, fc1_contact_id, key_fingerprint_v1, new_blob,
+    };
     use super::*;
+    use crate::library::sqlite::schema::CURRENT_SCHEMA_VERSION;
 
     /// Builds an in-memory DB shaped like schema version 1.19.1 (pre-migration column
     /// names) with some seeded identity / contact / transfer rows.
     fn seed_db_at_v1_19_1() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
         conn.execute_batch(
             "CREATE TABLE schema_version (version TEXT NOT NULL);
              INSERT INTO schema_version (version) VALUES ('1.19.1');
@@ -142,7 +178,9 @@ mod tests {
              CREATE TABLE filerequest_audience (
                  filerequest_id TEXT NOT NULL,
                  contact_id TEXT NOT NULL,
-                 created_at TEXT NOT NULL
+                 created_at TEXT NOT NULL,
+                 PRIMARY KEY (filerequest_id, contact_id),
+                 FOREIGN KEY (contact_id) REFERENCES contacts(id) ON DELETE CASCADE
              );
              INSERT INTO filerequest_audience VALUES ('fr-own', 'c1', 'now');
 
@@ -172,8 +210,22 @@ mod tests {
              INSERT INTO pending_files (id, file_path, target_filerequest_id, created_at)
                  VALUES ('pf1', '/p', 'rfr1', 'now');
 
-             CREATE TABLE received_files (id TEXT PRIMARY KEY, peer_id TEXT NOT NULL, file_name TEXT NOT NULL);
-             INSERT INTO received_files VALUES ('rf1', 'peer-x', 'photo.jpg');",
+             CREATE TABLE received_files (
+                 id TEXT PRIMARY KEY,
+                 contact_id TEXT,
+                 filerequest_id TEXT NOT NULL,
+                 transfer_id TEXT UNIQUE,
+                 file_name TEXT NOT NULL,
+                 file_path TEXT,
+                 file_size_bytes INTEGER NOT NULL,
+                 progress_bytes INTEGER NOT NULL DEFAULT 0,
+                 status TEXT NOT NULL DEFAULT 'Receiving',
+                 received_at_ms INTEGER,
+                 started_at_ms INTEGER NOT NULL DEFAULT 0,
+                 peer_id TEXT NOT NULL DEFAULT ''
+             );
+             INSERT INTO received_files (id, contact_id, filerequest_id, file_name, file_size_bytes, peer_id)
+                 VALUES ('rf1', 'c1', 'fr-own', 'photo.jpg', 1, 'peer-x');",
         )
         .unwrap();
         conn
@@ -191,7 +243,7 @@ mod tests {
         run_migrations(&mut conn).unwrap();
 
         // Version advanced.
-        assert_eq!(get_db_version(&conn).unwrap(), Version::new(1, 22, 0));
+        assert_eq!(get_db_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
 
         // Stable identity preserved: PeerId keypair and contact_id untouched.
         let node_key_after: Vec<u8> = conn
@@ -200,14 +252,11 @@ mod tests {
             })
             .unwrap();
         assert_eq!(node_key_before, node_key_after);
-        let (contact_id, name): (String, String) = conn
-            .query_row(
-                "SELECT contact_id, name FROM self_contact WHERE id = 1",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+        let name: String = conn
+            .query_row("SELECT name FROM self_contact WHERE id = 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
-        assert_eq!(contact_id, "my-stable-id");
         assert_eq!(name, "Reset after update");
 
         // Only private signing columns remain, and they are cleared (regenerated on boot).
@@ -261,6 +310,33 @@ mod tests {
     }
 
     #[test]
+    fn the_chain_rolls_back_to_where_it_started() {
+        let mut conn = seed_db_at_v1_19_1();
+        run_migrations(&mut conn).unwrap();
+
+        let start = Version::new(1, 19, 1);
+        for migration in get_migrations()
+            .iter()
+            .rev()
+            .take_while(|m| m.applies_to_version >= start)
+        {
+            migration.rollback(&conn).unwrap();
+        }
+
+        assert_eq!(get_db_version(&conn).unwrap(), start);
+        for column in [
+            "contacts.dilithium_public_key",
+            "self_contact.dilithium_public_key",
+        ] {
+            let (table, column) = column.split_once('.').unwrap();
+            conn.query_row(&format!("SELECT COUNT({column}) FROM {table}"), [], |_| {
+                Ok(())
+            })
+            .unwrap_or_else(|e| panic!("{table}.{column} should be back: {e}"));
+        }
+    }
+
+    #[test]
     fn seed_sync_docs_populates_documents_from_existing_rows() {
         use crate::core::domain_models::{ContactId, FylesId, PeerIdWrapper};
         use crate::core::sync::{self, ContactsDoc, DevicesDoc, DocKind, RemoteFrDoc};
@@ -272,6 +348,7 @@ mod tests {
         let expected_peer_id = crate::core::p2p::peer_id_from_node_keypair(&key_bytes).unwrap();
 
         let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
         conn.execute_batch(
             "CREATE TABLE schema_version (version TEXT NOT NULL);
              INSERT INTO schema_version (version) VALUES ('1.21.0');
@@ -284,6 +361,37 @@ mod tests {
                  pq_signing_public_key BLOB, ed25519_public_key BLOB
              );
              INSERT INTO contacts VALUES ('c1', 'Bob', 'now', 'now', X'aabb', X'ccdd');
+             INSERT INTO contacts VALUES ('c2', 'Keyless', 'now', 'now', NULL, NULL);
+
+             CREATE TABLE self_contact (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 contact_id TEXT NOT NULL UNIQUE,
+                 name TEXT NOT NULL,
+                 pq_signing_private_key BLOB,
+                 ed25519_private_key BLOB
+             );
+             INSERT INTO self_contact VALUES (1, 'my-stable-id', 'Alice', NULL, NULL);
+
+             CREATE TABLE filerequest_audience (
+                 filerequest_id TEXT NOT NULL, contact_id TEXT NOT NULL,
+                 created_at TEXT NOT NULL,
+                 PRIMARY KEY (filerequest_id, contact_id),
+                 FOREIGN KEY (contact_id) REFERENCES contacts(id) ON DELETE CASCADE
+             );
+             INSERT INTO filerequest_audience VALUES ('fr-own', 'c1', 'now');
+
+             CREATE TABLE received_files (
+                 id TEXT PRIMARY KEY, contact_id TEXT, filerequest_id TEXT NOT NULL,
+                 transfer_id TEXT UNIQUE, file_name TEXT NOT NULL, file_path TEXT,
+                 file_size_bytes INTEGER NOT NULL, progress_bytes INTEGER NOT NULL DEFAULT 0,
+                 status TEXT NOT NULL DEFAULT 'Receiving', received_at_ms INTEGER,
+                 started_at_ms INTEGER NOT NULL DEFAULT 0, peer_id TEXT NOT NULL DEFAULT '',
+                 persisted_as_name TEXT NOT NULL DEFAULT ''
+             );
+             INSERT INTO received_files (id, filerequest_id, file_name, file_size_bytes, contact_id)
+                 VALUES ('rf1', 'fr-own', 'a.txt', 1, 'c1');
+             INSERT INTO received_files (id, filerequest_id, file_name, file_size_bytes, contact_id)
+                 VALUES ('rf2', 'fr-own', 'b.txt', 1, 'gone');
 
              CREATE TABLE remote_filerequests (
                  id TEXT PRIMARY KEY, peer_id TEXT NOT NULL, filerequest_id TEXT NOT NULL,
@@ -309,7 +417,7 @@ mod tests {
         .unwrap();
 
         run_migrations(&mut conn).unwrap();
-        assert_eq!(get_db_version(&conn).unwrap(), Version::new(1, 22, 0));
+        assert_eq!(get_db_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
 
         // remote_filerequests table dropped; pending_files kept (FK removed) with its row.
         assert!(
@@ -331,19 +439,58 @@ mod tests {
             .unwrap()
         };
 
+        let bob_id: ContactId = fc1_contact_id(&key_fingerprint_v1(&[0xaa, 0xbb], &[0xcc, 0xdd]))
+            .unwrap()
+            .parse()
+            .unwrap();
         let contacts_doc: ContactsDoc =
             sync::hydrate(&sync::load(&blob(DocKind::Contacts)).unwrap()).unwrap();
-        let bob = &contacts_doc.contacts[&ContactId("c1".into())];
-        assert_eq!(bob.name, "Bob");
+        assert_eq!(contacts_doc.contacts.len(), 1);
+        assert_eq!(contacts_doc.contacts[&bob_id].name, "Bob");
+
+        // Bob keeps his rows under the derived id. The keyless contact has no key material
+        // anywhere, so it cannot be given one and goes, along with its references.
+        let contact_rows: Vec<String> = conn
+            .prepare("SELECT id FROM contacts ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(contact_rows, vec![bob_id.to_string()]);
+
+        let received: Vec<(String, Option<String>)> = conn
+            .prepare("SELECT id, contact_id FROM received_files ORDER BY id")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
         assert_eq!(
-            bob.key_fingerprint,
-            sync::fingerprint(&[0xaa, 0xbb], &[0xcc, 0xdd])
+            received,
+            vec![
+                ("rf1".to_string(), Some(bob_id.to_string())),
+                // The sender cannot be identified any more, but the file was still received.
+                ("rf2".to_string(), None),
+            ]
+        );
+        let audience: String = conn
+            .query_row("SELECT contact_id FROM filerequest_audience", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(audience, bob_id.to_string());
+        assert!(
+            conn.query_row("SELECT contact_id FROM self_contact", [], |r| r
+                .get::<_, String>(0))
+                .is_err(),
+            "the self contact's id is derived from its keys, not stored"
         );
 
         let remote_doc: RemoteFrDoc =
             sync::hydrate(&sync::load(&blob(DocKind::RemoteFilerequests)).unwrap()).unwrap();
         let rfr = &remote_doc.remote_filerequests[&FylesId("rfr1".into())];
-        assert_eq!(rfr.contact_id.0, "c1");
+        assert_eq!(rfr.contact_id, bob_id);
         assert_eq!(rfr.peer_id_hint.0, "peerX");
         assert_eq!(rfr.filerequest_id.0, "fr-remote");
 
@@ -357,5 +504,213 @@ mod tests {
                 .contains_key(&PeerIdWrapper(expected_peer_id)),
             "seed migration should register this device in the Devices doc"
         );
+    }
+
+    #[test]
+    fn deriving_contact_ids_downgrades_and_upgrades_again() {
+        use std::collections::HashMap;
+
+        use crypto::{
+            ContactKeys, serialize_ed25519_private_key, serialize_ed25519_public_key,
+            serialize_pq_signing_private_key, serialize_pq_signing_public_key,
+        };
+
+        use crate::core::sync::{self, ContactsDoc, DocKind};
+
+        let public_bytes = |keys: &ContactKeys| {
+            (
+                serialize_pq_signing_public_key(&keys.public.pq_signing),
+                serialize_ed25519_public_key(&keys.public.ed25519),
+            )
+        };
+        let me = ContactKeys::new();
+        let keyed = ContactKeys::new();
+        let keyless = ContactKeys::new();
+        let (keyed_pq, keyed_ed) = public_bytes(&keyed);
+        let (keyless_pq, keyless_ed) = public_bytes(&keyless);
+        let keyed_fingerprint = key_fingerprint_v1(&keyed_pq, &keyed_ed);
+        let keyless_fingerprint = key_fingerprint_v1(&keyless_pq, &keyless_ed);
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&pending_files_1_25("pending_files"))
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version TEXT NOT NULL);
+             INSERT INTO schema_version (version) VALUES ('1.23.0');
+             CREATE TABLE contacts (
+                 id TEXT PRIMARY KEY, name TEXT NOT NULL,
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                 pq_signing_public_key BLOB, ed25519_public_key BLOB
+             );
+             CREATE TABLE filerequest_audience (
+                 filerequest_id TEXT NOT NULL, contact_id TEXT NOT NULL, created_at TEXT NOT NULL,
+                 PRIMARY KEY (filerequest_id, contact_id)
+             );
+             CREATE TABLE received_files (id TEXT PRIMARY KEY, contact_id TEXT);
+             CREATE TABLE self_contact (
+                 id INTEGER PRIMARY KEY CHECK (id = 1),
+                 contact_id TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+                 pq_signing_private_key BLOB, ed25519_private_key BLOB
+             );
+             CREATE TABLE sync_docs (doc_kind TEXT PRIMARY KEY, data BLOB NOT NULL);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO contacts VALUES ('keyed-uuid', 'Keyed', 'now', 'now', ?, ?)",
+            rusqlite::params![keyed_pq, keyed_ed],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO self_contact VALUES (1, 'my-uuid', 'Me', ?, ?)",
+            rusqlite::params![
+                serialize_pq_signing_private_key(&me.private.pq_signing),
+                serialize_ed25519_private_key(&me.private.ed25519)
+            ],
+        )
+        .unwrap();
+        let contacts_v1 = ContactsDocV1 {
+            contacts: HashMap::from([
+                (
+                    "keyed-uuid".to_string(),
+                    ContactEntryV1 {
+                        name: "Keyed".into(),
+                        key_fingerprint: keyed_fingerprint.clone(),
+                    },
+                ),
+                (
+                    "keyless-uuid".to_string(),
+                    ContactEntryV1 {
+                        name: "Keyless".into(),
+                        key_fingerprint: keyless_fingerprint.clone(),
+                    },
+                ),
+            ]),
+        };
+        conn.execute(
+            "INSERT INTO sync_docs (doc_kind, data) VALUES (?, ?)",
+            rusqlite::params![
+                DocKind::Contacts.as_str(),
+                new_blob(DocKind::Contacts, &contacts_v1).unwrap()
+            ],
+        )
+        .unwrap();
+        let contacts_doc = |conn: &Connection| {
+            let blob: Vec<u8> = conn
+                .query_row(
+                    "SELECT data FROM sync_docs WHERE doc_kind = ?",
+                    [DocKind::Contacts.as_str()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            sync::load(&blob).unwrap()
+        };
+        let assert_upgraded = |conn: &Connection| {
+            assert_eq!(get_db_version(conn).unwrap(), CURRENT_SCHEMA_VERSION);
+            let view: ContactsDoc = sync::hydrate(&contacts_doc(conn)).unwrap();
+            assert_eq!(view.contacts[&keyed.id()].name, "Keyed");
+            assert_eq!(view.contacts[&keyless.id()].name, "Keyless");
+            assert_eq!(view.contacts.len(), 2);
+        };
+
+        run_migrations(&mut conn).unwrap();
+        assert_upgraded(&conn);
+
+        let start = Version::new(1, 23, 0);
+        for migration in get_migrations()
+            .iter()
+            .rev()
+            .take_while(|m| m.applies_to_version >= start)
+        {
+            migration.rollback(&conn).unwrap();
+        }
+
+        assert_eq!(get_db_version(&conn).unwrap(), start);
+        let self_contact_id: String = conn
+            .query_row("SELECT contact_id FROM self_contact", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(self_contact_id, me.id().to_string());
+        let downgraded: ContactsDocV1 = sync::hydrate(&contacts_doc(&conn)).unwrap();
+        assert_eq!(
+            downgraded.contacts[keyed.id().as_ref()].key_fingerprint,
+            keyed_fingerprint
+        );
+        assert_eq!(
+            downgraded.contacts[keyless.id().as_ref()].key_fingerprint,
+            keyless_fingerprint
+        );
+
+        run_migrations(&mut conn).unwrap();
+        assert_upgraded(&conn);
+    }
+
+    #[test]
+    fn existing_installs_keep_listening_on_24256() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&pending_files_1_25("pending_files"))
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version TEXT NOT NULL);
+             INSERT INTO schema_version (version) VALUES ('1.24.0');",
+        )
+        .unwrap();
+        run_migrations(&mut conn).unwrap();
+
+        let port: u16 = conn
+            .query_row("SELECT port FROM listen_port WHERE id = 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(port, 24256);
+
+        let start = Version::new(1, 24, 0);
+        for migration in get_migrations()
+            .iter()
+            .rev()
+            .take_while(|m| m.applies_to_version >= start)
+        {
+            migration.rollback(&conn).unwrap();
+        }
+        assert!(
+            conn.query_row("SELECT COUNT(*) FROM listen_port", [], |_| Ok(()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_transfer_recorded_without_its_source_stamp_starts_over() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&pending_files_1_25("pending_files"))
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_version (version TEXT NOT NULL);
+             INSERT INTO schema_version (version) VALUES ('1.25.0');
+             INSERT INTO pending_files (id, file_path, target_filerequest_id, status, progress_bytes, file_size_bytes, transfer_id, created_at)
+                 VALUES ('interrupted', '/a', 'fr', 'Interrupted', 4, 7, 'transfer', 'now');
+             INSERT INTO pending_files (id, file_path, target_filerequest_id, status, created_at)
+                 VALUES ('sent', '/b', 'fr', 'Sent', 'now');",
+        )
+        .unwrap();
+        run_migrations(&mut conn).unwrap();
+
+        let row = |id: &str| {
+            conn.query_row(
+                "SELECT status, transfer_id FROM pending_files WHERE id = ?",
+                [id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!(row("interrupted"), ("Pending".into(), None));
+        assert_eq!(row("sent"), ("Sent".into(), None));
+
+        let stamp_and_later = get_migrations()
+            .into_iter()
+            .rev()
+            .take_while(|m| m.applies_to_version >= Version::new(1, 25, 0));
+        for migration in stamp_and_later {
+            migration.rollback(&conn).unwrap();
+        }
+        assert_eq!(get_db_version(&conn).unwrap(), Version::new(1, 25, 0));
+        assert_eq!(row("interrupted"), ("Pending".into(), None));
     }
 }

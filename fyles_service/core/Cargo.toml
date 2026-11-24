@@ -1,6 +1,6 @@
 [package]
 name = "fyles-core"
-version = "0.6.0"
+version = "0.7.0"
 edition.workspace = true
 
 [dependencies]
@@ -12,11 +12,9 @@ libp2p = { workspace = true, features = ["ed25519"] }
 futures = { workspace = true }
 itertools = { workspace = true }
 prost = { workspace = true }
-protobuf = { workspace = true }
 rusqlite = { workspace = true, features = ["bundled", "backup"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-tap = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "sync", "rt", "rt-multi-thread", "fs", "time"] }
 tokio-stream = { workspace = true }
@@ -25,40 +23,45 @@ tonic-prost = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 semver = { workspace = true, features = ["serde"] }
 sha2 = { workspace = true }
-shellexpand = { workspace = true }
+data-encoding = { workspace = true }
 autosurgeon = { workspace = true }
 automerge = { workspace = true }
 expiringmap = { workspace = true }
 serde_bytes = { workspace = true }
 bincode = { workspace = true }
 tracing = { workspace = true }
-test-log = { workspace = true, features = ["trace"] }
 sanitize-filename = { workspace = true }
 rand = { workspace = true }
 zip_clone = { workspace = true }
-uds_windows = { workspace = true }
 crypto = { workspace = true }
-tempfile = { workspace = true, optional = true }
-async-io = { workspace = true }
+license_format = { workspace = true }
+tempfile = { workspace = true }
 futures-util = { workspace = true }
 subtle = { workspace = true, features = ["const-generics"] }
 base64 = { workspace = true }
 zstd = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
+zeroize = { workspace = true }
+zxcvbn_lite = { workspace = true }
 libc.workspace = true
 tokio-util = { workspace = true, features = ["compat", "rt", "time"] }
-derive_more = { workspace = true, features = ["as_ref", "deref", "deref_mut", "display", "from", "from_str"] }
+derive_more = { workspace = true, features = ["as_ref", "deref", "deref_mut", "display", "from", "from_str", "try_from"] }
+axum = { workspace = true, optional = true, features = ["macros"] }
+erased-serde = { workspace = true, optional = true }
 
 [build-dependencies]
 tonic-build = { workspace = true }
 tonic-prost-build = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 crypto = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 default = []
 otel-jaeger = []
-test-support = ["tempfile", "crypto/test-support"]
+dev-keys = ["license_format/dev-keys"]
+test-support = ["crypto/test-support"]
+debug-server = [ "axum", "erased-serde" ]
+axum = ["dep:axum"]
 

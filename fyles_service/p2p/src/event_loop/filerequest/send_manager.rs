@@ -1,55 +1,136 @@
 use super::PARALLEL_CHUNKS;
-use crate::crypto::SessionEstablishmentError;
 use crate::send_receive_traits::session_send_receive::SessionSendError;
+use crate::sessions::SessionEstablishmentError;
+use crate::source::{Source, SourceWatch};
+use crate::types::AttemptId;
 use crate::{file_reader::FileReader, types::DataChunk};
 use crypto::SerCryptError;
 use fyles_core::core::domain_models::{ContactId, FylesId, PendingFile};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{collections::HashMap, hash::Hash};
+use tokio_util::sync::CancellationToken;
 
-pub struct LockedSendData<ID: Hash + Eq + Clone> {
-    send_manager: SendManager<ID>,
+pub struct SendSlot<ID: Hash + Eq + Clone> {
+    path: DataPath<ID>,
     pub pending_file: PendingFile,
-    /// Whenever a transfer is started (or continued), we check if we know the contact associated
-    /// with this filerequest. If so, we must, on each message, check that we are actually talking
-    /// to that contact, not an impostor. However, we also want to be able to send files to unknown contacts.
-    /// In that case, we can only rely on libp2p's crypto implementation and cannot further pin the target.
-    pub must_verify_contact_id: bool,
+    pin: ContactPin,
     /// An occupied slot blocks every future send to that peer, so a stalled one has to be visible.
-    /// `last_progress` is bumped in [`Self::unlock_mut`], the only way to mutate the transfer.
+    /// `last_progress` is bumped in [`Self::advance_for`], the only way to advance the transfer.
     claimed_at: tokio::time::Instant,
     last_progress: tokio::time::Instant,
     /// Latch: report a wedged slot once per episode, not once per sweep.
     stall_reported: bool,
 }
 
+/// Whether only a session that proves the target contact may advance the transfer. A session can
+/// prove a contact only when we hold its keys, which is also what pins a slot from the start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContactPin {
+    Unpinned,
+    Pinned,
+}
+
+pub enum DataPath<ID: Hash + Eq + Clone> {
+    Chunked(SendManager<ID>),
+    Stream(StreamPath<ID>),
+}
+
+impl<ID: Hash + Eq + Clone> DataPath<ID> {
+    pub fn chunked_mut(&mut self) -> Option<&mut SendManager<ID>> {
+        match self {
+            DataPath::Chunked(send_manager) => Some(send_manager),
+            DataPath::Stream(_) => None,
+        }
+    }
+}
+
+pub struct StreamPath<ID: Hash + Eq + Clone> {
+    transfer_id: FylesId,
+    file_size_bytes: u64,
+    control: HashMap<ID, OpeningRequest>,
+    pub phase: StreamPhase,
+}
+
+pub enum StreamPhase {
+    Negotiating(Box<Source>),
+    Running(StreamAttempt),
+}
+
+/// Dropping it cancels the attempt's task, so whatever clears a slot also stops its stream.
+pub struct StreamAttempt {
+    pub attempt: AttemptId,
+    pub progress: Arc<AtomicU64>,
+    cancel: CancellationToken,
+}
+
+impl StreamAttempt {
+    pub fn new(attempt: AttemptId, offset: u64) -> Self {
+        Self {
+            attempt,
+            progress: Arc::new(AtomicU64::new(offset)),
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel.clone()
+    }
+
+    pub fn progress_bytes(&self) -> u64 {
+        self.progress.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for StreamAttempt {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
 pub struct SendDataMut<'a, ID: Hash + Eq + Clone> {
-    pub send_manager: &'a mut SendManager<ID>,
+    pub path: &'a mut DataPath<ID>,
     pub pending_file: &'a mut PendingFile,
 }
 
-pub struct SendDataRef<'a, ID: Hash + Eq + Clone> {
-    pub send_manager: &'a SendManager<ID>,
-    pub pending_file: &'a PendingFile,
-}
-
-pub struct SendData<ID: Hash + Eq + Clone> {
-    pub send_manager: SendManager<ID>,
-    pub pending_file: PendingFile,
-}
-
-impl<ID: Hash + Eq + Clone> LockedSendData<ID> {
-    pub fn new(
+impl<ID: Hash + Eq + Clone> SendSlot<ID> {
+    pub fn chunked(
         pending_file: PendingFile,
         transfer_id: FylesId,
-        file_size_bytes: u64,
-        file: tokio::fs::File,
+        source: Source,
+        pin: ContactPin,
     ) -> Self {
+        Self::with_path(
+            DataPath::Chunked(SendManager::new(transfer_id, source)),
+            pending_file,
+            pin,
+        )
+    }
+
+    pub fn streamed(
+        pending_file: PendingFile,
+        transfer_id: FylesId,
+        source: Source,
+        pin: ContactPin,
+    ) -> Self {
+        Self::with_path(
+            DataPath::Stream(StreamPath {
+                transfer_id,
+                file_size_bytes: source.stamp().size_bytes,
+                control: Default::default(),
+                phase: StreamPhase::Negotiating(Box::new(source)),
+            }),
+            pending_file,
+            pin,
+        )
+    }
+
+    fn with_path(path: DataPath<ID>, pending_file: PendingFile, pin: ContactPin) -> Self {
         let now = tokio::time::Instant::now();
         Self {
-            send_manager: SendManager::new(transfer_id, file_size_bytes, file),
+            path,
             pending_file,
-            must_verify_contact_id: true, // safe default, must set to false if contact isn't known
+            pin,
             claimed_at: now,
             last_progress: now,
             stall_reported: false,
@@ -57,11 +138,51 @@ impl<ID: Hash + Eq + Clone> LockedSendData<ID> {
     }
 
     pub fn get_transfer_id(&self) -> &FylesId {
-        &self.send_manager.transfer_id
+        match &self.path {
+            DataPath::Chunked(send_manager) => &send_manager.transfer_id,
+            DataPath::Stream(stream) => &stream.transfer_id,
+        }
     }
 
     pub fn get_file_size_bytes(&self) -> u64 {
-        self.send_manager.file_size_bytes()
+        match &self.path {
+            DataPath::Chunked(send_manager) => send_manager.file_size_bytes(),
+            DataPath::Stream(stream) => stream.file_size_bytes,
+        }
+    }
+
+    pub fn path(&self) -> &DataPath<ID> {
+        &self.path
+    }
+
+    pub fn running_attempt(&self) -> Option<&StreamAttempt> {
+        match &self.path {
+            DataPath::Stream(StreamPath {
+                phase: StreamPhase::Running(attempt),
+                ..
+            }) => Some(attempt),
+            _ => None,
+        }
+    }
+
+    pub fn await_response(&mut self, id: ID, request: OpeningRequest) {
+        match &mut self.path {
+            DataPath::Chunked(send_manager) => send_manager.await_response(id, request.into()),
+            DataPath::Stream(stream) => {
+                stream.control.insert(id, request);
+            }
+        }
+    }
+
+    /// `None` when `id` was not sent for this transfer, for example by an earlier attempt.
+    pub fn claim(&mut self, id: &ID) -> Option<Request> {
+        match &mut self.path {
+            DataPath::Chunked(send_manager) => send_manager.requests.remove(id),
+            DataPath::Stream(stream) => stream
+                .control
+                .remove(id)
+                .map(|it| Request::Control(it.into())),
+        }
     }
 
     /// How long the transfer has been standing still. See the field docs on `last_progress`.
@@ -73,9 +194,13 @@ impl<ID: Hash + Eq + Clone> LockedSendData<ID> {
         self.claimed_at.elapsed()
     }
 
-    /// Report a stall exactly once per episode. Returns whether the caller should log.
+    /// Report a stall exactly once per episode. Returns whether the caller should log. A running
+    /// stream attempt is exempt, because its own idle timeout already ends it.
     pub fn should_report_stall(&mut self, threshold: std::time::Duration) -> bool {
-        if self.stalled_for() > threshold && !self.stall_reported {
+        if self.running_attempt().is_none()
+            && self.stalled_for() > threshold
+            && !self.stall_reported
+        {
             self.stall_reported = true;
             true
         } else {
@@ -83,90 +208,99 @@ impl<ID: Hash + Eq + Clone> LockedSendData<ID> {
         }
     }
 
-    pub fn unlock_mut<'a>(
+    /// `None` when the session's contact may not advance the transfer. A session that proves the
+    /// target pins the slot.
+    pub fn advance_for<'a>(
         &'a mut self,
         connected_contact_id: &Option<ContactId>,
     ) -> Option<SendDataMut<'a, ID>> {
-        let permitted = !self.must_verify_contact_id
-            || connected_contact_id
-                .as_ref()
-                .is_some_and(|connected_id| *connected_id == self.pending_file.contact_id);
-        if !permitted {
-            // Handing out nothing is not progress — a peer that keeps failing the contact check
-            // must still show up as stalled.
+        if connected_contact_id.as_ref() == Some(&self.pending_file.contact_id) {
+            self.pin = ContactPin::Pinned;
+        } else if self.pin == ContactPin::Pinned {
+            // Handing out nothing is not progress, so a peer that keeps failing the contact check
+            // still shows up as stalled.
             return None;
         }
         self.last_progress = tokio::time::Instant::now();
         self.stall_reported = false;
         Some(SendDataMut {
-            send_manager: &mut self.send_manager,
+            path: &mut self.path,
             pending_file: &mut self.pending_file,
         })
     }
+}
 
-    pub fn unlock_into(self, connected_contact_id: &Option<ContactId>) -> Option<SendData<ID>> {
-        if !self.must_verify_contact_id
-            || connected_contact_id
-                .as_ref()
-                .is_some_and(|connected_id| *connected_id == self.pending_file.contact_id)
-        {
-            Some(SendData {
-                send_manager: self.send_manager,
-                pending_file: self.pending_file,
-            })
-        } else {
-            None
-        }
-    }
+/// Opens an attempt on either path. Only the chunked path also awaits a `Done`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpeningRequest {
+    Offer,
+    Continue,
+}
 
-    pub fn unlock(
-        &'_ self,
-        connected_contact_id: &Option<ContactId>,
-    ) -> Option<SendDataRef<'_, ID>> {
-        if !self.must_verify_contact_id
-            || connected_contact_id
-                .as_ref()
-                .is_some_and(|connected_id| *connected_id == self.pending_file.contact_id)
-        {
-            Some(SendDataRef {
-                send_manager: &self.send_manager,
-                pending_file: &self.pending_file,
-            })
-        } else {
-            None
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlRequest {
+    Offer,
+    Continue,
+    Done,
+}
+
+impl From<OpeningRequest> for ControlRequest {
+    fn from(request: OpeningRequest) -> Self {
+        match request {
+            OpeningRequest::Offer => ControlRequest::Offer,
+            OpeningRequest::Continue => ControlRequest::Continue,
         }
     }
 }
 
+/// Only [`SendManager`] hands these out, so an acknowledgement always names a chunk in flight.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ChunkTicket(u32);
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Request {
+    Control(ControlRequest),
+    Chunk(ChunkTicket),
+}
+
 pub struct SendManager<ID: Hash + Eq + Clone> {
-    chunk_to_index: HashMap<ID, u32>,
+    requests: HashMap<ID, Request>,
     chunks_in_flight: Vec<Slot>,
     earliest_not_sent: u32,
     next_slot: u32,
     file: FileReader,
+    source: SourceWatch,
     progress_bytes: u64,
-    file_size_bytes: u64,
+    next_offset: u64,
+    seek_to: Option<u64>,
     pub transfer_id: FylesId,
 }
 
 impl<ID: Hash + Eq + Clone> SendManager<ID> {
-    pub fn new(transfer_id: FylesId, file_size_bytes: u64, file: tokio::fs::File) -> Self {
-        let file_reader = FileReader::new(file);
+    pub fn new(transfer_id: FylesId, source: Source) -> Self {
         Self {
             transfer_id,
-            chunk_to_index: Default::default(),
+            requests: Default::default(),
             chunks_in_flight: vec![Slot::Empty; PARALLEL_CHUNKS as usize],
             earliest_not_sent: 0,
             next_slot: 0,
-            file: file_reader,
-            file_size_bytes,
+            file: FileReader::new(source.file),
+            source: source.watch,
             progress_bytes: 0,
+            next_offset: 0,
+            seek_to: None,
         }
     }
 
-    pub async fn set_progress(&mut self, offset: u64) {
+    pub fn await_response(&mut self, id: ID, request: ControlRequest) {
+        self.requests.insert(id, Request::Control(request));
+    }
+
+    /// The reader seeks before its next read.
+    pub fn resume_at(&mut self, offset: u64) {
         self.progress_bytes = offset;
-        self.file.set_progress(offset).await;
+        self.next_offset = offset;
+        self.seek_to = Some(offset);
     }
 }
 
@@ -177,6 +311,7 @@ pub enum SendRes<ID> {
     IoError(std::io::Error),
     /// When something has gone wrong, like sending didn't work
     Interrupt,
+    SourceChanged,
 }
 
 #[derive(Clone)]
@@ -199,6 +334,12 @@ impl<ID: Hash + Eq + Clone> SendManager<ID> {
         if !self.is_ready() {
             return SendRes::NotReady;
         }
+        if self.source.changed().await {
+            return SendRes::SourceChanged;
+        }
+        if let Some(offset) = self.seek_to.take() {
+            self.file.set_progress(offset).await;
+        }
         let Some(read) = self.file.read().await else {
             return if self.earliest_not_sent == self.next_slot
                 && !self
@@ -219,14 +360,16 @@ impl<ID: Hash + Eq + Clone> SendManager<ID> {
 
         let chunk = DataChunk {
             transfer_uuid: self.transfer_id.clone(),
+            offset: self.next_offset,
             data: data[..num_bytes].to_vec(),
-            idx: self.next_slot,
         };
 
-        let Ok(id) = send(chunk.clone()).await else {
+        let Ok(id) = send(chunk).await else {
             return SendRes::Interrupt;
         };
-        self.chunk_to_index.insert(id.clone(), self.next_slot);
+        self.requests
+            .insert(id.clone(), Request::Chunk(ChunkTicket(self.next_slot)));
+        self.next_offset += num_bytes as u64;
         let real_index = (self.next_slot % PARALLEL_CHUNKS) as usize;
         assert!(
             real_index < self.chunks_in_flight.len(),
@@ -240,9 +383,8 @@ impl<ID: Hash + Eq + Clone> SendManager<ID> {
         SendRes::Sent(id)
     }
 
-    /// Acknowlegde reception of file chunk
-    pub fn receive_ack(&mut self, id: ID) {
-        self.mark_done(id);
+    pub fn receive_ack(&mut self, ticket: ChunkTicket) {
+        self.mark_done(ticket.0);
     }
 
     pub fn progress_bytes(&self) -> u64 {
@@ -250,18 +392,14 @@ impl<ID: Hash + Eq + Clone> SendManager<ID> {
     }
 
     pub fn file_size_bytes(&self) -> u64 {
-        self.file_size_bytes
+        self.source.stamp().size_bytes
     }
 
     fn is_ready(&self) -> bool {
         self.next_slot - self.earliest_not_sent < PARALLEL_CHUNKS
     }
 
-    fn mark_done(&mut self, id: ID) {
-        let idx = self
-            .chunk_to_index
-            .remove(&id)
-            .expect("id to be registered");
+    fn mark_done(&mut self, idx: u32) {
         assert!(
             idx >= self.earliest_not_sent && idx <= self.next_slot,
             "Index out of bounds"
@@ -289,22 +427,30 @@ impl<ID: Hash + Eq + Clone> SendManager<ID> {
 }
 
 #[cfg(test)]
-mod locked_send_data_tests {
+mod send_slot_tests {
     use super::*;
     use crate::constants::STALL_ERROR_AFTER;
     use fyles_core::core::domain_models::SendStatus;
 
-    async fn slot() -> LockedSendData<usize> {
+    fn target() -> ContactId {
+        ContactId::for_test(3)
+    }
+
+    async fn slot(pin: ContactPin) -> SendSlot<usize> {
         let path = tempfile::NamedTempFile::new()
             .expect("a temp file to be creatable")
             .into_temp_path();
-        let file = tokio::fs::File::open(&path)
-            .await
-            .expect("the temp file to be openable");
-        let mut data = LockedSendData::new(
+        let source = Source::open(
+            tokio::fs::File::open(&path)
+                .await
+                .expect("the temp file to be openable"),
+        )
+        .await
+        .expect("the temp file to be inspectable");
+        SendSlot::chunked(
             PendingFile {
                 id: FylesId("file".into()),
-                contact_id: ContactId("contact".into()),
+                contact_id: target(),
                 file_path: path.to_string_lossy().into_owned(),
                 retry_count: 0,
                 target_filerequest_id: FylesId("fr".into()),
@@ -313,23 +459,55 @@ mod locked_send_data_tests {
                 interruption_reasons: Vec::new(),
             },
             FylesId("transfer".into()),
-            0,
-            file,
+            source,
+            pin,
+        )
+    }
+
+    #[tokio::test]
+    async fn only_requests_of_this_transfer_can_be_claimed() {
+        let mut data = slot(ContactPin::Unpinned).await;
+        data.await_response(7, OpeningRequest::Offer);
+
+        assert_eq!(data.claim(&8), None);
+        assert_eq!(
+            data.claim(&7),
+            Some(Request::Control(ControlRequest::Offer))
         );
-        // The contact check is orthogonal to what these tests exercise.
-        data.must_verify_contact_id = false;
-        data
+        assert_eq!(data.claim(&7), None);
+    }
+
+    #[tokio::test]
+    async fn a_pinned_slot_admits_only_the_target() {
+        let mut data = slot(ContactPin::Pinned).await;
+        assert!(data.advance_for(&None).is_none());
+        assert!(data.advance_for(&Some(ContactId::for_test(119))).is_none());
+        assert!(data.advance_for(&Some(target())).is_some());
+    }
+
+    #[tokio::test]
+    async fn an_unpinned_slot_admits_any_session() {
+        let mut data = slot(ContactPin::Unpinned).await;
+        assert!(data.advance_for(&Some(ContactId::for_test(119))).is_some());
+        assert!(data.advance_for(&None).is_some());
+    }
+
+    #[tokio::test]
+    async fn a_session_that_proves_the_target_pins_the_slot() {
+        let mut data = slot(ContactPin::Unpinned).await;
+        assert!(data.advance_for(&Some(target())).is_some());
+        assert!(data.advance_for(&None).is_none());
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_fresh_slot_is_not_stalled() {
-        let mut data = slot().await;
+        let mut data = slot(ContactPin::Unpinned).await;
         assert!(!data.should_report_stall(STALL_ERROR_AFTER));
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_wedged_slot_reports_exactly_once() {
-        let mut data = slot().await;
+        let mut data = slot(ContactPin::Unpinned).await;
         tokio::time::advance(STALL_ERROR_AFTER * 2).await;
 
         assert!(data.should_report_stall(STALL_ERROR_AFTER));
@@ -342,11 +520,11 @@ mod locked_send_data_tests {
     /// operation as taking a mutable view of it, so progress cannot be made without recording it.
     #[tokio::test(start_paused = true)]
     async fn touching_the_transfer_clears_the_stall() {
-        let mut data = slot().await;
+        let mut data = slot(ContactPin::Unpinned).await;
         tokio::time::advance(STALL_ERROR_AFTER * 2).await;
         assert!(data.should_report_stall(STALL_ERROR_AFTER));
 
-        assert!(data.unlock_mut(&None).is_some());
+        assert!(data.advance_for(&None).is_some());
         assert!(data.stalled_for() < STALL_ERROR_AFTER);
         assert!(!data.should_report_stall(STALL_ERROR_AFTER));
 
@@ -356,17 +534,82 @@ mod locked_send_data_tests {
     }
 
     /// A peer that keeps failing the contact check makes no progress, so it must still be visible
-    /// as stalled — `unlock_mut` returning `None` is not an advance.
+    /// as stalled — `advance_for` returning `None` is not an advance.
     #[tokio::test(start_paused = true)]
-    async fn a_refused_unlock_is_not_progress() {
-        let mut data = slot().await;
-        data.must_verify_contact_id = true;
+    async fn a_refused_advance_is_not_progress() {
+        let mut data = slot(ContactPin::Pinned).await;
 
         tokio::time::advance(STALL_ERROR_AFTER * 2).await;
-        assert!(
-            data.unlock_mut(&Some(ContactId("impostor".into())))
-                .is_none()
-        );
+        assert!(data.advance_for(&Some(ContactId::for_test(119))).is_none());
         assert!(data.should_report_stall(STALL_ERROR_AFTER));
+    }
+}
+
+#[cfg(test)]
+mod send_manager_tests {
+    use super::*;
+    use crate::CHUNK_SIZE;
+    use crate::constants::SOURCE_FILE_TIMESTAMP_CHECK_INTERVAL;
+    use std::io::Write;
+
+    async fn open(path: &std::path::Path) -> Source {
+        Source::open(
+            tokio::fs::File::open(path)
+                .await
+                .expect("the temp file to be openable"),
+        )
+        .await
+        .expect("the temp file to be inspectable")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_source_that_grows_while_sending_is_reported() {
+        let mut source = tempfile::NamedTempFile::new().expect("a temp file to be creatable");
+        source
+            .write_all(&vec![7u8; CHUNK_SIZE])
+            .expect("the temp file to be writable");
+        let mut manager =
+            SendManager::<usize>::new(FylesId("transfer".into()), open(source.path()).await);
+
+        source
+            .write_all(b"more")
+            .expect("the temp file to be writable");
+        tokio::time::advance(SOURCE_FILE_TIMESTAMP_CHECK_INTERVAL).await;
+
+        let res = manager.send_next_chunk(async |_| Ok(0)).await;
+        assert!(matches!(res, SendRes::SourceChanged));
+    }
+
+    #[tokio::test]
+    async fn chunks_carry_contiguous_offsets_from_the_resume_point() {
+        let size = 2 * CHUNK_SIZE + 10;
+        let mut source = tempfile::NamedTempFile::new().expect("a temp file to be creatable");
+        source
+            .write_all(&vec![7u8; size])
+            .expect("the temp file to be writable");
+        let mut manager =
+            SendManager::<usize>::new(FylesId("transfer".into()), open(source.path()).await);
+        manager.resume_at(5);
+
+        let mut sent = Vec::new();
+        for id in 0.. {
+            let mut chunk_seen = None;
+            let res = manager
+                .send_next_chunk(async |chunk| {
+                    chunk_seen = Some((chunk.offset, chunk.data.len()));
+                    Ok(id)
+                })
+                .await;
+            let SendRes::Sent(_) = res else {
+                break;
+            };
+            sent.push(chunk_seen.expect("the chunk to be handed to send"));
+        }
+
+        let chunk = CHUNK_SIZE as u64;
+        assert_eq!(
+            sent,
+            [(5, CHUNK_SIZE), (5 + chunk, CHUNK_SIZE), (5 + 2 * chunk, 5)]
+        );
     }
 }

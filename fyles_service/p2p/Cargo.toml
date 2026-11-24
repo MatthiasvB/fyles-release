@@ -9,6 +9,10 @@ license.workspace = true
 # nothing in the code _or the runtime_ will let you know that this is required, but without
 # the "rsa" feature you will be unable to find nodes via the DHT (and possibly other problems!)
 libp2p = { workspace = true, features = ["autonat", "cbor", "dcutr", "dns", "ed25519", "identify", "kad", "macros", "mdns", "noise", "quic", "relay", "request-response", "rsa", "tcp", "tokio", "yamux"] }
+libp2p-stream = { workspace = true }
+asynchronous-codec = { workspace = true }
+bytes = { workspace = true }
+serde_bytes = { workspace = true }
 fyles-core = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
@@ -17,33 +21,30 @@ tracing = { workspace = true }
 rand.workspace = true
 rand_core.workspace = true
 crypto = { workspace = true }
-ml-dsa = { workspace = true }
-ml-kem = { workspace = true }
 bincode = { workspace = true }
-x25519-dalek = { workspace = true, features = ["serde"] }
-ed25519-dalek = { workspace = true, features = ["serde"] }
 thiserror = { workspace = true }
 tap = { workspace = true }
-chacha20poly1305 = { workspace = true }
-hkdf = { workspace = true }
 zeroize = { workspace = true }
-sha2 = { workspace = true }
-uuid = { workspace = true, features = ["v4"] }
+uuid = { workspace = true, features = ["serde", "v4"] }
 itertools = { workspace = true }
 futures = { workspace = true }
-test-log = { workspace = true, features = ["trace"] }
 tempfile = { workspace = true }
 bs58.workspace = true
 derive_more = { workspace = true, features = ["deref"] }
 tokio-util = { workspace = true, features = ["rt", "time"] }
 log = { workspace = true }
 hashbrown = { workspace = true }
+erased-serde = { workspace = true, optional = true }
+serde_derive = { workspace = true, optional = true }
 
 [dev-dependencies]
+test-log = { workspace = true, features = ["trace"] }
 libp2p-swarm-test = { workspace = true, features = ["tokio"] }
 tempfile = { workspace = true }
 fyles-core = { workspace = true, features = ["test-support"] }
 crypto = { workspace = true, features = ["test-support"] }
+tokio-util = { workspace = true, features = ["compat"] }
 
 [features]
 test-support = []
+debug-server = ["fyles-core/debug-server", "erased-serde", "serde_derive" ]

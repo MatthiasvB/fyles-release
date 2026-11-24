@@ -1,38 +1,42 @@
 use std::collections::HashMap;
 
 use crypto::ContactKeys;
-use tap::Pipe;
 use tracing::{Instrument, Span, debug, error, info, instrument, trace, warn};
 
-use crate::core::brain::GigaBrain;
+use crate::core::backup::RestoreOutcome;
 use crate::core::brain::action::BrainAction;
 use crate::core::brain::action_p2p::NodeInfo;
 #[cfg(any(test, feature = "test-support"))]
 use crate::core::brain::action_test::TestAction;
-use crate::core::brain::stale_cleanup;
 use crate::core::brain::types::CreationResult;
-use crate::core::brain::types::{ContactShareChallenge, SelfContactInviteChallenge};
+use crate::core::brain::types::{
+    ContactRegistration, ContactShareChallenge, SelfContactInviteChallenge, SignedContactShare,
+};
+use crate::core::brain::{GenerationEnd, GigaBrain};
 use crate::core::db::DbError;
 use crate::core::domain_models::{
-    ContactId, FilerequestLocation, FylesId, InProgressSendStatus, PeerIdWrapper, ReceiveStatus,
-    ReceivedFile, SelfContact, SelfContactInvite, SendStatus,
+    Contact, DisplayContact, FilerequestLocation, FylesId, InProgressSendStatus, PeerIdWrapper,
+    ReceiveStatus, ReceivedFile, SelfContact, SelfContactInvite, SendStatus, Unwithdrawable,
 };
 use crate::core::filerequest_drive_handler::{FilerequestDriveHandler, RenameFilerequestError};
+use crate::core::license;
 use crate::core::notification::{FileSender, Notification};
 use crate::core::p2p::FileToSend;
 use crate::core::sync::LocalDocWrite;
 use crate::io_controller::{FileNamespace, OwnershipOutcome};
 use crate::library::util::error_handling::AutoMapError;
+use crate::library::util::part_file::get_part_file_name;
 use crate::library::util::util::{TimeoutLock, generate_byte_challenge};
 use crate::library::wire::api::ServerMessage;
 
 use super::action_client::ClientAction;
 use super::action_p2p::{NetworkNodeAction, PubkeyFetchReceiveRequest, SyncReceiveRequest};
+use super::action_plugin::PluginAction;
 use super::error::FilerequestError;
 use super::types::FilerequestResult;
 use crate::core::sync::{
     self, DocKind, SyncId, add_or_update_owned_device, is_owned_device, list_owned_devices,
-    remove_owned_device, sync_doc_err,
+    remove_owned_device,
 };
 
 pub(crate) struct SyncMessage {
@@ -76,6 +80,7 @@ impl GigaBrain {
         match action {
             BrainAction::Client(action) => self.handle_client_action(action).await,
             BrainAction::NetworkNode(action) => self.handle_p2p_action(action).await,
+            BrainAction::Plugin(action) => self.handle_plugin_action(action).await,
             #[cfg(any(test, feature = "test-support"))]
             BrainAction::Test(action) => match action {
                 TestAction::RegisterActionInterceptor(request) => {
@@ -90,6 +95,36 @@ impl GigaBrain {
                     }
                 }
             },
+            #[cfg(feature = "debug-server")]
+            BrainAction::DebugServer(action) => self.handle_debug_server_action(action).await,
+        }
+    }
+
+    #[instrument(skip_all)]
+    async fn handle_plugin_action(&self, action: PluginAction) {
+        match action {
+            PluginAction::LoadSettings(request) => {
+                let result = self.db.get_settings().await.auto_map_err();
+                if let Err(e) = &result {
+                    error!("Failed to read settings for the plugin: {e}");
+                }
+                if let Some(sender) = request.response_sender.timeout_lock().await.take() {
+                    let _ = sender.send(result);
+                }
+            }
+            PluginAction::StoreSettings(request) => {
+                let result = self.db.store_settings(request.request).await.auto_map_err();
+                if let Err(e) = &result {
+                    error!("Failed to persist settings: {e}");
+                }
+                if let Some(sender) = request.response_sender.timeout_lock().await.take() {
+                    let _ = sender.send(result);
+                }
+            }
+            PluginAction::RestartNetwork(config) => self.restart_network(config).await,
+            PluginAction::PushSettingsView(view) => {
+                self.push_settings(view).await;
+            }
         }
     }
 
@@ -150,6 +185,12 @@ impl GigaBrain {
                     Err(e) => Err(FilerequestError::HostError { source: e }),
                 };
 
+                if reply.is_ok() {
+                    match self.db.get_filerequest(&id).await {
+                        Ok(created) => self.push_filerequest_upserted(&created).await,
+                        Err(e) => error!("Failed to load created filerequest {id} to push: {e:?}"),
+                    }
+                }
                 if let Some(sender) = create_filerequest
                     .response_sender
                     .timeout_lock()
@@ -218,6 +259,10 @@ impl GigaBrain {
                     .update_filerequest(&update_filerequest.request)
                     .await
                     .auto_map_err();
+                if result.is_ok() {
+                    self.push_filerequest_upserted(&update_filerequest.request)
+                        .await;
+                }
                 if let Some(sender) = update_filerequest
                     .response_sender
                     .timeout_lock()
@@ -255,6 +300,10 @@ impl GigaBrain {
                     // No such row: deleting it is a no-op success.
                     Err(_) => Ok(()),
                 };
+                if result.is_ok() {
+                    self.push_filerequest_removed(&delete_filerequest.request)
+                        .await;
+                }
                 if let Some(sender) = delete_filerequest
                     .response_sender
                     .timeout_lock()
@@ -332,7 +381,7 @@ impl GigaBrain {
                 let result = self.db.update_contact(&update_contact.request).await;
                 match result {
                     Ok(write) => {
-                        self.announce(write);
+                        self.commit_local_write(write).await;
                         if let Some(sender) =
                             update_contact.response_sender.timeout_lock().await.take()
                         {
@@ -351,7 +400,7 @@ impl GigaBrain {
             ClientAction::DeleteContact(delete_contact) => {
                 match self.db.delete_contact(&delete_contact.request).await {
                     Ok(write) => {
-                        self.announce(write);
+                        self.commit_local_write(write).await;
                         if let Some(sender) =
                             delete_contact.response_sender.timeout_lock().await.take()
                         {
@@ -372,7 +421,7 @@ impl GigaBrain {
                 if let Some(sender) = request.response_sender.timeout_lock().await.take() {
                     let _ = sender.send(Ok(true));
                 }
-                self.shutdown_workloads().await;
+                self.end_generation(GenerationEnd::Stop);
             }
             ClientAction::ClientHeartbeat { foreground } => {
                 self.observe_client_heartbeat(foreground).await;
@@ -392,7 +441,7 @@ impl GigaBrain {
             ClientAction::CreateRemoteFilerequest(req) => {
                 match self.db.create_remote_filerequest(&req.request).await {
                     Ok((id, write)) => {
-                        self.announce(write);
+                        self.commit_local_write(write).await;
                         if let Some(sender) = req.response_sender.timeout_lock().await.take() {
                             let _ = sender.send(Ok(id));
                         }
@@ -458,7 +507,7 @@ impl GigaBrain {
                         );
                         match self.db.delete_remote_filerequest(&req.request).await {
                             Ok(write) => {
-                                self.announce(write);
+                                self.commit_local_write(write).await;
                                 Ok(true)
                             }
                             Err(e) => Err(e).auto_map_err(),
@@ -476,7 +525,7 @@ impl GigaBrain {
                     .await
                 {
                     Ok(write) => {
-                        self.announce(write);
+                        self.commit_local_write(write).await;
                         if let Some(sender) = req.response_sender.timeout_lock().await.take() {
                             let _ = sender.send(Ok(()));
                         }
@@ -503,7 +552,7 @@ impl GigaBrain {
                         if let Some(sender) = req.response_sender.timeout_lock().await.take() {
                             let _ = sender.send(Err(FilerequestError::InputError(format!(
                                 "No filerequest known with id {}",
-                                &req.request.target_filerequest_id
+                                req.request.target_filerequest_id
                             ))));
                         }
                         return;
@@ -521,6 +570,23 @@ impl GigaBrain {
                 debug!("Created pending files with IDs {pending_file_id_res:?}");
 
                 if let Ok(pending_file_ids) = pending_file_id_res.as_ref() {
+                    // Before handing the files to the network: a status delta for a row the
+                    // clients have not been told about yet has nowhere to land.
+                    match self
+                        .db
+                        .get_pending_files(&req.request.target_filerequest_id)
+                        .await
+                    {
+                        Ok(existing) => {
+                            let added = existing
+                                .into_iter()
+                                .filter(|file| pending_file_ids.contains(&file.id))
+                                .collect();
+                            self.push_pending_files_added(added).await;
+                        }
+                        Err(e) => error!("Failed to load created pending files to push: {e:?}"),
+                    }
+
                     let file_paths = req.request.file_infos.clone();
                     let db_ids_and_file_paths = pending_file_ids.iter().zip(file_paths.iter());
                     // let peer = db.get_peer(&peer_id).await.expect("Peer to be found");
@@ -597,6 +663,11 @@ impl GigaBrain {
                                     .delete_pending_file(&req.request)
                                     .await
                                     .auto_map_err();
+                                self.push_pending_file_removed(
+                                    &req.request,
+                                    &pending_file.target_filerequest_id,
+                                )
+                                .await;
                                 if let Some(sender) =
                                     req.response_sender.timeout_lock().await.take()
                                 {
@@ -612,6 +683,11 @@ impl GigaBrain {
                                 .auto_map_err();
                                 // We'll delete it anyway but report the error
                                 let _ = self.db.delete_pending_file(&req.request).await;
+                                self.push_pending_file_removed(
+                                    &req.request,
+                                    &pending_file.target_filerequest_id,
+                                )
+                                .await;
 
                                 if let Some(sender) =
                                     req.response_sender.timeout_lock().await.take()
@@ -640,6 +716,11 @@ impl GigaBrain {
                             .delete_pending_file(&req.request)
                             .await
                             .auto_map_err();
+                        self.push_pending_file_removed(
+                            &req.request,
+                            &pending_file.target_filerequest_id,
+                        )
+                        .await;
                         if let Some(sender) = req.response_sender.timeout_lock().await.take() {
                             let _ = sender.send(result);
                         }
@@ -689,8 +770,11 @@ impl GigaBrain {
                     .delete_received_file(&req.request)
                     .await
                     .auto_map_err();
+                if let Ok(filerequest_id) = result.as_ref() {
+                    self.push_received_files(&filerequest_id.0).await;
+                }
                 if let Some(sender) = req.response_sender.timeout_lock().await.take() {
-                    let _ = sender.send(result);
+                    let _ = sender.send(result.map(|_| ()));
                 }
             }
             ClientAction::ResolveFilerequestLocation(req) => {
@@ -726,9 +810,12 @@ impl GigaBrain {
             ClientAction::UpdateSelfContactName(req) => {
                 let result = self
                     .db
-                    .update_self_contact_name(req.request)
+                    .update_self_contact_name(req.request.into())
                     .await
                     .auto_map_err();
+                if result.is_ok() {
+                    self.push_self_contact().await;
+                }
                 if let Some(sender) = req.response_sender.timeout_lock().await.take() {
                     let _ = sender.send(result);
                 }
@@ -777,6 +864,12 @@ impl GigaBrain {
                     .adopt_shared_identity(contact, inviter_peer_id, Some(inviter_device_name))
                     .await
                     .auto_map_err();
+                if result.is_ok() {
+                    self.push_self_contact().await;
+                    // The license is bound to the identity's keys; a changed identity must
+                    // re-evaluate immediately rather than ride a cached certificate.
+                    license::push_entitlements(&self.db, &self.client_push_sender).await;
+                }
                 if let Some(sender) = brain_request.response_sender.timeout_lock().await.take() {
                     let _ = sender.send(result);
                 }
@@ -788,36 +881,26 @@ impl GigaBrain {
                 }
             }
             ClientAction::SharePublicSelfContact(brain_request) => {
-                let result = self
-                    .db
-                    .get_sharable_public_self_contact()
-                    .await
-                    .auto_map_err();
+                let result = self.signed_self_contact_share().await;
                 if let Some(sender) = brain_request.response_sender.timeout_lock().await.take() {
                     let _ = sender.send(result);
                 }
             }
             ClientAction::RegisterContact(brain_request) => {
-                match self
-                    .db
-                    .update_contact_projection(brain_request.request)
-                    .await
-                {
-                    Ok(write) => {
-                        self.announce(write);
-                        if let Some(sender) =
-                            brain_request.response_sender.timeout_lock().await.take()
-                        {
-                            let _ = sender.send(Ok(()));
-                        }
-                    }
-                    Err(e) => {
-                        if let Some(sender) =
-                            brain_request.response_sender.timeout_lock().await.take()
-                        {
-                            let _ = sender.send(Err(e).auto_map_err());
-                        }
-                    }
+                let result = self.register_contact(brain_request.request).await;
+                if let Some(sender) = brain_request.response_sender.timeout_lock().await.take() {
+                    let _ = sender.send(result);
+                }
+            }
+            ClientAction::DecodeSignedContact(brain_request) => {
+                let decoded = brain_request
+                    .request
+                    .verify()
+                    .inspect_err(|error| warn!(%error, "Refusing to decode a contact share"))
+                    .ok()
+                    .map(DisplayContact::from);
+                if let Some(sender) = brain_request.response_sender.timeout_lock().await.take() {
+                    let _ = sender.send(decoded);
                 }
             }
             ClientAction::RegisterSelfContactInviteChallenge(brain_request) => {
@@ -853,7 +936,7 @@ impl GigaBrain {
                 }
             }
             ClientAction::RenameThisDevice(brain_request) => {
-                let name = brain_request.request;
+                let name = brain_request.request.into();
                 // We may only rename our *own* device entry; resolve our own peer id.
                 let result: FilerequestResult<LocalDocWrite> = async {
                     let info = self.network.read().await.get_node_info().await?;
@@ -862,7 +945,7 @@ impl GigaBrain {
                 .await;
                 match result {
                     Ok(write) => {
-                        self.announce(write);
+                        self.commit_local_write(write).await;
                         if let Some(sender) =
                             brain_request.response_sender.timeout_lock().await.take()
                         {
@@ -881,7 +964,7 @@ impl GigaBrain {
             ClientAction::RemoveOwnedDevice(brain_request) => {
                 match remove_owned_device(self.db.as_ref(), &brain_request.request).await {
                     Ok(write) => {
-                        self.announce(write);
+                        self.commit_local_write(write).await;
                         if let Some(sender) =
                             brain_request.response_sender.timeout_lock().await.take()
                         {
@@ -936,216 +1019,207 @@ impl GigaBrain {
                 }
             }
             ClientAction::BackupData(request) => {
-                let backup_dir = match self.host_controller.get_path_to_db_backup_file().await {
-                    Ok(path) => path,
-                    Err(e) => {
-                        error!("Could not obtain backup drop location from host: {e:?}");
-                        if let Some(sender) = request.response_sender.timeout_lock().await.take() {
-                            let _ = sender.send(Err(FilerequestError::HostError { source: e }));
-                        }
-                        return;
-                    }
-                };
-
-                match self
-                    .db
-                    .backup_database(backup_dir, self.internal_data_dir.clone())
-                    .await
-                {
-                    Err(e) => {
-                        error!("Error during database backup: {e:?}");
-                        if let Some(sender) = request.response_sender.timeout_lock().await.take() {
-                            let _ = sender.send(Err(e.into()));
-                        }
-                        return;
-                    }
-                    Ok(()) => {
-                        if let Some(sender) = request.response_sender.timeout_lock().await.take() {
-                            let _ = sender.send(Ok(()));
-                        }
-                    }
-                };
-            }
-            ClientAction::RestoreData(request) => {
-                let backup_path = request.request;
-                let backup_file = match self
-                    .host_controller
-                    .access_file_for_reading(backup_path)
-                    .await
-                {
-                    Err(e) => {
-                        error!("Could not access backup file for reading: {e:?}");
-                        if let Some(sender) = request.response_sender.timeout_lock().await.take() {
-                            let _ = sender.send(Err(FilerequestError::HostError { source: e }));
-                        }
-                        return;
-                    }
-                    Ok(f) => f,
-                };
-                match self.db.restore_database(backup_file.file).await {
-                    Err(e) => {
-                        error!("Error during database restore: {e:?}");
-                        if let Some(sender) = request.response_sender.timeout_lock().await.take() {
-                            let _ = sender.send(Err(e.into()));
-                        }
-                    }
-                    Ok(()) => {
-                        if let Some(sender) = request.response_sender.timeout_lock().await.take() {
-                            let _ = sender.send(Ok(()));
-                        }
-                        // The restored DB may reference directories that don't
-                        // exist (or aren't claimed) on this device — re-establish
-                        // ownership idempotently.
-                        stale_cleanup::reconcile_filerequest_dirs(
-                            self.db.clone(),
-                            self.host_controller.clone(),
-                        )
-                        .await;
-                        self.client_push_sender
-                            .send(ServerMessage::database_restored())
-                            .await
-                            .expect("Sending to work");
-                    }
-                };
-            }
-            ClientAction::Settings(request) => {
-                // Opaque relay: forward the serialized request to the network node and
-                // return its serialized response. The network node interprets the bytes
-                // and owns any persistence (via NetworkNodeAction::PersistSettings).
-                let result = self
-                    .network
-                    .read()
-                    .await
-                    .process_settings_request(&request.request)
-                    .await
-                    .auto_map_err();
+                let result = self.backup_data().await;
+                if let Err(e) = &result {
+                    error!("Backup failed: {e:?}");
+                }
                 if let Some(sender) = request.response_sender.timeout_lock().await.take() {
                     let _ = sender.send(result);
+                }
+            }
+            ClientAction::RestoreData(request) => {
+                let result = self.restore_data(request.request).await;
+                if let Err(e) = &result {
+                    error!("Restore failed: {e:?}");
+                }
+                let sender = request.response_sender.timeout_lock().await.take();
+                if let Ok(RestoreOutcome::Restored(_)) = result {
+                    // Everything that read the old database once is rebuilt by the next
+                    // generation, and its clients reconnect and reload.
+                    self.end_generation(GenerationEnd::Restart);
+                }
+                if let Some(sender) = sender {
+                    let _ = sender.send(result);
+                }
+            }
+            ClientAction::GetBackupPasswordStatus(request) => {
+                let result = self.backup_password_status().await;
+                if let Some(sender) = request.response_sender.timeout_lock().await.take() {
+                    let _ = sender.send(result);
+                }
+            }
+            ClientAction::SetBackupPassword(request) => {
+                let result = self.set_backup_password(request.request).await;
+                if let Some(sender) = request.response_sender.timeout_lock().await.take() {
+                    let _ = sender.send(result);
+                }
+            }
+            ClientAction::VerifyBackupPassword(request) => {
+                let result = self.verify_backup_password(request.request).await;
+                if let Some(sender) = request.response_sender.timeout_lock().await.take() {
+                    let _ = sender.send(result);
+                }
+            }
+            ClientAction::SnoozeBackupPasswordVerification(request) => {
+                let result = self.snooze_backup_password_verification().await;
+                if let Some(sender) = request.response_sender.timeout_lock().await.take() {
+                    let _ = sender.send(result);
+                }
+            }
+            ClientAction::GetSettings(request) => {
+                let result = self.plugin.read().await.handle_settings_query().await;
+                if let Some(sender) = request.response_sender.timeout_lock().await.take() {
+                    let _ = sender.send(result);
+                }
+            }
+            ClientAction::MutateSettings(request) => {
+                // Opaque relay: the plugin interprets the bytes, owns persistence, and decides
+                // whether the network node has to be rebuilt.
+                let result = self
+                    .plugin
+                    .write()
+                    .await
+                    .handle_settings_mutation(request.request)
+                    .await;
+                if let Ok(view) = result.as_ref() {
+                    self.push_settings(view.clone()).await;
+                }
+                if let Some(sender) = request.response_sender.timeout_lock().await.take() {
+                    let _ = sender.send(result);
+                }
+            }
+            ClientAction::GetListenStatus(request) => {
+                let status = self.listen_status().await;
+                if let Some(sender) = request.response_sender.timeout_lock().await.take() {
+                    let _ = sender.send(status);
+                }
+            }
+            ClientAction::SetListenPort(request) => {
+                let result = self.set_listen_port(request.request).await;
+                if let Err(e) = &result {
+                    error!("Failed to keep the configured listen port: {e}");
+                }
+                if let Some(sender) = request.response_sender.timeout_lock().await.take() {
+                    let _ = sender.send(result);
+                }
+            }
+            ClientAction::GetEntitlements(brain_request) => {
+                let entitlements = license::current_entitlements(&self.db).await;
+                if let Some(sender) = brain_request.response_sender.timeout_lock().await.take() {
+                    let _ = sender.send(Ok(entitlements));
+                }
+            }
+            ClientAction::GetLicenseIdentity(brain_request) => {
+                let result = license::export_identity(&self.db)
+                    .await
+                    .map_err(FilerequestError::DatabaseError);
+                if let Some(sender) = brain_request.response_sender.timeout_lock().await.take() {
+                    let _ = sender.send(result);
+                }
+            }
+            ClientAction::PrepareLicenseCheck(brain_request) => {
+                let force = brain_request.request;
+                let prepared = license::prepare_check(&self.db, force).await;
+                if let Some(sender) = brain_request.response_sender.timeout_lock().await.take() {
+                    let _ = sender.send(Ok(prepared));
+                }
+            }
+            ClientAction::SubmitLicenseCheckResponse(brain_request) => {
+                let (http_status, body) = brain_request.request;
+                let entitlements = license::submit_response(
+                    &self.db,
+                    &self.client_push_sender,
+                    http_status,
+                    &body,
+                )
+                .await;
+                if let Some(sender) = brain_request.response_sender.timeout_lock().await.take() {
+                    let _ = sender.send(Ok(entitlements));
                 }
             }
         }
     }
 
-    // #[instrument(skip_all, fields(action = ?action))]
     #[instrument(skip_all)]
     async fn handle_p2p_action(&self, action: NetworkNodeAction) {
         match action {
             NetworkNodeAction::RequestFileDrop(request_file_drop, span) => {
                 Span::current().follows_from(span.clone());
                 async move {
-                    match self.db
-                        .get_filerequest(&request_file_drop.request.filerequest_id)
-                        .in_current_span()
-                        .await
-                    {
+                    let request = &request_file_drop.request;
+                    let handler = match self.db.get_filerequest(&request.filerequest_id).await {
                         Ok(filerequest) => {
-                            if !filerequest.is_active {
-                                warn!("Filerequest is not active");
-                                if let Some(sender) =
-                                    request_file_drop.response_sender.timeout_lock().await.take()
-                                {
-                                    let _ = sender.send(None);
-                                }
-                            } else {
-                                let is_accessible = filerequest
-                                    .access
-                                    .is_accessible_by(request_file_drop.request.contact_id.clone()).pipe(async |is_accessible| {
-                                        if !is_accessible
-                                            && let Some(ref maybe_me) = request_file_drop.request.contact_id {
-                                                let is_me = self.db.get_self_contact().await.ok().map(|sc| sc.id == *maybe_me).unwrap_or(false);
-                                                if is_me {
-                                                    trace!("Filerequest is accessible because contact is self");
-                                                    return true;
-                                                }
-                                            }
-                                        is_accessible
-                                    }).await;
-                                if !is_accessible {
-                                    warn!(
-                                        "RequestFileDrop is not accessible by: {:?}",
-                                        request_file_drop.request.contact_id
-                                    );
-                                }
-                                if let Some(sender) =
-                                    request_file_drop.response_sender.timeout_lock().await.take()
-                                {
-                                    let handler = is_accessible.then(|| {
-                                        FilerequestDriveHandler::new(
-                                            self.host_controller.clone(),
-                                            filerequest,
-                                        )
-                                    });
-                                    let _ = sender.send(handler);
-                                };
-                            };
-                        }
-                        Err(_) => {
-                            error!(
-                                "Filerequest {} not found",
-                                request_file_drop.request.filerequest_id
-                            );
-                            if let Some(sender) =
-                                request_file_drop.response_sender.timeout_lock().await.take()
+                            match filerequest
+                                .admits_sender(&request.contact_id, async || {
+                                    self.db.get_self_contact_id().await.ok()
+                                })
+                                .await
                             {
-                                let _ = sender.send(None);
+                                Ok(()) => Some(FilerequestDriveHandler::new(
+                                    self.host_controller.clone(),
+                                    filerequest,
+                                )),
+                                Err(refusal) => {
+                                    warn!(?refusal, contact_id = ?request.contact_id, "Refusing a file drop");
+                                    None
+                                }
                             }
                         }
+                        Err(_) => {
+                            error!("Filerequest {} not found", request.filerequest_id);
+                            None
+                        }
+                    };
+                    if let Some(sender) =
+                        request_file_drop.response_sender.timeout_lock().await.take()
+                    {
+                        let _ = sender.send(handler);
                     }
                 }
                 .instrument(span)
                 .await;
             }
             NetworkNodeAction::RequestFileTransferContinuation(request) => {
-                let transfer_id = &request.request.transfer_id;
+                let continuation = &request.request;
+                let transfer_id = &continuation.transfer_id;
                 // Look up the persisted received file to recover file_name and file_size_bytes
                 let received_file = self.db.get_received_file_by_transfer_id(transfer_id).await;
-                let filerequest_result = self
-                    .db
-                    .get_filerequest(&request.request.filerequest_id)
-                    .await;
+                let filerequest_result =
+                    self.db.get_filerequest(&continuation.filerequest_id).await;
                 let response = match (filerequest_result, received_file) {
-                    (Ok(filerequest), Ok(rf)) => {
-                        if !filerequest.is_active {
-                            warn!("Filerequest is not active for transfer continuation");
-                            None
-                        } else if !filerequest
-                            .access
-                            .is_accessible_by(request.request.contact_id.clone())
-                        {
-                            warn!(
-                                "Transfer continuation not accessible by: {:?}",
-                                request.request.contact_id
-                            );
-                            None
-                        } else if rf.peer_id != request.request.peer_id {
-                            warn!(
-                                "Peer {} tried to continue transfer owned by peer {}",
-                                request.request.peer_id, rf.peer_id
-                            );
-                            None
-                        } else if rf.contact_id != request.request.contact_id {
-                            warn!(
-                                "Peer {} tried to continue transfer with mismatched contact_id (expected {:?}, got {:?})",
-                                request.request.peer_id, rf.contact_id, request.request.contact_id
-                            );
-                            None
-                        } else {
-                            let handler = FilerequestDriveHandler::new(
+                    (Ok(filerequest), Ok(rf)) => match (
+                        filerequest
+                            .admits_sender(&continuation.contact_id, async || {
+                                self.db.get_self_contact_id().await.ok()
+                            })
+                            .await,
+                        rf.continuable_by(&continuation.peer_id, &continuation.contact_id),
+                    ) {
+                        (Ok(()), Ok(())) => Some(super::action_p2p::FilerequestContinueResponse {
+                            drive_handler: FilerequestDriveHandler::new(
                                 self.host_controller.clone(),
                                 filerequest,
+                            ),
+                            file_name: rf.file_name,
+                            file_size_bytes: rf.file_size_bytes,
+                            started_at_ms: rf.started_at_ms,
+                        }),
+                        (sender, owner) => {
+                            warn!(
+                                ?transfer_id,
+                                peer_id = continuation.peer_id,
+                                contact_id = ?continuation.contact_id,
+                                ?sender,
+                                ?owner,
+                                "Refusing to continue an incoming transfer"
                             );
-                            Some(super::action_p2p::FilerequestContinueResponse {
-                                drive_handler: handler,
-                                file_name: rf.file_name,
-                                file_size_bytes: rf.file_size_bytes,
-                                started_at_ms: rf.started_at_ms,
-                            })
+                            None
                         }
-                    }
+                    },
                     (Err(e), _) => {
                         error!(
                             "Filerequest {} not found for transfer continuation: {e:?}",
-                            request.request.filerequest_id
+                            continuation.filerequest_id
                         );
                         None
                     }
@@ -1162,15 +1236,12 @@ impl GigaBrain {
             }
             NetworkNodeAction::GetNodeInfo(request) => {
                 let result = self.db.get_node_keys().await;
-                let persisted_settings = self.db.get_settings().await.unwrap_or_else(|e| {
-                    warn!("Failed to read persisted settings during GetNodeInfo: {e}");
-                    Vec::new()
-                });
+                let node_config = self.plugin.read().await.node_config().await;
 
                 match result {
                     Ok(node_info) => {
                         if let Some(sender) = request.response_sender.timeout_lock().await.take() {
-                            let _ = sender.send(Ok((node_info, persisted_settings)));
+                            let _ = sender.send(Ok((node_info, node_config)));
                         }
                     }
                     Err(db_err) => match db_err {
@@ -1182,24 +1253,23 @@ impl GigaBrain {
                                     .await
                                     .generate_keypair()
                                     .expect("Key generation failed. Cancel execution."),
-                                self_contact_id: ContactId::new(),
                                 self_contact_keys: ContactKeys::new(),
                             };
                             self.db.store_node_keys(node_info.clone()).await.expect("Storing node keys failed. This is essential for operation. Aborting.");
                             if let Some(sender) =
                                 request.response_sender.timeout_lock().await.take()
                             {
-                                let _ = sender.send(Ok((node_info, persisted_settings)));
+                                let _ = sender.send(Ok((node_info, node_config)));
                             }
                         }
                         DbError::SigningKeysMissing => {
-                            // The node keypair (PeerId) and contact id exist but the signing keys
-                            // are absent; regenerate them in place, keeping the other identity parts.
-                            let (node_key_pair, self_contact_id) = self
+                            // Fresh signing keys are a fresh contact id, so every contact has to
+                            // re-pair.
+                            let node_key_pair = self
                                 .db
-                                .get_node_and_self_contact_id()
+                                .get_node_keypair()
                                 .await
-                                .expect("Node keypair and contact id must be readable when signing keys are missing. Aborting.");
+                                .expect("Node keypair must be readable when signing keys are missing. Aborting.");
                             let self_contact_keys = ContactKeys::new();
                             self.db
                                 .store_signing_keys(self_contact_keys.clone())
@@ -1207,13 +1277,12 @@ impl GigaBrain {
                                 .expect("Storing regenerated signing keys failed. This is essential for operation. Aborting.");
                             let node_info = NodeInfo {
                                 node_key_pair,
-                                self_contact_id,
                                 self_contact_keys,
                             };
                             if let Some(sender) =
                                 request.response_sender.timeout_lock().await.take()
                             {
-                                let _ = sender.send(Ok((node_info, persisted_settings)));
+                                let _ = sender.send(Ok((node_info, node_config)));
                             }
                         }
                         e => {
@@ -1224,23 +1293,15 @@ impl GigaBrain {
                     },
                 };
             }
-            NetworkNodeAction::PersistSettings(request) => {
-                // Store-only: the network node owns settings persistence and asks us to
-                // durably store an opaque blob. Awaitable so the network node knows the
-                // write landed before reporting success.
-                let result = self
-                    .db
-                    .store_settings(request.request.clone())
-                    .await
-                    .auto_map_err();
-                if let Err(e) = &result {
-                    error!("Failed to persist settings: {e}");
-                }
-                if let Some(sender) = request.response_sender.timeout_lock().await.take() {
-                    let _ = sender.send(result);
-                }
-            }
             NetworkNodeAction::Ready => {
+                let brain = self.clone();
+                self.tasks.spawn(
+                    self.shutdown
+                        .clone()
+                        .run_until_cancelled_owned(async move { brain.establish_listening().await })
+                        .in_current_span(),
+                );
+
                 let remote_file_requests_list = self
                     .db
                     .get_all_remote_filerequests()
@@ -1351,6 +1412,7 @@ impl GigaBrain {
                         &pending_file_id,
                         &status,
                         &target_filerequest_id,
+                        None,
                     ))
                     .await;
                 self.try_cleanup_source_file(&pending_file_id).await;
@@ -1371,6 +1433,7 @@ impl GigaBrain {
                         &pending_file_id,
                         &status,
                         &target_filerequest_id,
+                        None,
                     ))
                     .await;
             }
@@ -1392,8 +1455,11 @@ impl GigaBrain {
                     .await
                     .expect("Pending file status to be updated");
 
-                if let Some(r) = reason {
-                    let _ = self.db.add_interruption_reason(&pending_file_id, r).await;
+                if let Some(ref r) = reason {
+                    let _ = self
+                        .db
+                        .add_interruption_reason(&pending_file_id, r.clone())
+                        .await;
                 }
 
                 let _ = self
@@ -1402,6 +1468,7 @@ impl GigaBrain {
                         &pending_file_id,
                         &status,
                         &target_filerequest_id,
+                        reason,
                     ))
                     .await;
             }
@@ -1422,6 +1489,7 @@ impl GigaBrain {
                         &pending_file_id,
                         &status,
                         &target_filerequest_id,
+                        None,
                     ))
                     .await;
                 self.try_cleanup_source_file(&pending_file_id).await;
@@ -1443,6 +1511,7 @@ impl GigaBrain {
                         &pending_file_id,
                         &status,
                         &target_filerequest_id,
+                        None,
                     ))
                     .await;
                 self.try_cleanup_source_file(&pending_file_id).await;
@@ -1461,6 +1530,7 @@ impl GigaBrain {
                         &pending_file_id,
                         &status,
                         &target_filerequest_id,
+                        None,
                     ))
                     .await;
                 self.try_cleanup_source_file(&pending_file_id).await;
@@ -1489,6 +1559,7 @@ impl GigaBrain {
                         .client_push_sender
                         .send(ServerMessage::received_file_status_changed(rf))
                         .await;
+                    self.push_received_files(&rf.filerequest_id).await;
                 }
 
                 if let Some(sender) = request.response_sender.timeout_lock().await.take() {
@@ -1501,7 +1572,7 @@ impl GigaBrain {
                 };
 
                 let self_contact_id = match self.db.get_self_contact().await {
-                    Ok(self_contact) => Some(self_contact.id),
+                    Ok(self_contact) => Some(self_contact.id()),
                     Err(e) => {
                         error!("Could not retrieve self contact: {e:?}");
                         None
@@ -1569,6 +1640,7 @@ impl GigaBrain {
                         .client_push_sender
                         .send(ServerMessage::received_file_status_changed(&rf))
                         .await;
+                    self.push_received_files(&rf.filerequest_id).await;
                 }
 
                 if let Some(sender) = request.response_sender.timeout_lock().await.take() {
@@ -1593,20 +1665,54 @@ impl GigaBrain {
                         .client_push_sender
                         .send(ServerMessage::received_file_status_changed(&rf))
                         .await;
-                }
-            }
-            NetworkNodeAction::DeleteReceivedFile { transfer_id } => {
-                // Look up by transfer_id to get the row id, then delete
-                if let Ok(rf) = self.db.get_received_file_by_transfer_id(&transfer_id).await {
-                    if let Err(e) = self.db.delete_received_file(&rf.id).await {
-                        error!("Failed to delete received file {}: {e:?}", rf.id);
+                    // Progress arrives per chunk, so only a settled transfer is worth a list read.
+                    if !matches!(status, ReceiveStatus::Receiving) {
+                        self.push_received_files(&rf.filerequest_id).await;
                     }
-                } else {
-                    error!(
-                        "Failed to find received file with transfer_id {transfer_id} for deletion"
-                    );
                 }
             }
+            NetworkNodeAction::DropIncomingTransfer {
+                transfer_id,
+                peer_id,
+                contact_id,
+            } => match self.db.get_received_file_by_transfer_id(&transfer_id).await {
+                Err(e) => debug!(?transfer_id, "No incoming transfer to drop: {e:?}"),
+                Ok(rf) => match rf.withdrawable_by(&peer_id, &contact_id) {
+                    Err(Unwithdrawable::NotOwner(not_owner)) => {
+                        warn!(
+                            ?transfer_id,
+                            %peer_id,
+                            ?not_owner,
+                            "Refusing to drop an incoming transfer of another peer or contact"
+                        );
+                    }
+                    Err(Unwithdrawable::Settled) => {
+                        debug!(?transfer_id, status = ?rf.status, "Incoming transfer already settled");
+                    }
+                    Ok(()) => {
+                        let part_file_name = get_part_file_name(
+                            rf.started_at_ms,
+                            &transfer_id.0,
+                            &peer_id,
+                            &contact_id,
+                        );
+                        if let Err(e) = self
+                            .host_controller
+                            .remove_partial_file(&part_file_name)
+                            .await
+                        {
+                            warn!(
+                                ?transfer_id,
+                                "Could not remove the withdrawn partial file: {e}"
+                            );
+                        }
+                        match self.db.delete_received_file(&rf.id).await {
+                            Ok(filerequest_id) => self.push_received_files(&filerequest_id.0).await,
+                            Err(e) => error!("Failed to delete the withdrawn transfer: {e:?}"),
+                        }
+                    }
+                },
+            },
             NetworkNodeAction::FileIoError { file, error } => {
                 error!("File IO error for file {:?}: {:?}", file, error);
                 let status = SendStatus::Failed;
@@ -1621,6 +1727,7 @@ impl GigaBrain {
                         &file,
                         &status,
                         &target_filerequest_id,
+                        None,
                     ))
                     .await;
                 self.try_cleanup_source_file(&file).await;
@@ -1641,7 +1748,7 @@ impl GigaBrain {
                         .await
                         .ok()
                         .and_then(|self_contact| {
-                            if self_contact.id == brain_request.request {
+                            if self_contact.id() == brain_request.request {
                                 Some(self_contact.keys.public)
                             } else {
                                 None
@@ -1673,24 +1780,23 @@ impl GigaBrain {
                     let _ = sender.send(keys);
                 }
             }
-            NetworkNodeAction::IsContactKnown(brain_request) => {
-                let contact_name = self.db.get_contact_name(&brain_request.request).await;
-                let is_known = match contact_name {
-                    Ok(_) => {
-                        // if we know the name, we know the contact
-                        Ok(true)
-                    }
-                    Err(DbError::NotFound { .. }) => {
-                        // We don't know that contact
-                        Ok(false)
-                    }
-                    Err(e) => {
-                        error!(?e, "Error when querying contact name");
-                        Err("Could not determine whether contact is known due to DB error".into())
-                    }
+            NetworkNodeAction::HoldsContactKeys(brain_request) => {
+                let contact_id = &brain_request.request;
+                let holds = match self.db.get_contact_public_keys(contact_id.clone()).await {
+                    Ok(Some(_)) => Ok(true),
+                    Ok(None) => self
+                        .db
+                        .get_self_contact_id()
+                        .await
+                        .map(|self_id| self_id == *contact_id),
+                    Err(e) => Err(e),
                 };
+                let holds = holds.map_err(|e| {
+                    error!(?e, "Error when looking up a contact's keys");
+                    "Could not determine whether we hold the contact's keys due to DB error".into()
+                });
                 if let Some(sender) = brain_request.response_sender.timeout_lock().await.take() {
-                    let _ = sender.send(is_known);
+                    let _ = sender.send(holds);
                 }
             }
             NetworkNodeAction::OpenFileForReading(brain_request) => {
@@ -1712,6 +1818,7 @@ impl GigaBrain {
                             &brain_request.request.id,
                             &status,
                             &target_filerequest_id,
+                            None,
                         ))
                         .await;
                     self.try_cleanup_source_file(&brain_request.request.id)
@@ -1798,33 +1905,45 @@ impl GigaBrain {
                     }
                 }
                 true => {
-                    let self_contact = self
-                        .db
-                        .get_sharable_public_self_contact()
+                    let share = self
+                        .signed_self_contact_share()
                         .await
                         .inspect_err(|e| {
-                            error!("Failed to get contact from DB: {:?}", e);
+                            error!("Failed to build a signed contact share: {:?}", e);
                         })
                         .ok();
                     if let Some(sender) = brain_request.response_sender.timeout_lock().await.take()
                     {
-                        let _ = sender.send(self_contact);
+                        let _ = sender.send(share);
                     }
                 }
             },
-            NetworkNodeAction::CreateContact(contact) => {
-                match self.db.update_contact_projection(contact).await {
-                    Ok(write) => {
-                        self.announce(write);
+            NetworkNodeAction::ContactShareReceived(share) => {
+                let verified = share
+                    .verify()
+                    .inspect_err(|error| warn!(%error, "Rejecting contact share"))
+                    .ok();
+
+                match verified {
+                    Some(contact) => match self.db.update_contact_projection(contact).await {
+                        Ok(write) => {
+                            self.commit_local_write(write).await;
+                            self.client_push_sender
+                                .send(ServerMessage::contact_share_accepted_over_network())
+                                .await
+                                .expect("Sending to work");
+                        }
+                        Err(e) => {
+                            error!("Failed to create contact in DB: {:?}", e);
+                        }
+                    },
+                    None => {
                         self.client_push_sender
-                            .send(ServerMessage::contact_share_accepted_over_network())
+                            .send(ServerMessage::contact_share_rejected())
                             .await
                             .expect("Sending to work");
                     }
-                    Err(e) => {
-                        error!("Failed to create contact in DB: {:?}", e);
-                    }
-                };
+                }
             }
             NetworkNodeAction::AnsweredContactShare => {
                 // Do nothing
@@ -1854,8 +1973,13 @@ impl GigaBrain {
                 // independently requires the session to prove it carries our contact id
                 // (i.e. the peer is one of our own devices too).
                 match is_owned_device(self.db.as_ref(), &peer_id).await {
-                    Ok(true) => self.initiate_sync(&peer_id).await,
-                    Ok(false) => {}
+                    Ok(true) => {
+                        trace!(peer=?peer_id, "Initiating sync with owned device");
+                        self.initiate_sync(&peer_id).await
+                    }
+                    Ok(false) => {
+                        trace!(peer=?peer_id, "Skipping sync - not an owned device");
+                    }
                     Err(e) => error!("Failed to check owned-device status: {e:?}"),
                 }
             }
@@ -1876,7 +2000,6 @@ impl GigaBrain {
         }
     }
 
-
     /// Adopt a shared identity (from a network invite or an out-of-band QR): switch our
     /// contact id/keys, reset the old identity's owned-device list, re-register ourselves,
     /// and initiate a sync with the inviter. When `inviter_device_name` is given, the inviter is
@@ -1892,18 +2015,16 @@ impl GigaBrain {
         self.network
             .read()
             .await
-            .update_identity(identity.id, identity.keys)
+            .update_identity(identity.id(), identity.keys)
             .await;
         // Reset the (old identity's) device list atomically so it can't race a concurrent write.
-        if let Err(e) = self
-            .db
-            .mutate_sync_doc(
-                DocKind::Devices,
-                Box::new(|_old| sync::empty_blob(DocKind::Devices).map_err(sync_doc_err)),
-            )
-            .await
-        {
-            error!("Failed to reset devices doc on identity change: {e:?}");
+        match sync::empty_blob(DocKind::Devices) {
+            Ok(blob) => {
+                if let Err(e) = self.db.save_sync_doc(DocKind::Devices, blob).await {
+                    error!("Failed to reset devices doc on identity change: {e:?}");
+                }
+            }
+            Err(e) => error!("Failed to build an empty devices doc: {e:?}"),
         }
         self.ensure_own_device_registered().await;
         if let Some(name) = inviter_device_name {
@@ -1935,6 +2056,31 @@ impl GigaBrain {
         })
     }
 
+    async fn signed_self_contact_share(&self) -> FilerequestResult<SignedContactShare> {
+        let mut me = self.db.get_self_contact().await?;
+        Ok(me.to_public().sign(&mut me.keys.private)?)
+    }
+
+    async fn register_contact(&self, registration: ContactRegistration) -> FilerequestResult<()> {
+        let ContactRegistration {
+            share,
+            user_edited_name,
+        } = registration;
+        let contact = share
+            .verify()
+            .inspect_err(|error| warn!(%error, "Rejecting scanned contact share"))
+            .map_err(|e| FilerequestError::InputError(e.to_string()))?;
+        let write = self
+            .db
+            .update_contact_projection(Contact {
+                name: user_edited_name.unwrap_or(contact.name),
+                ..contact
+            })
+            .await?;
+        self.commit_local_write(write).await;
+        Ok(())
+    }
+
     async fn try_cleanup_source_file(&self, pending_file_id: &FylesId) {
         if let Ok(pending_file) = self.db.get_pending_file(pending_file_id).await
             && let Ok(count) = self
@@ -1950,4 +2096,3 @@ impl GigaBrain {
         }
     }
 }
-

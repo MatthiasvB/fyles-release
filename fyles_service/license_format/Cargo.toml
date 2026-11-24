@@ -1,0 +1,26 @@
+[package]
+name = "license_format"
+version = "0.1.0"
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+crypto = { workspace = true }
+serde = { workspace = true }
+bincode = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+thiserror = { workspace = true }
+prost = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }
+
+[features]
+# Compiles a well-known development keypair into the trusted-key list. Must never
+# be enabled in production builds.
+dev-keys = []
+
+[dev-dependencies]
+crypto = { workspace = true, features = ["test-support"] }

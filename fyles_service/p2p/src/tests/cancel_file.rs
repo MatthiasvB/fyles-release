@@ -42,7 +42,7 @@ async fn test_cancel_file() {
         filerequest_id,
         file_path: test_file_path.to_str().unwrap().to_string(),
         retry_count: 0,
-        contact_id: ContactId("test_contact".to_string()),
+        contact_id: ContactId::for_test(57),
         status: SendStatus::Pending,
     };
 
@@ -56,26 +56,32 @@ async fn test_cancel_file() {
     // unblock thread
     tokio::time::timeout(3.seconds(), async {
         loop {
-            if let BrainAction::NetworkNode(p2p_node_action) =
+            let BrainAction::NetworkNode(p2p_node_action) =
                 harness.brain_receiver.recv().await.expect("sender dropped")
-            {
-                match p2p_node_action {
-                    NetworkNodeAction::OpenFileForReading(brain_request) => {
-                        let _ = brain_request
-                            .response_sender
-                            .timeout_lock()
-                            .await
-                            .take()
-                            .expect("no channel")
-                            .send(Ok(FileMeta {
-                                file: File::open(&test_file_path).await.unwrap(),
-                                path: test_file_path.to_str().unwrap().to_string(),
-                                file_name: "test_file.txt".to_string(),
-                            }));
-                        break;
-                    }
-                    _ => (),
-                }
+            else {
+                continue;
+            };
+            if let NetworkNodeAction::HoldsContactKeys(brain_request) = p2p_node_action {
+                let _ = brain_request
+                    .response_sender
+                    .timeout_lock()
+                    .await
+                    .take()
+                    .expect("no channel")
+                    .send(Ok(false));
+            } else if let NetworkNodeAction::OpenFileForReading(brain_request) = p2p_node_action {
+                let _ = brain_request
+                    .response_sender
+                    .timeout_lock()
+                    .await
+                    .take()
+                    .expect("no channel")
+                    .send(Ok(FileMeta {
+                        file: File::open(&test_file_path).await.unwrap(),
+                        path: test_file_path.to_str().unwrap().to_string(),
+                        file_name: "test_file.txt".to_string(),
+                    }));
+                break;
             }
         }
     })

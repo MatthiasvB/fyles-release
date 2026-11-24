@@ -2,17 +2,17 @@ use crypto::ContactKeys;
 use futures::StreamExt;
 use fyles_core::core::api_server::MockRunnableFilerequestServer;
 use fyles_core::core::brain::action_test::TestAction;
-use fyles_core::core::brain::{ActionInterceptor, BrainNetwork, GigaBrain};
+use fyles_core::core::brain::plugin::{BrainPluginRef, NoOpBrainPlugin};
+use fyles_core::core::brain::{ActionInterceptor, BrainNetwork, GenerationEnd, GigaBrain};
 use fyles_core::core::db::test::{DbRef, setup_test_db};
-use fyles_core::core::domain_models::ContactId;
-use fyles_core::core::p2p::{NetworkNode, Runnable};
+use fyles_core::core::p2p::{NetworkNode, NodeConfig, Runnable};
 use fyles_core::io_controller::HostController;
 use fyles_core::io_controller::test::TestHostController;
 use fyles_core::library::util::duration_ext::DurationExt;
 use fyles_core::library::util::util::TimeoutLock;
 use fyles_core::library::wire::api::ServerMessage;
 use libp2p::swarm::{Swarm, SwarmEvent};
-use libp2p::{PeerId, identity::Keypair};
+use libp2p::{Multiaddr, PeerId, identity::Keypair};
 use libp2p_swarm_test::SwarmExt;
 use std::{future::Future, path::PathBuf, sync::Arc, time::Duration};
 use tempfile::TempDir;
@@ -27,7 +27,7 @@ use fyles_core::core::{
         action::BrainAction,
         action_client::ClientAction,
         action_p2p::{NetworkNodeAction, NodeInfo},
-        types::BrainRequest,
+        types::{BrainRequest, SignedContactShare},
     },
     domain_models::{Contact, CreatePendingFiles, CreateRemoteFilerequest, FylesId, SendStatus},
 };
@@ -43,20 +43,53 @@ use crate::{
 };
 
 pub fn generate_random_keypair(node_key_pair: &Keypair) -> NodeInfo {
-    use crypto::ContactKeys;
-    use fyles_core::core::domain_models::ContactId;
-
-    use crate::utils::encode_keypair;
-
     NodeInfo {
         node_key_pair: encode_keypair(node_key_pair).expect("Encoding keypair to work"),
-        self_contact_id: ContactId::new(),
         self_contact_keys: ContactKeys::new(),
     }
 }
 
+async fn listen_and_wait(
+    swarm: &mut Swarm<LocalNetworkBehaviour>,
+    address: Multiaddr,
+) -> Multiaddr {
+    let listener = swarm.listen_on(address).expect("listening to work");
+    swarm
+        .wait(|event| match event {
+            SwarmEvent::NewListenAddr {
+                address,
+                listener_id,
+            } => (listener_id == listener).then_some(address),
+            _ => None,
+        })
+        .await
+}
+
+/// Replaces `SwarmExt::listen`, which panics on any event other than the address it waits for.
+/// mDNS reports devices that really are on the network, at a moment no test controls.
+async fn listen_with_memory_addr_external(swarm: &mut Swarm<LocalNetworkBehaviour>) {
+    let memory = listen_and_wait(swarm, "/memory/0".parse().expect("a valid memory address")).await;
+    listen_and_wait(
+        swarm,
+        "/ip4/127.0.0.1/tcp/0".parse().expect("a valid tcp address"),
+    )
+    .await;
+    swarm.add_external_address(memory);
+}
+
 pub fn generate_swarm_factory(
     keypair: Option<Keypair>,
+) -> (
+    TestSwarmFactory<Swarm<LocalNetworkBehaviour>>,
+    NodeInfo,
+    PeerId,
+) {
+    swarm_factory_with(keypair, LocalNetworkBehaviour::new)
+}
+
+pub fn swarm_factory_with(
+    keypair: Option<Keypair>,
+    behaviour: fn(&Keypair) -> LocalNetworkBehaviour,
 ) -> (
     TestSwarmFactory<Swarm<LocalNetworkBehaviour>>,
     NodeInfo,
@@ -68,7 +101,7 @@ pub fn generate_swarm_factory(
     let swarm_factory = Arc::new(move || {
         Ok(Swarm::new_ephemeral_tokio_with_preexisting_keypair(
             keypair.clone(),
-            |kp| LocalNetworkBehaviour::new(&kp),
+            |kp| behaviour(&kp),
         ))
     });
     (swarm_factory, node_info, peer_id)
@@ -169,8 +202,10 @@ impl IdleP2pTestHarness {
             async move || db.clone(),
             async move || out_dir_handler.clone(),
             async move || p2p_clone.clone() as BrainNetwork,
+            async || Arc::new(RwLock::new(NoOpBrainPlugin)) as BrainPluginRef,
             async || Box::new(MockRunnableFilerequestServer {}) as _,
             self.brain_receiver,
+            self.brain_sender.clone(),
             client_sender,
             shutdown,
         );
@@ -201,14 +236,14 @@ impl IdleP2pTestHarness {
     #[instrument(skip_all, level = "trace")]
     pub async fn connect(&mut self, other: &mut Self) {
         self.swarm
-            .lock()
+            .get_mut()
             .expect("locking to work")
             .as_mut()
             .expect("swarm not initialized")
             .connect(
                 other
                     .swarm
-                    .lock()
+                    .get_mut()
                     .expect("locking to work")
                     .as_mut()
                     .expect("swarm not initialized"),
@@ -219,14 +254,14 @@ impl IdleP2pTestHarness {
     #[instrument(skip_all, level = "trace")]
     pub async fn connect_brainless(&mut self, other: &mut BrainlessIdleP2pTestHarness) {
         self.swarm
-            .lock()
+            .get_mut()
             .expect("locking to work")
             .as_mut()
             .expect("swarm not initialized")
             .connect(
                 other
                     .swarm
-                    .lock()
+                    .get_mut()
                     .expect("locking to work")
                     .as_mut()
                     .expect("swarm not initialized"),
@@ -238,14 +273,14 @@ impl IdleP2pTestHarness {
     /// This is useful for testing purposes, allowing the swarm to accept connections from other peers.
     #[instrument(skip_all, level = "trace")]
     pub async fn listen_external(&mut self) {
-        self.swarm
-            .lock()
-            .expect("locking to work")
-            .as_mut()
-            .expect("swarm not initialized")
-            .listen()
-            .with_memory_addr_external()
-            .await;
+        listen_with_memory_addr_external(
+            self.swarm
+                .get_mut()
+                .expect("locking to work")
+                .as_mut()
+                .expect("swarm not initialized"),
+        )
+        .await;
     }
 }
 
@@ -337,7 +372,7 @@ impl BrainlessIdleP2pTestHarness {
         );
         wait_for_ready(&mut self.brain_receiver, self.node_info.clone()).await;
         BrainlessRunningP2pTestHarness {
-            p2p_client: p2p_client,
+            p2p_client,
             node_info: self.node_info,
             peer_id: self.peer_id,
             brain_receiver: self.brain_receiver,
@@ -352,14 +387,14 @@ impl BrainlessIdleP2pTestHarness {
     #[instrument(skip_all, level = "trace")]
     pub async fn connect(&mut self, other: &mut BrainlessIdleP2pTestHarness) {
         self.swarm
-            .lock()
+            .get_mut()
             .expect("locking to work")
             .as_mut()
             .expect("swarm not yet initialized")
             .connect(
                 other
                     .swarm
-                    .lock()
+                    .get_mut()
                     .expect("locking to work")
                     .as_mut()
                     .expect("swarm not yet initialized"),
@@ -371,14 +406,14 @@ impl BrainlessIdleP2pTestHarness {
     /// This is useful for testing purposes, allowing the swarm to accept connections from other peers.
     #[instrument(skip_all, level = "trace")]
     pub async fn listen_external(&mut self) {
-        self.swarm
-            .lock()
-            .expect("locking to work")
-            .as_mut()
-            .expect("swarm not yet initialized")
-            .listen()
-            .with_memory_addr_external()
-            .await;
+        listen_with_memory_addr_external(
+            self.swarm
+                .get_mut()
+                .expect("locking to work")
+                .as_mut()
+                .expect("swarm not yet initialized"),
+        )
+        .await;
     }
 }
 
@@ -393,7 +428,7 @@ pub struct InitializingP2pTestHarness {
     pub temp_dir: TempDir,
     pub out_dir_handler: Arc<dyn HostController>,
     pub out_dir: PathBuf,
-    brain_handle: JoinHandle<()>,
+    brain_handle: JoinHandle<GenerationEnd>,
     giga_brain: GigaBrain,
     swarm_factory: TestSwarmFactory<Swarm<LocalNetworkBehaviour>>,
     /// Messages the brain pushes toward connected clients. A test may `take()` this before
@@ -464,7 +499,7 @@ pub struct RunningP2pTestHarness {
     pub temp_dir: TempDir,
     pub out_dir_handler: Arc<dyn HostController>,
     pub out_dir: PathBuf,
-    brain_handle: JoinHandle<()>,
+    brain_handle: JoinHandle<GenerationEnd>,
     giga_brain: GigaBrain,
     swarm_factory: TestSwarmFactory<Swarm<LocalNetworkBehaviour>>,
 }
@@ -568,7 +603,7 @@ impl RunningP2pTestHarness {
 
     // convenience functions
     #[instrument(skip_all, level = "trace")]
-    pub async fn get_sharable_self_contact(&self) -> Contact {
+    pub async fn get_sharable_self_contact(&self) -> SignedContactShare {
         let (request, response) = BrainRequest::with_receiver(());
         self.act(ClientAction::SharePublicSelfContact(request))
             .await;
@@ -579,8 +614,16 @@ impl RunningP2pTestHarness {
     }
 
     #[instrument(skip_all, level = "trace")]
-    pub async fn register_contact(&self, contact: Contact) {
-        let (request, response) = BrainRequest::with_receiver(contact);
+    pub async fn register_new_contact(&self) -> Contact {
+        let share = SignedContactShare::for_test();
+        let contact = share.contact_unverified().clone();
+        self.register_contact(share).await;
+        contact
+    }
+
+    #[instrument(skip_all, level = "trace")]
+    pub async fn register_contact(&self, share: SignedContactShare) {
+        let (request, response) = BrainRequest::with_receiver(share.into());
         self.act(ClientAction::RegisterContact(request)).await;
         response
             .await
@@ -606,7 +649,7 @@ impl RunningP2pTestHarness {
             peer_id: remote.peer_id.wrap(),
             filerequest_id: remote_filerequest_id,
             name: name.to_string(),
-            contact_id: remote.node_info.self_contact_id.clone(),
+            contact_id: remote.node_info.self_contact_keys.id(),
         };
         let (request, response) = BrainRequest::with_receiver(req_body);
         self.act(ClientAction::CreateRemoteFilerequest(request))
@@ -684,7 +727,7 @@ impl RunningP2pTestHarness {
 
         let mut reborn_swarm = (self.swarm_factory)().unwrap();
 
-        reborn_swarm.listen().with_memory_addr_external().await;
+        listen_with_memory_addr_external(&mut reborn_swarm).await;
 
         let mut swarm_harbor = Some(reborn_swarm);
         for connector in connectors {
@@ -754,6 +797,23 @@ pub async fn act(brain_sender: &mpsc::Sender<BrainAction>, action: ClientAction)
         .expect("Failed to send action to brain");
 }
 
+#[instrument(skip_all, level = "trace")]
+pub async fn connected_running_pair() -> (RunningP2pTestHarness, RunningP2pTestHarness) {
+    let mut first = IdleP2pTestHarness::default()
+        .instrument(span!(Level::INFO, "First setup"))
+        .await;
+    let mut second = IdleP2pTestHarness::default()
+        .instrument(span!(Level::INFO, "Second setup"))
+        .await;
+
+    first.listen_external().await;
+    second.connect(&mut first).await;
+
+    let first = first.run().instrument(span!(Level::INFO, "First")).await;
+    let second = second.run().instrument(span!(Level::INFO, "Second")).await;
+    (first, second)
+}
+
 /// Creates a local network swarm with a keypair and peer ID.
 pub fn get_local_network_swarm(
     mut keypair: Option<Keypair>,
@@ -791,7 +851,6 @@ pub fn get_local_network_swarm_with_keypair(
 pub fn generate_random_node_info(keypair: &Keypair) -> NodeInfo {
     NodeInfo {
         node_key_pair: encode_keypair(keypair).expect("Encoding keypair to work"),
-        self_contact_id: ContactId::new(),
         self_contact_keys: ContactKeys::new(),
     }
 }
@@ -812,7 +871,7 @@ pub async fn wait_for_ready(brain_receiver: &mut mpsc::Receiver<BrainAction>, no
                         .await
                         .take()
                         .expect("no channel")
-                        .send(Ok((node_info.clone(), Vec::new())));
+                        .send(Ok((node_info.clone(), NodeConfig(Vec::new()))));
                 }
                 _ => {}
             }

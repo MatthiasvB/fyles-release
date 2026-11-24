@@ -1,3 +1,9 @@
+use crate::core::backup::{
+    BackupOutcome, BackupPasswordStatus, PasswordCheck, PasswordSuggestion, PasswordWarning,
+    RestoreOutcome, RestoreRefusal, UnpackedFormat,
+};
+use crate::core::listen::{ListenFailure, ListenStatus};
+use crate::core::settings::SettingsView;
 use crypto::{
     ContactKeys, ContactPrivateKeys, ContactPublicKeys, PqSigningPrivateKeyDeserializationError,
     PqSigningPublicKeyDeserializationError, PrivateEd25519DeserializationError,
@@ -17,42 +23,281 @@ use super::domain_models::{
 };
 use crate::library::wire::api::TransferDataProto;
 use crate::{
-    core::domain_models::{Contact, DisplayContact, PeerIdWrapper, SelfContact, SelfContactInvite},
+    core::brain::types::SignedContactShare,
+    core::domain_models::{
+        Contact, ContactId, ContactIdParseError, DisplayContact, FylesId, PeerIdWrapper,
+        SelfContact, SelfContactInvite,
+    },
+    core::license::PreparedLicenseRequest,
+    core::license::evaluate::Entitlements,
     library::wire::api::{
-        self, AccessProto, ContactKeysProto, ContactPrivateKeysProto, ContactProto,
-        ContactPublicKeysProto, ContactsChanged, CreateRemoteFileRequestProto,
-        DatabaseRestoredFromBackup, FileRequestProto, OwnedDeviceProto, OwnedDevicesChanged,
-        PendingFileProto, PendingFileStatusChanged, PublicProto, ReceiveStatusProto,
-        ReceivedContactShareOverNetwork, ReceivedFileProto, ReceivedFileStatusChanged,
-        ReceivedSelfContactInviteOverNetwork, RemoteFileRequestProto, RemoteFilerequestsChanged,
+        self, AccessProto, BackupDataResponse, ContactKeysProto, ContactPrivateKeysProto,
+        ContactProto, ContactPublicKeysProto, ContactRemoved,
+        ContactShareRejected as ContactShareRejectedProto, ContactUpserted, ContactsChanged,
+        CreateRemoteFileRequestProto, EntitlementProto, EntitlementsChanged,
+        EvaluateBackupPasswordResponse, FileRequestProto, FilerequestRemoved, FilerequestUpserted,
+        GetBackupPasswordStatusResponse, GetEntitlementStatusResponse, GetListenStatusResponse,
+        LicenseCheckNotDue, LicenseHttpRequest, ListenFailureProto, ListenStarting,
+        ListenStatusChanged, ListenStatusProto, ListeningOnConfiguredPort,
+        ListeningOnTemporaryPort, NotListening, OwnedDeviceProto, OwnedDeviceRemoved,
+        OwnedDeviceUpserted, OwnedDevicesChanged, PendingFileProto, PendingFileRemoved,
+        PendingFileStatusChanged, PendingFilesAdded, PrepareLicenseCheckResponse, PublicProto,
+        ReceiveStatusProto, ReceivedContactShareOverNetwork, ReceivedFileProto,
+        ReceivedFileStatusChanged, ReceivedFilesChanged, ReceivedSelfContactInviteOverNetwork,
+        RemoteFileRequestProto, RemoteFilerequestRemoved, RemoteFilerequestUpserted,
+        RemoteFilerequestsChanged, RestoreDataResponse, SelfContactChanged,
         SelfContactInviteAcceptedOverNetwork, SelfContactInviteProto, SelfContactPublicProto,
-        SendStatusProto, ServerMessage, SpecificUsersProto, StorePendingFileRequest,
-        server_message,
+        SendStatusProto, ServerMessage, SettingsChanged, SpecificUsersProto,
+        StorePendingFileRequest, backup_data_response, evaluate_backup_password_response,
+        get_backup_password_status_response, get_listen_status_response, listen_failure_proto,
+        listen_status_proto, prepare_license_check_response, restore_data_response, server_message,
     },
 };
+
+impl From<ListenFailure> for ListenFailureProto {
+    fn from(failure: ListenFailure) -> Self {
+        let failure = match failure {
+            ListenFailure::AddressInUse => {
+                listen_failure_proto::Failure::AddressInUse(api::AddressInUse {})
+            }
+            ListenFailure::AccessDenied => {
+                listen_failure_proto::Failure::AccessDenied(api::AccessDenied {})
+            }
+            ListenFailure::Other(message) => listen_failure_proto::Failure::Other(message),
+        };
+        ListenFailureProto {
+            failure: Some(failure),
+        }
+    }
+}
+
+impl From<ListenStatus> for ListenStatusProto {
+    fn from(status: ListenStatus) -> Self {
+        let status = match status {
+            ListenStatus::Listening(port) => {
+                listen_status_proto::Status::Listening(ListeningOnConfiguredPort {
+                    port: port.get().into(),
+                })
+            }
+            ListenStatus::Temporary(temporary) => {
+                listen_status_proto::Status::Temporary(ListeningOnTemporaryPort {
+                    configured: temporary.configured().get().into(),
+                    failure: Some(temporary.failure().clone().into()),
+                    active: temporary.active().get().into(),
+                })
+            }
+            ListenStatus::NotListening {
+                configured,
+                failure,
+            } => listen_status_proto::Status::NotListening(NotListening {
+                configured: configured.map(|port| port.get().into()),
+                failure: Some(failure.into()),
+            }),
+        };
+        ListenStatusProto {
+            status: Some(status),
+        }
+    }
+}
+
+impl From<Option<ListenStatus>> for GetListenStatusResponse {
+    fn from(status: Option<ListenStatus>) -> Self {
+        let state = match status {
+            Some(status) => get_listen_status_response::State::Status(status.into()),
+            None => get_listen_status_response::State::Starting(ListenStarting {}),
+        };
+        GetListenStatusResponse { state: Some(state) }
+    }
+}
+
+impl From<BackupOutcome> for BackupDataResponse {
+    fn from(outcome: BackupOutcome) -> Self {
+        let outcome = match outcome {
+            BackupOutcome::Written => backup_data_response::Outcome::Written(api::BackupWritten {}),
+            BackupOutcome::PasswordNotSet => {
+                backup_data_response::Outcome::PasswordNotSet(api::BackupPasswordNotSet {})
+            }
+        };
+        BackupDataResponse {
+            outcome: Some(outcome),
+        }
+    }
+}
+
+impl From<RestoreOutcome> for RestoreDataResponse {
+    fn from(outcome: RestoreOutcome) -> Self {
+        let outcome = match outcome {
+            RestoreOutcome::Restored(UnpackedFormat::Encrypted) => {
+                restore_data_response::Outcome::Restored(api::RestoredEncrypted {})
+            }
+            RestoreOutcome::Restored(UnpackedFormat::LegacyPlain) => {
+                restore_data_response::Outcome::RestoredLegacyPlain(api::RestoredLegacyPlain {})
+            }
+            RestoreOutcome::Refused(RestoreRefusal::NotABackup) => {
+                restore_data_response::Outcome::NotABackup(api::BackupNotABackup {})
+            }
+            RestoreOutcome::Refused(RestoreRefusal::Unsupported) => {
+                restore_data_response::Outcome::Unsupported(api::BackupUnsupported {})
+            }
+            RestoreOutcome::Refused(RestoreRefusal::PasswordRequired) => {
+                restore_data_response::Outcome::PasswordRequired(api::BackupPasswordRequired {})
+            }
+            RestoreOutcome::Refused(RestoreRefusal::WrongPassword) => {
+                restore_data_response::Outcome::WrongPassword(api::BackupWrongPassword {})
+            }
+            RestoreOutcome::Refused(RestoreRefusal::Corrupt) => {
+                restore_data_response::Outcome::Corrupt(api::BackupCorrupt {})
+            }
+        };
+        RestoreDataResponse {
+            outcome: Some(outcome),
+        }
+    }
+}
+
+impl From<BackupPasswordStatus> for GetBackupPasswordStatusResponse {
+    fn from(status: BackupPasswordStatus) -> Self {
+        let status = match status {
+            BackupPasswordStatus::NotSet => {
+                get_backup_password_status_response::Status::Missing(api::BackupPasswordNotSet {})
+            }
+            BackupPasswordStatus::Set { verification_due } => {
+                get_backup_password_status_response::Status::Present(api::BackupPasswordSet {
+                    verification_due,
+                })
+            }
+        };
+        GetBackupPasswordStatusResponse {
+            status: Some(status),
+        }
+    }
+}
+
+impl From<PasswordWarning> for api::PasswordWarning {
+    fn from(warning: PasswordWarning) -> Self {
+        match warning {
+            PasswordWarning::StraightRowsOfKeysAreEasyToGuess => Self::StraightRowsOfKeys,
+            PasswordWarning::ShortKeyboardPatternsAreEasyToGuess => Self::ShortKeyboardPatterns,
+            PasswordWarning::RepeatsLikeAaaAreEasyToGuess => Self::RepeatedCharacters,
+            PasswordWarning::RepeatsLikeAbcAbcAreOnlySlightlyHarderToGuess => Self::RepeatedBlocks,
+            PasswordWarning::SequencesLikeAbcAreEasyToGuess => Self::Sequences,
+            PasswordWarning::RecentYearsAreEasyToGuess => Self::RecentYears,
+            PasswordWarning::DatesAreOftenEasyToGuess => Self::Dates,
+        }
+    }
+}
+
+impl From<PasswordSuggestion> for api::PasswordSuggestion {
+    fn from(suggestion: PasswordSuggestion) -> Self {
+        match suggestion {
+            PasswordSuggestion::UseAFewWordsAvoidCommonPhrases => Self::UseAFewWords,
+            PasswordSuggestion::NoNeedForSymbolsDigitsOrUppercaseLetters => Self::NoNeedForSymbols,
+            PasswordSuggestion::AddAnotherWordOrTwo => Self::AddAnotherWord,
+            PasswordSuggestion::UseALongerKeyboardPatternWithMoreTurns => {
+                Self::LongerKeyboardPattern
+            }
+            PasswordSuggestion::AvoidRepeatedWordsAndCharacters => Self::AvoidRepeats,
+            PasswordSuggestion::AvoidSequences => Self::AvoidSequences,
+            PasswordSuggestion::AvoidRecentYears => Self::AvoidRecentYears,
+            PasswordSuggestion::AvoidYearsThatAreAssociatedWithYou => Self::AvoidPersonalYears,
+            PasswordSuggestion::AvoidDatesAndYearsThatAreAssociatedWithYou => {
+                Self::AvoidPersonalDates
+            }
+        }
+    }
+}
+
+impl From<PasswordCheck> for EvaluateBackupPasswordResponse {
+    fn from(check: PasswordCheck) -> Self {
+        let check = match check {
+            PasswordCheck::TooShort => {
+                evaluate_backup_password_response::Check::TooShort(api::PasswordTooShort {})
+            }
+            PasswordCheck::Guessable {
+                warning,
+                suggestions,
+            } => evaluate_backup_password_response::Check::Guessable(api::PasswordGuessable {
+                warning: warning.map(|warning| api::PasswordWarning::from(warning) as i32),
+                suggestions: suggestions
+                    .into_iter()
+                    .map(|suggestion| api::PasswordSuggestion::from(suggestion) as i32)
+                    .collect(),
+            }),
+            PasswordCheck::NoWeaknessFound => {
+                evaluate_backup_password_response::Check::NoWeaknessFound(
+                    api::PasswordNoWeaknessFound {},
+                )
+            }
+        };
+        EvaluateBackupPasswordResponse { check: Some(check) }
+    }
+}
+
+impl From<license_format::Entitlement> for EntitlementProto {
+    fn from(entitlement: license_format::Entitlement) -> Self {
+        EntitlementProto {
+            id: entitlement.id,
+            expires_at: entitlement.expires_at,
+        }
+    }
+}
+
+impl From<Entitlements> for EntitlementsChanged {
+    fn from(entitlements: Entitlements) -> Self {
+        EntitlementsChanged {
+            entitlements: entitlements.entitlements.into_iter().map_into().collect(),
+            provisional: entitlements.provisional,
+        }
+    }
+}
+
+impl From<Entitlements> for GetEntitlementStatusResponse {
+    fn from(entitlements: Entitlements) -> Self {
+        GetEntitlementStatusResponse {
+            entitlements: entitlements.entitlements.into_iter().map_into().collect(),
+            provisional: entitlements.provisional,
+        }
+    }
+}
+
+impl From<Option<PreparedLicenseRequest>> for PrepareLicenseCheckResponse {
+    fn from(prepared: Option<PreparedLicenseRequest>) -> Self {
+        let outcome = match prepared {
+            Some(request) => prepare_license_check_response::Outcome::Request(LicenseHttpRequest {
+                body: request.body,
+            }),
+            None => prepare_license_check_response::Outcome::NotDue(LicenseCheckNotDue {}),
+        };
+        PrepareLicenseCheckResponse {
+            outcome: Some(outcome),
+        }
+    }
+}
 
 impl From<&Contact> for ContactProto {
     fn from(contact: &Contact) -> Self {
         ContactProto {
-            id: contact.id.0.clone(),
+            id: contact.id().to_string(),
             name: contact.name.clone(),
         }
     }
 }
 
-impl From<ContactProto> for DisplayContact {
-    fn from(proto: ContactProto) -> Self {
-        Self {
-            id: proto.id.into(),
+impl TryFrom<ContactProto> for DisplayContact {
+    type Error = ContactIdParseError;
+
+    fn try_from(proto: ContactProto) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: proto.id.parse()?,
             name: proto.name,
-        }
+        })
     }
 }
 
 impl From<DisplayContact> for ContactProto {
     fn from(contact: DisplayContact) -> Self {
         ContactProto {
-            id: contact.id.0,
+            id: contact.id.to_string(),
             name: contact.name,
         }
     }
@@ -67,7 +312,7 @@ impl From<FilerequestAccess> for AccessProto {
                 }
                 FilerequestAccess::Audience { contact_ids } => {
                     crate::library::wire::api::access_proto::Access::Audience(SpecificUsersProto {
-                        contact_ids: contact_ids.into_iter().map(|id| id.0).collect(),
+                        contact_ids: contact_ids.into_iter().map(|id| id.to_string()).collect(),
                     })
                 }
             }),
@@ -95,7 +340,12 @@ impl TryFrom<AccessProto> for FilerequestAccess {
         match proto.access {
             Some(api::access_proto::Access::Public(_)) => Ok(FilerequestAccess::Public),
             Some(api::access_proto::Access::Audience(users)) => Ok(FilerequestAccess::Audience {
-                contact_ids: users.contact_ids.into_iter().map_into().collect(),
+                contact_ids: users
+                    .contact_ids
+                    .into_iter()
+                    .map(|id| id.parse())
+                    .collect::<Result<_, ContactIdParseError>>()
+                    .map_err(|e| Status::invalid_argument(e.to_string()))?,
             }),
             None => Err(Status::invalid_argument("Missing access type")),
         }
@@ -134,20 +384,22 @@ impl From<RemoteFilerequest> for RemoteFileRequestProto {
             peer_id: r.peer_id.0,
             file_request_id: r.filerequest_id.0,
             name: r.name,
-            contact_id: r.contact_id.0,
+            contact_id: r.contact_id.to_string(),
         }
     }
 }
 
-impl From<RemoteFileRequestProto> for RemoteFilerequest {
-    fn from(proto: RemoteFileRequestProto) -> Self {
-        RemoteFilerequest {
+impl TryFrom<RemoteFileRequestProto> for RemoteFilerequest {
+    type Error = ContactIdParseError;
+
+    fn try_from(proto: RemoteFileRequestProto) -> Result<Self, Self::Error> {
+        Ok(RemoteFilerequest {
             id: proto.id.into(),
             peer_id: proto.peer_id.into(),
             filerequest_id: proto.file_request_id.into(),
             name: proto.name,
-            contact_id: proto.contact_id.into(),
-        }
+            contact_id: proto.contact_id.parse()?,
+        })
     }
 }
 
@@ -157,19 +409,21 @@ impl From<CreateRemoteFilerequest> for CreateRemoteFileRequestProto {
             peer_id: r.peer_id.0,
             file_request_id: r.filerequest_id,
             name: r.name,
-            contact_id: r.contact_id.0,
+            contact_id: r.contact_id.to_string(),
         }
     }
 }
 
-impl From<CreateRemoteFileRequestProto> for CreateRemoteFilerequest {
-    fn from(proto: CreateRemoteFileRequestProto) -> Self {
-        CreateRemoteFilerequest {
+impl TryFrom<CreateRemoteFileRequestProto> for CreateRemoteFilerequest {
+    type Error = ContactIdParseError;
+
+    fn try_from(proto: CreateRemoteFileRequestProto) -> Result<Self, Self::Error> {
+        Ok(CreateRemoteFilerequest {
             peer_id: proto.peer_id.into(),
             filerequest_id: proto.file_request_id,
             name: proto.name,
-            contact_id: proto.contact_id.into(),
-        }
+            contact_id: proto.contact_id.parse()?,
+        })
     }
 }
 
@@ -254,7 +508,7 @@ impl From<ReceivedFile> for ReceivedFileProto {
     fn from(r: ReceivedFile) -> Self {
         ReceivedFileProto {
             id: r.id.0,
-            contact_id: r.contact_id.map(|id| id.0),
+            contact_id: r.contact_id.map(|id| id.to_string()),
             filerequest_id: r.filerequest_id.0,
             file_name: r.file_name,
             file_path: r.file_path.unwrap_or_default(),
@@ -306,7 +560,6 @@ impl TryFrom<SelfContactInviteProto> for SelfContactInvite {
     fn try_from(value: SelfContactInviteProto) -> Result<Self, Self::Error> {
         Ok(Self {
             contact: SelfContact {
-                id: value.id.into(),
                 name: value.name,
                 keys: value
                     .keys
@@ -324,7 +577,6 @@ impl TryFrom<SelfContactInviteProto> for SelfContactInvite {
 impl From<SelfContactInvite> for SelfContactInviteProto {
     fn from(value: SelfContactInvite) -> Self {
         Self {
-            id: value.contact.id.0,
             name: value.contact.name,
             keys: Some(value.contact.keys.into()),
             inviter_peer_id: value.inviter_peer_id.0,
@@ -385,30 +637,35 @@ impl TryFrom<ContactPrivateKeysProto> for ContactPrivateKeys {
     }
 }
 
-impl From<Contact> for SelfContactPublicProto {
-    fn from(contact: Contact) -> Self {
-        SelfContactPublicProto {
-            name: contact.name,
-            contact_id: contact.id.0,
-            public_keys: Some(contact.public_keys.into()),
-        }
+impl TryFrom<SignedContactShare> for SelfContactPublicProto {
+    type Error = bincode::error::EncodeError;
+    fn try_from(share: SignedContactShare) -> Result<Self, Self::Error> {
+        Ok(SelfContactPublicProto {
+            signed_share: bincode::serde::encode_to_vec(&share, crypto::BINCODE_CONFIG)?,
+        })
     }
 }
 
-impl TryFrom<SelfContactPublicProto> for Contact {
-    type Error = SelfContactDeserializationError;
+impl TryFrom<SelfContactPublicProto> for SignedContactShare {
+    type Error = bincode::error::DecodeError;
     fn try_from(proto: SelfContactPublicProto) -> Result<Self, Self::Error> {
-        Ok(Contact {
-            id: proto.contact_id.into(),
-            name: proto.name,
-            public_keys: proto
-                .public_keys
-                .ok_or(SelfContactDeserializationError::Proto3FuckMissingKey(
-                    "public_keys",
-                ))?
-                .try_into()?,
-        })
+        bincode::serde::decode_from_slice(&proto.signed_share, crypto::BINCODE_CONFIG)
+            .map(|(share, _)| share)
     }
+}
+
+pub(crate) fn decode_share(
+    proto: Option<SelfContactPublicProto>,
+) -> Result<SignedContactShare, Status> {
+    proto
+        .ok_or(Status::invalid_argument("Missing sharable_contact"))?
+        .try_into()
+        .map_err(|e: bincode::error::DecodeError| Status::invalid_argument(e.to_string()))
+}
+
+pub(crate) fn parse_contact_id(id: String) -> Result<ContactId, Status> {
+    id.parse()
+        .map_err(|e: ContactIdParseError| Status::invalid_argument(e.to_string()))
 }
 
 impl ServerMessage {
@@ -440,15 +697,14 @@ impl ServerMessage {
         }
     }
 
-    pub fn database_restored() -> Self {
+    pub fn contact_share_rejected() -> Self {
         ServerMessage {
-            message: Some(server_message::Message::DatabaseRestoredFromBackup(
-                DatabaseRestoredFromBackup {},
+            message: Some(server_message::Message::ContactShareRejected(
+                ContactShareRejectedProto {},
             )),
         }
     }
 
-    /// The synced contacts document changed; carries the full contact list.
     pub fn contacts_changed(contacts: Vec<DisplayContact>) -> Self {
         ServerMessage {
             message: Some(server_message::Message::ContactsChanged(ContactsChanged {
@@ -457,8 +713,8 @@ impl ServerMessage {
         }
     }
 
-    /// The synced remote-filerequests document changed; carries the full remote-filerequest list
-    /// plus every pending file, so the client rebuilds the nested structure without a refetch.
+    /// Carries every pending file alongside the remote filerequests, so the client rebuilds the
+    /// nested structure without a refetch.
     pub fn remote_filerequests_changed(
         remote_filerequests: Vec<RemoteFilerequest>,
         pending_files: Vec<PendingFile>,
@@ -479,7 +735,6 @@ impl ServerMessage {
         }
     }
 
-    /// The synced owned-devices document changed; carries the full owned-device list.
     pub fn owned_devices_changed(devices: Vec<(PeerIdWrapper, String)>) -> Self {
         ServerMessage {
             message: Some(server_message::Message::OwnedDevicesChanged(
@@ -496,10 +751,150 @@ impl ServerMessage {
         }
     }
 
+    pub fn self_contact_changed(self_contact: DisplayContact) -> Self {
+        ServerMessage {
+            message: Some(server_message::Message::SelfContactChanged(
+                SelfContactChanged {
+                    self_contact: Some(ContactProto::from(self_contact)),
+                },
+            )),
+        }
+    }
+
+    pub fn settings_changed(view: SettingsView) -> Self {
+        ServerMessage {
+            message: Some(server_message::Message::SettingsChanged(SettingsChanged {
+                view: view.0,
+            })),
+        }
+    }
+
+    pub fn listen_status_changed(status: ListenStatus) -> Self {
+        ServerMessage {
+            message: Some(server_message::Message::ListenStatusChanged(
+                ListenStatusChanged {
+                    status: Some(status.into()),
+                },
+            )),
+        }
+    }
+
+    pub fn received_files_changed(filerequest_id: &FylesId) -> Self {
+        ServerMessage {
+            message: Some(server_message::Message::ReceivedFilesChanged(
+                ReceivedFilesChanged {
+                    filerequest_id: filerequest_id.to_string(),
+                },
+            )),
+        }
+    }
+
+    pub fn contact_upserted(contact: DisplayContact) -> Self {
+        ServerMessage {
+            message: Some(server_message::Message::ContactUpserted(ContactUpserted {
+                contact: Some(ContactProto::from(contact)),
+            })),
+        }
+    }
+
+    pub fn contact_removed(contact_id: &ContactId) -> Self {
+        ServerMessage {
+            message: Some(server_message::Message::ContactRemoved(ContactRemoved {
+                contact_id: contact_id.to_string(),
+            })),
+        }
+    }
+
+    pub fn filerequest_upserted(filerequest: &Filerequest) -> Self {
+        ServerMessage {
+            message: Some(server_message::Message::FilerequestUpserted(
+                FilerequestUpserted {
+                    file_request: Some(FileRequestProto::from(filerequest)),
+                },
+            )),
+        }
+    }
+
+    pub fn filerequest_removed(id: &FylesId) -> Self {
+        ServerMessage {
+            message: Some(server_message::Message::FilerequestRemoved(
+                FilerequestRemoved { id: id.to_string() },
+            )),
+        }
+    }
+
+    pub fn remote_filerequest_upserted(remote_filerequest: RemoteFilerequest) -> Self {
+        ServerMessage {
+            message: Some(server_message::Message::RemoteFilerequestUpserted(
+                RemoteFilerequestUpserted {
+                    remote_file_request: Some(RemoteFileRequestProto::from(remote_filerequest)),
+                },
+            )),
+        }
+    }
+
+    pub fn remote_filerequest_removed(id: &FylesId) -> Self {
+        ServerMessage {
+            message: Some(server_message::Message::RemoteFilerequestRemoved(
+                RemoteFilerequestRemoved { id: id.to_string() },
+            )),
+        }
+    }
+
+    pub fn pending_files_added(pending_files: Vec<PendingFile>) -> Self {
+        ServerMessage {
+            message: Some(server_message::Message::PendingFilesAdded(
+                PendingFilesAdded {
+                    pending_files: pending_files
+                        .into_iter()
+                        .map(PendingFileProto::from)
+                        .collect(),
+                },
+            )),
+        }
+    }
+
+    pub fn pending_file_removed(id: &FylesId, target_filerequest_id: &FylesId) -> Self {
+        ServerMessage {
+            message: Some(server_message::Message::PendingFileRemoved(
+                PendingFileRemoved {
+                    id: id.to_string(),
+                    target_file_request_id: target_filerequest_id.to_string(),
+                },
+            )),
+        }
+    }
+
+    pub fn owned_device_upserted(peer_id: PeerIdWrapper, name: String) -> Self {
+        ServerMessage {
+            message: Some(server_message::Message::OwnedDeviceUpserted(
+                OwnedDeviceUpserted {
+                    device: Some(OwnedDeviceProto {
+                        peer_id: peer_id.0,
+                        name,
+                    }),
+                },
+            )),
+        }
+    }
+
+    pub fn owned_device_removed(peer_id: &PeerIdWrapper) -> Self {
+        ServerMessage {
+            message: Some(server_message::Message::OwnedDeviceRemoved(
+                OwnedDeviceRemoved {
+                    peer_id: peer_id.to_string(),
+                },
+            )),
+        }
+    }
+
+    /// `interruption_reason` is what *this* transition recorded, if anything. The client appends it
+    /// to the reasons it already holds, so the accumulated history never needs re-sending.
     pub fn pending_file_status_changed(
         pending_file_id: &str,
         status: &SendStatus,
         target_filerequest_id: &str,
+        interruption_reason: Option<String>,
     ) -> Self {
         match status {
             SendStatus::InProgress(_) => {
@@ -524,7 +919,7 @@ impl ServerMessage {
                     transfer_id: transfer_data.map(|td| td.transfer_id.to_string()),
                     file_size_bytes: transfer_data.map(|it| it.file_size_bytes),
                     target_file_request_id: target_filerequest_id.to_string(),
-                    interruption_reasons: vec![],
+                    interruption_reasons: interruption_reason.into_iter().collect(),
                 },
             )),
         }

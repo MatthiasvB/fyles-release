@@ -1,7 +1,7 @@
 use rusqlite::{Connection, Result};
 use semver::Version;
 
-pub static CURRENT_VERSION: Version = Version::new(1, 22, 0);
+pub static CURRENT_SCHEMA_VERSION: Version = Version::new(1, 27, 0);
 
 pub fn initialize_tables(conn: &mut Connection) -> Result<()> {
     // First create schema version table if it doesn't exist
@@ -71,17 +71,19 @@ pub fn initialize_tables(conn: &mut Connection) -> Result<()> {
             display_name TEXT,
             interruption_reasons TEXT NOT NULL DEFAULT '[]',
             created_at TEXT NOT NULL,
+            source_modified_ms INTEGER,
 
             CHECK (
                 -- Pending: no transfer data
                 (status = 'Pending'
-                    AND progress_bytes IS NULL AND file_size_bytes IS NULL AND transfer_id IS NULL)
+                    AND progress_bytes IS NULL AND file_size_bytes IS NULL
+                    AND transfer_id IS NULL AND source_modified_ms IS NULL)
                 OR
                 -- Sending/Interrupted: transfer data required
                 (status IN ('Sending', 'Interrupted')
                     AND progress_bytes IS NOT NULL AND progress_bytes >= 0
                     AND file_size_bytes IS NOT NULL AND file_size_bytes >= 0
-                    AND transfer_id IS NOT NULL)
+                    AND transfer_id IS NOT NULL AND source_modified_ms IS NOT NULL)
                 OR
                 -- Terminal states: transfer metadata is optional (preserved for diagnostics)
                 (status IN ('Sent', 'Rejected', 'Failed'))
@@ -108,13 +110,38 @@ pub fn initialize_tables(conn: &mut Connection) -> Result<()> {
 
         CREATE TABLE IF NOT EXISTS self_contact (
             id INTEGER PRIMARY KEY CHECK (id = 1),
-            contact_id TEXT NOT NULL UNIQUE,
             name TEXT NOT NULL,
             pq_signing_private_key BLOB,
             ed25519_private_key BLOB
         );
 
         CREATE TABLE IF NOT EXISTS settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            data BLOB NOT NULL DEFAULT X'',
+            version TEXT NOT NULL DEFAULT '0.0.0'
+        );
+
+        -- No row until a port has been configured.
+        CREATE TABLE IF NOT EXISTS listen_port (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            port INTEGER NOT NULL CHECK (port BETWEEN 1024 AND 65535)
+        );
+
+        -- No row until the user chose a backup password.
+        CREATE TABLE IF NOT EXISTS backup_secret (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            salt BLOB NOT NULL CHECK (length(salt) = 16),
+            m_cost_kib INTEGER NOT NULL,
+            t_cost INTEGER NOT NULL,
+            p_cost INTEGER NOT NULL,
+            key BLOB NOT NULL CHECK (length(key) = 32),
+            verify_gap INTEGER NOT NULL CHECK (verify_gap BETWEEN 0 AND 3),
+            verify_due_at_ms INTEGER NOT NULL,
+            verify_missed INTEGER NOT NULL CHECK (verify_missed IN (0, 1))
+        );
+
+        -- Cached license state (certificate + check timestamps), owned by core::license.
+        CREATE TABLE IF NOT EXISTS license_cache (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             data BLOB NOT NULL DEFAULT X'',
             version TEXT NOT NULL DEFAULT '0.0.0'
@@ -132,7 +159,7 @@ pub fn initialize_tables(conn: &mut Connection) -> Result<()> {
     // Record current schema version for new DB
     tx.execute(
         "INSERT INTO schema_version (version) VALUES (?)",
-        [CURRENT_VERSION.to_string()],
+        [CURRENT_SCHEMA_VERSION.to_string()],
     )?;
 
     tx.commit()?;

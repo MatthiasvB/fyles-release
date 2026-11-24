@@ -122,7 +122,6 @@ impl Drop for TraceGuard {
         {
             self.provider
                 .shutdown()
-                .ok()
                 .expect("Failed to shutdown tracing provider");
         }
     }

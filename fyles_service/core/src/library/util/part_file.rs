@@ -13,7 +13,7 @@ pub fn get_part_file_name(
 ) -> String {
     let contact_string = contact_id
         .as_ref()
-        .map(|id| id.0.as_str())
+        .map(|id| id.as_ref())
         .unwrap_or("unknown-contact");
     format!("{started_at_ms}_{contact_string}_{peer_id}_{transfer_id}.part")
 }

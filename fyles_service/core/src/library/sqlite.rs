@@ -1,15 +1,22 @@
+use crate::core::backup::{RestoredFrom, StoredBackupSecret, VerificationSchedule};
 use crate::core::brain::action_p2p::NodeInfo;
 use crate::core::db::{DatabaseResult, FilerequestDb};
 use crate::core::domain_models::{
     CompleteReceivedFile, Contact, ContactId, CreateFilerequest, CreateIncomingFile,
-    CreatePendingFiles, CreateRemoteFilerequest, DisplayContact, Filerequest, FylesId, PendingFile,
-    ReceiveStatus, ReceivedFile, RemoteFilerequest, SelfContact, SendStatus,
+    CreatePendingFiles, CreateRemoteFilerequest, DisplayContact, Filerequest, FilerequestId,
+    FylesId, PendingFile, ReceiveStatus, ReceivedFile, RemoteFilerequest, SelfContact, SendStatus,
 };
+use crate::core::listen::ListenPort;
 use crate::core::p2p::NodeKeyPairBinary;
-use crate::core::sync::{DocKind, LocalDocWrite};
+use crate::core::settings::SettingsBlob;
+use crate::core::sync::{
+    ContactChange, DeviceChange, DevicesDoc, DocChange, DocKind, LocalDocWrite,
+    RemoteFilerequestChange,
+};
 use crate::library::util::util::TimeoutLock;
 use actor::SqliteActor;
 use async_trait::async_trait;
+use automerge::AutoCommit;
 use command::SqliteMsg;
 use crypto::{ContactKeys, ContactPublicKeys};
 use std::collections::HashMap;
@@ -216,7 +223,9 @@ impl FilerequestDb for Sqlite {
             .send(SqliteMsg::UpdateContact(contact.clone(), sender))
             .await?;
         receiver.await??;
-        Ok(LocalDocWrite::new(DocKind::Contacts))
+        Ok(LocalDocWrite::new(DocChange::Contacts(
+            ContactChange::Upserted(contact.clone()),
+        )))
     }
 
     async fn delete_contact(&self, id: &ContactId) -> DatabaseResult<LocalDocWrite> {
@@ -226,7 +235,9 @@ impl FilerequestDb for Sqlite {
             .send(SqliteMsg::DeleteContact(id.clone(), sender))
             .await?;
         receiver.await??;
-        Ok(LocalDocWrite::new(DocKind::Contacts))
+        Ok(LocalDocWrite::new(DocChange::Contacts(
+            ContactChange::Removed(id.clone()),
+        )))
     }
 
     async fn store_node_keys(&self, keys: NodeInfo) -> DatabaseResult<()> {
@@ -243,11 +254,9 @@ impl FilerequestDb for Sqlite {
         receiver.await?
     }
 
-    async fn get_node_and_self_contact_id(&self) -> DatabaseResult<(NodeKeyPairBinary, ContactId)> {
+    async fn get_node_keypair(&self) -> DatabaseResult<NodeKeyPairBinary> {
         let (sender, receiver) = oneshot::channel();
-        self.sender
-            .send(SqliteMsg::GetNodeAndSelfContactId(sender))
-            .await?;
+        self.sender.send(SqliteMsg::GetNodeKeypair(sender)).await?;
         receiver.await?
     }
 
@@ -309,7 +318,19 @@ impl FilerequestDb for Sqlite {
             ))
             .await?;
         let id = receiver.await??;
-        Ok((id, LocalDocWrite::new(DocKind::RemoteFilerequests)))
+        let created = RemoteFilerequest {
+            id: id.clone(),
+            peer_id: remote_fr.peer_id.clone(),
+            filerequest_id: FylesId(remote_fr.filerequest_id.clone()),
+            contact_id: remote_fr.contact_id.clone(),
+            name: remote_fr.name.clone(),
+        };
+        Ok((
+            id,
+            LocalDocWrite::new(DocChange::RemoteFilerequests(
+                RemoteFilerequestChange::Upserted(created),
+            )),
+        ))
     }
 
     async fn delete_remote_filerequest(&self, id: &FylesId) -> DatabaseResult<LocalDocWrite> {
@@ -318,7 +339,9 @@ impl FilerequestDb for Sqlite {
             .send(SqliteMsg::DeleteRemoteFilerequest(id.clone(), sender))
             .await?;
         receiver.await??;
-        Ok(LocalDocWrite::new(DocKind::RemoteFilerequests))
+        Ok(LocalDocWrite::new(DocChange::RemoteFilerequests(
+            RemoteFilerequestChange::Removed(id.clone()),
+        )))
     }
 
     async fn update_remote_filerequest(
@@ -328,10 +351,13 @@ impl FilerequestDb for Sqlite {
     ) -> DatabaseResult<LocalDocWrite> {
         let (sender, receiver) = oneshot::channel();
         self.sender
-            .send(SqliteMsg::UpdateRemoteFilerequest(id, name, sender))
+            .send(SqliteMsg::UpdateRemoteFilerequest(id.clone(), name, sender))
             .await?;
         receiver.await??;
-        Ok(LocalDocWrite::new(DocKind::RemoteFilerequests))
+        let updated = self.get_remote_filerequest(&id).await?;
+        Ok(LocalDocWrite::new(DocChange::RemoteFilerequests(
+            RemoteFilerequestChange::Upserted(updated),
+        )))
     }
 
     // Implement the missing pending file methods
@@ -486,7 +512,7 @@ impl FilerequestDb for Sqlite {
         receiver.await?
     }
 
-    async fn delete_received_file(&self, id: &FylesId) -> DatabaseResult<()> {
+    async fn delete_received_file(&self, id: &FylesId) -> DatabaseResult<FilerequestId> {
         let (sender, receiver) = oneshot::channel();
         let _ = self
             .sender
@@ -536,21 +562,16 @@ impl FilerequestDb for Sqlite {
         receiver.await?
     }
 
-    async fn get_sharable_public_self_contact(&self) -> DatabaseResult<Contact> {
-        let (sender, receiver) = oneshot::channel();
-        self.sender
-            .send(SqliteMsg::GetSharablePublicSelfContact(sender))
-            .await?;
-        receiver.await?
-    }
     async fn update_contact_projection(&self, contact: Contact) -> DatabaseResult<LocalDocWrite> {
         trace!("Registering contact: {:?}", contact);
         let (sender, receiver) = oneshot::channel();
         self.sender
-            .send(SqliteMsg::UpdateContactProjection(contact, sender))
+            .send(SqliteMsg::UpdateContactProjection(contact.clone(), sender))
             .await?;
         receiver.await??;
-        Ok(LocalDocWrite::new(DocKind::Contacts))
+        Ok(LocalDocWrite::new(DocChange::Contacts(
+            ContactChange::Upserted(contact.into()),
+        )))
     }
 
     async fn prune_contact_key_cache(&self) -> DatabaseResult<()> {
@@ -569,43 +590,85 @@ impl FilerequestDb for Sqlite {
         receiver.await?
     }
 
-    async fn backup_database(
+    async fn snapshot_database(&self, destination: PathBuf) -> DatabaseResult<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(SqliteMsg::Snapshot(destination, sender))
+            .await?;
+        receiver.await?
+    }
+
+    async fn restore_database(&self, sqlite: PathBuf, from: RestoredFrom) -> DatabaseResult<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(SqliteMsg::Restore(sqlite, from, sender))
+            .await?;
+        receiver.await?
+    }
+
+    async fn get_backup_secret(&self) -> DatabaseResult<Option<StoredBackupSecret>> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender.send(SqliteMsg::GetBackupSecret(sender)).await?;
+        receiver.await?
+    }
+
+    async fn store_backup_secret(&self, stored: StoredBackupSecret) -> DatabaseResult<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(SqliteMsg::StoreBackupSecret(stored, sender))
+            .await?;
+        receiver.await?
+    }
+
+    async fn store_verification_schedule(
         &self,
-        backup_file: std::fs::File,
-        internal_data_dir: PathBuf,
+        schedule: VerificationSchedule,
     ) -> DatabaseResult<()> {
         let (sender, receiver) = oneshot::channel();
         self.sender
-            .send(SqliteMsg::Backup {
-                backup_file,
-                internal_data_dir,
-                response_sender: sender,
-            })
+            .send(SqliteMsg::StoreVerificationSchedule(schedule, sender))
             .await?;
         receiver.await?
     }
 
-    async fn restore_database(&self, backup_file: tokio::fs::File) -> DatabaseResult<()> {
-        let (sender, receiver) = oneshot::channel();
-        self.sender
-            .send(SqliteMsg::Restore {
-                backup_file,
-                response_sender: sender,
-            })
-            .await?;
-        receiver.await?
-    }
-
-    async fn get_settings(&self) -> DatabaseResult<Vec<u8>> {
+    async fn get_settings(&self) -> DatabaseResult<SettingsBlob> {
         let (sender, receiver) = oneshot::channel();
         self.sender.send(SqliteMsg::GetSettings(sender)).await?;
         receiver.await?
     }
 
-    async fn store_settings(&self, settings: Vec<u8>) -> DatabaseResult<()> {
+    async fn store_settings(&self, settings: SettingsBlob) -> DatabaseResult<()> {
         let (sender, receiver) = oneshot::channel();
         self.sender
             .send(SqliteMsg::StoreSettings(settings, sender))
+            .await?;
+        receiver.await?
+    }
+
+    async fn get_license_cache(&self) -> DatabaseResult<Option<Vec<u8>>> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender.send(SqliteMsg::GetLicenseCache(sender)).await?;
+        receiver.await?
+    }
+
+    async fn store_license_cache(&self, data: Vec<u8>) -> DatabaseResult<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(SqliteMsg::StoreLicenseCache(data, sender))
+            .await?;
+        receiver.await?
+    }
+
+    async fn get_listen_port(&self) -> DatabaseResult<Option<ListenPort>> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender.send(SqliteMsg::GetListenPort(sender)).await?;
+        receiver.await?
+    }
+
+    async fn store_listen_port(&self, port: ListenPort) -> DatabaseResult<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(SqliteMsg::StoreListenPort(port, sender))
             .await?;
         receiver.await?
     }
@@ -626,14 +689,21 @@ impl FilerequestDb for Sqlite {
         receiver.await?
     }
 
-    async fn mutate_sync_doc(
+    async fn mutate_devices_doc(
         &self,
-        kind: DocKind,
-        transform: Box<dyn FnOnce(Vec<u8>) -> DatabaseResult<Vec<u8>> + Send>,
-    ) -> DatabaseResult<()> {
+        transform: Box<dyn for<'a> FnOnce(&'a mut DevicesDoc) -> DeviceChange + Send>,
+    ) -> DatabaseResult<DeviceChange> {
         let (sender, receiver) = oneshot::channel();
         self.sender
-            .send(SqliteMsg::MutateSyncDoc(kind, transform, sender))
+            .send(SqliteMsg::MutateDevicesDoc(transform, sender))
+            .await?;
+        receiver.await?
+    }
+
+    async fn merge_sync_doc(&self, kind: DocKind, incoming: Box<AutoCommit>) -> DatabaseResult<()> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender
+            .send(SqliteMsg::MergeSyncDoc(kind, incoming, sender))
             .await?;
         receiver.await?
     }
@@ -715,6 +785,12 @@ mod tests {
     async fn test_contacts_and_remote_fr_doc_roundtrip() {
         let db = setup_test_db(None).await;
         crate::core::db::test::test_contacts_and_remote_fr_doc_roundtrip(db).await;
+    }
+
+    #[tokio::test]
+    async fn test_listen_port_roundtrip() {
+        let db = setup_test_db(None).await;
+        crate::core::db::test::test_listen_port_roundtrip(db).await;
     }
 
     #[tokio::test]

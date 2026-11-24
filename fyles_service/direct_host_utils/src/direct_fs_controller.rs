@@ -1,13 +1,13 @@
 use crate::i18n::{Language, init_i18n};
 use crate::tr;
 use async_trait::async_trait;
-use chrono::Local;
 use derive_more::Deref;
+use fyles_core::core::backup::BackupFileName;
 use fyles_core::core::filerequest_drive_handler::GetFileError;
 use fyles_core::core::notification::{FileSender, Notification};
 use fyles_core::io_controller::{
-    BoxedError, FileMeta, FileNamespace, HostController, OWNER_MARKER_FILENAME, OutgoingFileInfo,
-    OwnershipOutcome, RenameOutcome, Uri,
+    BoxedError, FileMeta, FileNamespace, HostController, HostState, OWNER_MARKER_FILENAME,
+    OutgoingFileInfo, OwnershipOutcome, RenameOutcome, Uri,
 };
 use sanitize_filename::sanitize;
 use std::io;
@@ -16,6 +16,7 @@ use std::sync::Arc;
 use tap::Tap;
 use thiserror::Error;
 use tokio::fs::{self, File};
+use tokio::sync::watch;
 use tracing::{error, info, instrument, trace, warn};
 
 #[derive(Debug, Error)]
@@ -163,10 +164,14 @@ pub struct DirectFsController {
     backup_dir: PathBuf,
     partial_dir: PathBuf,
     lang: Language,
+    host_state: watch::Receiver<HostState>,
 }
 
 impl DirectFsController {
-    pub async fn new<P: Into<PathBuf>>(out_dir: P) -> Result<Self, DirectFsControllerError> {
+    pub async fn new<P: Into<PathBuf>>(
+        out_dir: P,
+        host_state: watch::Receiver<HostState>,
+    ) -> Result<Self, DirectFsControllerError> {
         let requested_path: PathBuf = out_dir.into();
         let out_dir = match fs::metadata(&requested_path).await.is_ok() {
             true => {
@@ -225,6 +230,7 @@ impl DirectFsController {
             backup_dir: canonical.join(PathBuf::from("Backup")),
             partial_dir: canonical.join(PathBuf::from("Partial")),
             lang: init_i18n(),
+            host_state,
         })
     }
 
@@ -858,19 +864,16 @@ impl HostController for DirectFsControllerWrapper {
         }
     }
 
-    async fn get_path_to_db_backup_file(&self) -> Result<std::fs::File, BoxedError> {
+    async fn get_path_to_db_backup_file(
+        &self,
+        file_name: &BackupFileName,
+    ) -> Result<std::fs::File, BoxedError> {
         fs::create_dir_all(self.backup_dir.clone()).await?;
-        let date = Local::now();
-        let backup_path = self.backup_dir.join(PathBuf::from(format!(
-            "{}_fyles.bak",
-            // Current date in "yyyy-MM-dd" format
-            date.format("%Y-%m-%d")
-        )));
         let backup_file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&backup_path)?;
+            .open(self.backup_dir.join(file_name.as_str()))?;
         Ok(backup_file)
     }
 
@@ -1020,11 +1023,16 @@ impl HostController for DirectFsControllerWrapper {
             Err(e) => error!("Failed to send notification: {}", e),
         }
     }
+
+    fn host_state(&self) -> watch::Receiver<HostState> {
+        self.host_state.clone()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host_state::unsupported;
     use fyles_core::core::{
         domain_models::{FilerequestAccess, FylesId},
         filerequest_drive_handler::FilerequestDriveHandler,
@@ -1059,7 +1067,7 @@ mod tests {
             "Root not deep enough: {}",
             root.display()
         );
-        let handler = DirectFsController::new(root.to_string_lossy().to_string())
+        let handler = DirectFsController::new(root.to_string_lossy().to_string(), unsupported())
             .await
             .unwrap();
         let fr = make_filerequest(name);
@@ -1105,7 +1113,7 @@ mod tests {
         std::fs::set_permissions(&target, perms).unwrap();
 
         // Construct handler pointing at the non-writable directory
-        let handler = DirectFsController::new(target.to_string_lossy().to_string())
+        let handler = DirectFsController::new(target.to_string_lossy().to_string(), unsupported())
             .await
             .expect("handler creation");
         // Should have deescalated (added _0)
@@ -1155,9 +1163,10 @@ mod tests {
             std::fs::set_permissions(d, perms).unwrap();
         }
 
-        let handler = DirectFsController::new(original.to_string_lossy().to_string())
-            .await
-            .expect("handler creation");
+        let handler =
+            DirectFsController::new(original.to_string_lossy().to_string(), unsupported())
+                .await
+                .expect("handler creation");
 
         // Should have skipped zap and zap_0 -> landing on zap_1 (or higher if already present)
         let fname = handler
@@ -1273,13 +1282,8 @@ mod tests {
 
         // Clean up: remove created file and directory so we can replace it with a symlink.
         std::fs::remove_file(&first_path).expect("remove first file");
-        std::fs::remove_file(
-            PathBuf::from(first_path)
-                .parent()
-                .unwrap()
-                .join(OWNER_MARKER_FILENAME),
-        )
-        .expect("delete ownership marker");
+        std::fs::remove_file(first_path.parent().unwrap().join(OWNER_MARKER_FILENAME))
+            .expect("delete ownership marker");
         std::fs::remove_dir(&fr_dir).expect("remove original fr dir");
 
         // Point the symlink to the parent of the allowed root (or root itself if no parent).
@@ -1313,10 +1317,10 @@ mod tests {
         let root = deep_root_path(&tmp);
         fs::create_dir_all(&root).unwrap();
 
-        let handler1 = DirectFsController::new(root.to_string_lossy().to_string())
+        let handler1 = DirectFsController::new(root.to_string_lossy().to_string(), unsupported())
             .await
             .unwrap();
-        let handler2 = DirectFsController::new(root.to_string_lossy().to_string())
+        let handler2 = DirectFsController::new(root.to_string_lossy().to_string(), unsupported())
             .await
             .unwrap();
 

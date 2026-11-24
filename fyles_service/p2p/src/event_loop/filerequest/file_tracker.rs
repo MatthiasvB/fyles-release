@@ -1,10 +1,20 @@
-use crate::crypto::SessionEstablishmentError;
-use crate::event_loop::filerequest::send_manager::{LockedSendData, SendDataMut, SendRes};
-use crate::send_receive_traits::response_receiver::ResponseReceiver;
-use crate::send_receive_traits::session_send_receive::{
-    LocalReceiveError, ReceiveError, SessionSendError,
+use crate::constants::{LEGACY_RECHECK, STALL_ERROR_AFTER};
+#[cfg(feature = "debug-server")]
+use crate::debug::{NoContent, SerializeDebug};
+use crate::event_loop::filerequest::send_decision::{
+    self, ChunkStep, Opening, Party, Response, Verdict,
 };
-use crate::types::{FileRequest, FileResponse};
+use crate::event_loop::filerequest::send_manager::{
+    ContactPin, ControlRequest, DataPath, Request, SendDataMut, SendSlot,
+};
+use crate::file_stream::send::AttemptOutcome;
+use crate::send_receive_traits::response_receiver::ResponseReceiver;
+use crate::send_receive_traits::session_send_receive::{ReceiveError, SessionSendError};
+use crate::sessions::SessionEstablishmentError;
+use crate::source::{Source, SourceStamp};
+use crate::types::{
+    AttemptGrant, AttemptId, FileRequest, FileRequestV2, FileResponse, FileResponseV2,
+};
 use async_trait::async_trait;
 use crypto::{DeSerCryptError, SerCryptError};
 use fyles_core::core::brain::action_p2p::OpenFileForReadingRequest;
@@ -14,20 +24,22 @@ use fyles_core::core::{
     brain::{action::BrainAction, action_p2p::NetworkNodeAction},
     domain_models::{FylesId, PendingFile, SendStatus},
 };
-use fyles_core::library::util::util::TimeoutLock;
+use fyles_core::library::util::util::{TimeoutLock, TimeoutRwLock};
+use libp2p::PeerId;
 use libp2p::request_response::OutboundFailure;
-use libp2p::{Multiaddr, PeerId};
 use std::collections::VecDeque;
 use std::collections::hash_map::OccupiedEntry;
 use std::pin::Pin;
+use std::sync::atomic::AtomicU64;
 use std::{
     collections::{HashMap, hash_map::Entry},
     sync::Arc,
 };
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, RwLockWriteGuard, mpsc};
+use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use tracing::instrument::Instrumented;
 use tracing::{Instrument, Span, debug, debug_span, error, info, trace, warn};
-use crate::constants::STALL_ERROR_AFTER;
 
 pub enum FileTrackerReceivePayload {
     Response(FileResponse),
@@ -66,9 +78,19 @@ pub trait FileTracker:
         TransportError = OutboundFailure,
         EncryptError = SerCryptError,
         GetSessionError = Arc<SessionEstablishmentError>,
+    > + ResponseReceiver<
+        FileResponseV2,
+        NodeId = PeerId,
+        RequestId = usize,
+        DecryptError = DeSerCryptError,
+        TransportError = OutboundFailure,
+        EncryptError = SerCryptError,
+        GetSessionError = Arc<SessionEstablishmentError>,
     >
 {
     async fn add_pending_file(&self, peer: PeerId, file: PendingFile);
+
+    async fn on_attempt_finished(&self, peer: PeerId, attempt: AttemptId, outcome: AttemptOutcome);
 
     async fn trigger_interaction_with(&self, peer: PeerId);
 
@@ -83,9 +105,8 @@ pub trait FileTracker:
         peer_id: PeerId,
     ) -> Option<PeerId>;
 
-    async fn handle_outgoing_connection_error(&self, peer: PeerId, address: &Multiaddr);
-
-    async fn handle_non_correlatable_error(&self, peer: PeerId);
+    #[cfg(feature = "debug-server")]
+    async fn get_debug_blob(&self) -> Box<dyn SerializeDebug + Send>;
 }
 
 #[async_trait]
@@ -99,15 +120,14 @@ pub trait FileTrackerPlugin {
         has_sending_files: bool,
     );
 
-    async fn outgoing_connection_error(&mut self, peer: &PeerId, multiaddr: &Multiaddr);
-
-    async fn non_correlatable_outgoing_connection_error(&mut self, peer: &PeerId);
-
     async fn on_send_file_to_peer(&mut self, peer: PeerId);
 
     async fn interrupt_sending_to_peer(&mut self, peer: PeerId);
 
     async fn done_sending_to_peer(&mut self, peer: PeerId);
+
+    #[cfg(feature = "debug-server")]
+    async fn get_debug_blob(&self) -> Box<dyn SerializeDebug + Send>;
 }
 
 pub struct NoOpFileTrackerPlugin;
@@ -127,14 +147,6 @@ impl FileTrackerPlugin for NoOpFileTrackerPlugin {
         // do nothing
     }
 
-    async fn outgoing_connection_error(&mut self, _peer: &PeerId, _multiaddr: &Multiaddr) {
-        // do nothing
-    }
-
-    async fn non_correlatable_outgoing_connection_error(&mut self, _peer: &PeerId) {
-        // do nothing
-    }
-
     async fn on_send_file_to_peer(&mut self, _peer: PeerId) {
         // do nothing
     }
@@ -146,11 +158,17 @@ impl FileTrackerPlugin for NoOpFileTrackerPlugin {
     async fn done_sending_to_peer(&mut self, _peer: PeerId) {
         // do nothing
     }
+
+    #[cfg(feature = "debug-server")]
+    async fn get_debug_blob(&self) -> Box<dyn SerializeDebug + Send> {
+        Box::new(NoContent)
+    }
 }
 
 pub struct PeerFiles {
     pending: VecDeque<PendingFile>,
-    sending: Option<LockedSendData<usize>>,
+    sending: Option<SendSlot<usize>>,
+    wire: PeerWire,
     span: Span,
 }
 
@@ -159,16 +177,190 @@ impl Default for PeerFiles {
         Self {
             pending: Default::default(),
             sending: None,
+            wire: PeerWire::Streams,
             span: debug_span!(parent: None, "Peer send"),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wire {
+    Chunks,
+    Streams,
+}
+
+/// A peer that lacks the stream protocol is served chunks for a while, then asked again, so an
+/// update on its side is noticed.
+enum PeerWire {
+    Streams,
+    ChunksUntil(Instant),
+}
+
+impl PeerWire {
+    fn current(&self) -> Wire {
+        match self {
+            PeerWire::ChunksUntil(until) if Instant::now() < *until => Wire::Chunks,
+            _ => Wire::Streams,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum WireRequest {
+    Chunks(FileRequest),
+    Streams(FileRequestV2),
+}
+
+impl From<FileRequest> for WireRequest {
+    fn from(request: FileRequest) -> Self {
+        WireRequest::Chunks(request)
+    }
+}
+
+impl From<FileRequestV2> for WireRequest {
+    fn from(request: FileRequestV2) -> Self {
+        WireRequest::Streams(request)
+    }
+}
+
+fn abort_over(wire: Wire, transfer_uuid: Option<FylesId>) -> WireRequest {
+    match wire {
+        Wire::Chunks => FileRequest::AbortTransfer { transfer_uuid }.into(),
+        Wire::Streams => FileRequestV2::AbortTransfer { transfer_uuid }.into(),
+    }
+}
+
+fn offer_over(
+    wire: Wire,
+    filerequest_id: FylesId,
+    file_name: String,
+    transfer_data: &TransferData,
+) -> WireRequest {
+    let file_size_bytes = transfer_data.file_size_bytes;
+    let transfer_uuid = transfer_data.transfer_id.clone();
+    match wire {
+        Wire::Chunks => FileRequest::NewTransfer {
+            filerequest_id,
+            file_name,
+            file_size_bytes,
+            transfer_uuid,
+        }
+        .into(),
+        Wire::Streams => FileRequestV2::NewTransfer {
+            filerequest_id,
+            file_name,
+            file_size_bytes,
+            transfer_uuid,
+        }
+        .into(),
+    }
+}
+
+fn continue_over(wire: Wire, filerequest_id: FylesId, transfer_uuid: FylesId) -> WireRequest {
+    match wire {
+        Wire::Chunks => FileRequest::ContinueTransfer {
+            filerequest_id,
+            transfer_uuid,
+        }
+        .into(),
+        Wire::Streams => FileRequestV2::ContinueTransfer {
+            filerequest_id,
+            transfer_uuid,
+        }
+        .into(),
+    }
+}
+
+fn slot_over(
+    wire: Wire,
+    pending_file: PendingFile,
+    transfer_id: FylesId,
+    source: Source,
+    pin: ContactPin,
+) -> SendSlot<usize> {
+    match wire {
+        Wire::Chunks => SendSlot::chunked(pending_file, transfer_id, source, pin),
+        Wire::Streams => SendSlot::streamed(pending_file, transfer_id, source, pin),
+    }
+}
+
+fn violation_over(wire: Wire, transfer_uuid: Option<FylesId>) -> WireRequest {
+    match wire {
+        Wire::Chunks => FileRequest::ProtocolViolation { transfer_uuid }.into(),
+        Wire::Streams => FileRequestV2::ProtocolViolation { transfer_uuid }.into(),
+    }
+}
+
+fn wire_of(sending: &SendSlot<usize>) -> Wire {
+    match sending.path() {
+        DataPath::Chunked(_) => Wire::Chunks,
+        DataPath::Stream(_) => Wire::Streams,
+    }
+}
+
+/// What a stream attempt needs once the receiver has admitted it.
+pub struct AttemptStart {
+    pub grant: AttemptGrant,
+    pub source: Source,
+    pub offset: u64,
+    pub progress: Arc<AtomicU64>,
+    pub cancel: CancellationToken,
+    pub pending_file_id: FylesId,
+    pub transfer_data: TransferData,
+}
+
+pub type StartAttemptFn = Box<dyn Fn(PeerId, AttemptStart) + Send + Sync>;
+
+/// Work that has to wait until the `files` lock is released. The plugin lock in particular is
+/// taken only afterwards, since `provider_query_completed` takes the two the other way round.
+enum AfterUnlock {
+    SendChunks {
+        connected: Option<ContactId>,
+    },
+    Interrupted {
+        pending_file_id: FylesId,
+        status: SendStatus,
+        reason: &'static str,
+    },
+    ReportAndSendChunks {
+        pending_file_id: FylesId,
+        status: SendStatus,
+        connected: Option<ContactId>,
+    },
+    StartAttempt(Box<AttemptStart>),
+}
+
+/// Takes the send slot out of `peer`'s entry, together with what `request_id` asked of it. `None`
+/// when the current transfer never sent that request, for example because an earlier attempt did.
+fn claim_for_current_transfer(
+    files: &mut HashMap<PeerId, PeerFiles>,
+    peer: PeerId,
+    request_id: Result<usize, ()>,
+) -> Option<(
+    OccupiedEntry<'_, PeerId, PeerFiles>,
+    SendSlot<usize>,
+    Request,
+)> {
+    let Ok(request_id) = request_id else {
+        return None;
+    };
+    let Entry::Occupied(mut entry) = files.entry(peer) else {
+        return None;
+    };
+    let peer_files = entry.get_mut();
+    let mut sending = peer_files.sending.take()?;
+    let Some(request) = sending.claim(&request_id) else {
+        peer_files.sending = Some(sending);
+        return None;
+    };
+    Some((entry, sending, request))
 }
 
 pub type SendFn = Box<
     dyn Fn(
             PeerId,
             Option<ContactId>,
-            FileRequest,
+            WireRequest,
         ) -> Pin<
             Box<
                 dyn Future<
@@ -186,7 +378,7 @@ pub type SpanSendFn = Box<
     dyn Fn(
             PeerId,
             Option<ContactId>,
-            FileRequest,
+            WireRequest,
             Span,
         ) -> Instrumented<
             Pin<
@@ -221,15 +413,14 @@ pub struct CoreFileTracker<P: FileTrackerPlugin = NoOpFileTrackerPlugin> {
     brain_action_sender: mpsc::Sender<BrainAction>,
     send: SendFn,
     send_idempotent: SendFn,
+    start_attempt: StartAttemptFn,
     pub plugin: Arc<Mutex<P>>,
 }
 
-#[derive(Debug)]
-pub enum ContactVerificationResult {
-    Verified,
-    ContactIsUnknown,
-    VerificationFailed,
-    InternalError,
+/// Put the thing back. Otherwise attackers can permanently stuck this app. Someone passing as the
+/// peer may delay a transfer, but must neither wedge it nor decide its outcome.
+fn put_back(entry: &mut OccupiedEntry<'_, PeerId, PeerFiles>, sending: SendSlot<usize>) {
+    entry.get_mut().sending = Some(sending);
 }
 
 macro_rules! light_ref {
@@ -249,7 +440,7 @@ impl<P: FileTrackerPlugin> CoreFileTracker<P> {
         &self,
         peer_id: PeerId,
         contact_id: Option<ContactId>,
-        request: FileRequest,
+        request: WireRequest,
         span: Span,
         path: Option<&str>,
     ) -> Instrumented<
@@ -276,7 +467,7 @@ impl<P: FileTrackerPlugin> CoreFileTracker<P> {
         &self,
         peer_id: PeerId,
         contact_id: Option<ContactId>,
-        request: FileRequest,
+        request: WireRequest,
         span: Span,
         path: Option<&str>,
     ) -> Instrumented<
@@ -296,63 +487,6 @@ impl<P: FileTrackerPlugin> CoreFileTracker<P> {
             (self.send_idempotent)(peer_id, contact_id, request)
         });
         future.instrument(span)
-    }
-
-    async fn verify_target_contact_id(
-        &self,
-        target_node_id: PeerId,
-        target_contact_id: &ContactId,
-        connected_contact_id: &Option<ContactId>,
-    ) -> ContactVerificationResult
-    where
-        P: Send,
-    {
-        let target_filerequest_contact_id = target_contact_id;
-        let (request, response) =
-            BrainRequest::with_receiver(target_filerequest_contact_id.clone());
-        self.brain_action_sender
-            .send(BrainAction::NetworkNode(NetworkNodeAction::IsContactKnown(
-                request,
-            )))
-            .await
-            .expect("Sending to work");
-        let target_contact_is_known_res = response.await.expect("Sender not dropped");
-
-        match target_contact_is_known_res {
-            Err(message) => {
-                error!(peer=?target_node_id, message, "Error while trying to verify contact. Sending internal error");
-                self.reset_all_on_internal_error_for(target_node_id).await;
-                ContactVerificationResult::InternalError
-            }
-            Ok(target_contact_is_known) => {
-                if target_contact_is_known {
-                    trace!("Target contact is known, so MUST verify that IDs match");
-                    if !connected_contact_id
-                        .as_ref()
-                        .is_some_and(|id| id == target_filerequest_contact_id)
-                    {
-                        match connected_contact_id {
-                            Some(evil_id) => {
-                                // This means that either somebody we know is impersonating the peer behind that libp2p PeerId, or that peer has since change its contact id and the filerequest has become invalid.
-                                warn!(peer=?target_node_id, filerequest_target_contact_id=?target_filerequest_contact_id, reached_contact_id=?evil_id, "Tried to dial a peer to send a file, but reached a contact that does not belong to the target filerequest.")
-                            }
-                            None => {
-                                // This means that either somebody we don't know is impersonating the peer behind that libp2p PeerId, or that peer has since change its contact id and the filerequest has become invalid.
-                                warn!(peer=?target_node_id, filerequest_target_contact_id=?target_filerequest_contact_id, "We know the contact behind this peer id, but we don't know the contact we are talking to. So we do not send that file.")
-                            }
-                        }
-                        ContactVerificationResult::VerificationFailed
-                    } else {
-                        trace!("Contact was verified");
-                        ContactVerificationResult::Verified
-                    }
-                } else {
-                    // Since we don't know the target contact, we can't verify him. So we just send a file and hope that libp2p's authentication isn't broken
-                    trace!("Target contact is not known, so we send file blindly");
-                    ContactVerificationResult::ContactIsUnknown
-                }
-            }
-        }
     }
 }
 
@@ -388,14 +522,17 @@ impl<'a, P: FileTrackerPlugin + Send> CoreFileTrackerRef<'a, P> {
                 return;
             };
 
-            let progress = match &next_to_send.status {
-                SendStatus::Pending => 0,
-                SendStatus::InProgress(InProgress { transfer_data, .. }) => {
-                    transfer_data.progress_bytes
-                }
-                _ => {
-                    error!(peer=?node_id, file=?next_to_send, "Trying to get progress for a file with a nonsense status");
-                    self.complete_file(entry, next_to_send.id.clone(), FileOutcome::Failed).await;
+            let Ok(opening) = send_decision::opening(&next_to_send.status) else {
+                error!(peer=?node_id, file=?next_to_send, "Pending file has a status it cannot be sent with, failing it");
+                self.complete_file(entry, next_to_send.id.clone(), FileOutcome::Failed).await;
+                return;
+            };
+
+            let pin = match self.starting_pin(&next_to_send.contact_id).await {
+                Ok(pin) => pin,
+                Err(message) => {
+                    error!(peer=?node_id, message, "Could not tell whether we hold the target's keys, setting back to pending");
+                    peer_files.pending.push_front(next_to_send);
                     return;
                 }
             };
@@ -403,7 +540,7 @@ impl<'a, P: FileTrackerPlugin + Send> CoreFileTrackerRef<'a, P> {
             let (request, response) = BrainRequest::with_receiver(OpenFileForReadingRequest {
                 uri: next_to_send.file_path.clone().into(),
                 id: next_to_send.id.clone(),
-                byte_offset: progress,
+                byte_offset: opening.offset(),
             });
             self.brain_action_sender
                 .send(BrainAction::NetworkNode(
@@ -422,9 +559,9 @@ impl<'a, P: FileTrackerPlugin + Send> CoreFileTrackerRef<'a, P> {
                 Box::pin(self.send_next(node_id, entry)).await;
                 return;
             };
-            let file_size_bytes = match file.file.metadata().await {
+            let source = match Source::open(file.file).await {
                 Err(e) => {
-                    error!(peer=?node_id, file=?next_to_send, error=?e, "Could not get filesize");
+                    error!(peer=?node_id, file=?next_to_send, error=?e, "Could not inspect the source file");
                     self.brain_action_sender
                         .send(BrainAction::NetworkNode(NetworkNodeAction::FileMissing {
                             pending_file_id: next_to_send.id.clone(),
@@ -434,106 +571,65 @@ impl<'a, P: FileTrackerPlugin + Send> CoreFileTrackerRef<'a, P> {
                     Box::pin(self.send_next(node_id, entry)).await;
                     return;
                 }
-                Ok(metadata) => metadata.len(),
+                Ok(source) => source,
             };
+            let stamp = source.stamp();
+            let wire = peer_files.wire.current();
+            let opening_request = opening.request();
 
-            trace!(status = ?next_to_send.status, "Next to send status");
+            trace!(status = ?next_to_send.status, ?wire, "Next to send status");
 
-            match next_to_send.status.clone() {
-                SendStatus::Pending => {
-                    let transfer_uuid: FylesId = Default::default();
-
-                    if let Ok(_id) = (self.send)(
-                        node_id,
-                        Some(next_to_send.contact_id.clone()),
-                        FileRequest::NewTransfer {
-                            filerequest_id: next_to_send.target_filerequest_id.clone(),
-                            file_name: file.file_name,
-                            file_size_bytes,
-                            transfer_uuid: transfer_uuid.clone(),
-                        },
-                    )
-                        .await
-                    {
-                        next_to_send.status = InProgress {
-                            status: InProgressSendStatus::Prepared,
-                            transfer_data: TransferData {
-                                progress_bytes: 0,
-                                file_size_bytes,
-                                transfer_id: transfer_uuid.clone(),
-                            },
-                        }
-                            .into();
-                        let send_data =
-                            LockedSendData::new(next_to_send.clone(), transfer_uuid.clone(), file_size_bytes, file.file);
-                        trace!("Setting next file into the sending slot");
-                        peer_files.sending = Some(send_data);
-                    } else {
-                        warn!(peer=?node_id, "Error trying to send, setting back to pending");
-                        peer_files.pending.push_front(next_to_send);
+            let filerequest_id = next_to_send.target_filerequest_id.clone();
+            let (request, transfer_data) = match opening {
+                Opening::Offer => {
+                    let transfer_data = TransferData {
+                        progress_bytes: 0,
+                        file_size_bytes: stamp.size_bytes,
+                        source_modified_ms: stamp.modified_ms,
+                        transfer_id: FylesId::default(),
+                    };
+                    let offer = offer_over(
+                        wire,
+                        filerequest_id,
+                        file.file_name,
+                        &transfer_data,
+                    );
+                    (offer, transfer_data)
+                }
+                Opening::Continue(transfer_data) => {
+                    if stamp != SourceStamp::recorded_in(&transfer_data) {
+                        info!(peer=?node_id, file=?next_to_send, ?stamp, "Source file changed since the interrupted transfer, starting over");
+                        drop(source);
+                        self.restart_as_new(
+                            entry,
+                            next_to_send,
+                            transfer_data.transfer_id,
+                            wire,
+                            "Source file changed since the interrupted transfer",
+                        )
+                        .await;
                         return;
                     }
+                    let continuation =
+                        continue_over(wire, filerequest_id, transfer_data.transfer_id.clone());
+                    (continuation, transfer_data)
                 }
-                SendStatus::InProgress(
-                    mut in_progress @ InProgress {
-                        status: InProgressSendStatus::Interrupted,
-                        ..
-                    },
-                ) => {
-                    if let Ok(_id) = (self.send)(
-                        node_id,
-                        Some(next_to_send.contact_id.clone()),
-                        FileRequest::ContinueTransfer {
-                            filerequest_id: next_to_send.target_filerequest_id.clone(),
-                            transfer_uuid: in_progress.transfer_data.transfer_id.clone(),
-                        },
-                    )
-                        .await
-                    {
-                        let mut send_data = LockedSendData::new(
-                            next_to_send.clone(),
-                            in_progress.transfer_data.transfer_id.clone(),
-                            file_size_bytes,
-                            file.file,
-                        );
-                        in_progress.status = InProgressSendStatus::Prepared;
-                        send_data.pending_file.status = in_progress.into();
-                        info!(peer=?node_id, pending_file=?send_data.pending_file, "Sent continuation request, setting `sending`");
-                        peer_files.sending = Some(send_data);
-                    }
-                }
-                SendStatus::Unknown(ref status) => {
-                    warn!(peer=?node_id, file=?next_to_send, "Pending file has unknown status \"{status}\", won't send this");
-                    self.brain_action_sender
-                        .send(BrainAction::NetworkNode(NetworkNodeAction::FileFailed {
-                            pending_file_id: next_to_send.id.clone(),
-                        }))
-                        .await
-                        .expect("Sending to work");
-                    Box::pin(self.send_next(node_id, entry)).await;
-                    return;
-                }
-                _ => {
-                    error!(peer=?node_id, file=?next_to_send, "Pending file has status that is neither sending nor interrupted. Dropping it");
-                    self.brain_action_sender
-                        .send(BrainAction::NetworkNode(NetworkNodeAction::FileFailed {
-                            pending_file_id: next_to_send.id.clone(),
-                        }))
-                        .await
-                        .expect("Sending to work");
-                    Box::pin(self.send_next(node_id, entry)).await;
-                    return;
-                }
+            };
+            let Ok(request_id) = (self.send)(node_id, Some(next_to_send.contact_id.clone()), request).await else {
+                warn!(peer=?node_id, ?opening_request, "Error trying to send, setting back to pending");
+                peer_files.pending.push_front(next_to_send);
+                return;
+            };
+            let transfer_id = transfer_data.transfer_id.clone();
+            next_to_send.status = InProgress {
+                status: InProgressSendStatus::Prepared,
+                transfer_data,
             }
-            if !matches!(next_to_send.status, SendStatus::InProgress(InProgress{ status: InProgressSendStatus::Prepared | InProgressSendStatus::PendingSent, ..})) {
-                self.brain_action_sender
-                    .send(BrainAction::NetworkNode(NetworkNodeAction::FileSending {
-                        pending_file_id: next_to_send.id,
-                        status: next_to_send.status,
-                    }))
-                    .await
-                    .expect("Sending to work");
-            }
+            .into();
+            let mut slot = slot_over(wire, next_to_send, transfer_id, source, pin);
+            slot.await_response(request_id, opening_request);
+            debug!(peer=?node_id, pending_file=?slot.pending_file, "Sent the opening request, setting `sending`");
+            peer_files.sending = Some(slot);
 
             self.plugin
                 .timeout_lock()
@@ -541,6 +637,51 @@ impl<'a, P: FileTrackerPlugin + Send> CoreFileTrackerRef<'a, P> {
                 .on_send_file_to_peer(node_id)
                 .await;
         }.instrument(span).await
+    }
+
+    async fn starting_pin(&self, target: &ContactId) -> Result<ContactPin, String> {
+        let (request, response) = BrainRequest::with_receiver(target.clone());
+        self.brain_action_sender
+            .send(BrainAction::NetworkNode(
+                NetworkNodeAction::HoldsContactKeys(request),
+            ))
+            .await
+            .expect("Sending to work");
+        Ok(match response.await.expect("Sender not to be dropped")? {
+            true => ContactPin::Pinned,
+            false => ContactPin::Unpinned,
+        })
+    }
+
+    async fn restart_as_new(
+        &mut self,
+        mut entry: OccupiedEntry<'a, PeerId, PeerFiles>,
+        mut file: PendingFile,
+        abandoned: FylesId,
+        wire: Wire,
+        reason: &str,
+    ) {
+        let node_id = *entry.key();
+        let _ = (self.send)(
+            node_id,
+            Some(file.contact_id.clone()),
+            abort_over(wire, Some(abandoned)),
+        )
+        .await;
+        file.status = SendStatus::Pending;
+        self.brain_action_sender
+            .send(BrainAction::NetworkNode(NetworkNodeAction::FileSendReset {
+                pending_file_id: file.id.clone(),
+                status: SendStatus::Pending,
+                retry_count: None,
+                reason: Some(reason.into()),
+            }))
+            .await
+            .expect("Sending to work");
+        entry.get_mut().pending.push_front(file);
+        // Not awaiting the confirmation is safe: the abort names the abandoned transfer, so in
+        // whichever order the receiver sees the two, it cannot take down the new one.
+        Box::pin(self.send_next(node_id, entry)).await;
     }
 
     /// Terminally complete a file: notify the brain, then advance to the next file.
@@ -576,10 +717,10 @@ impl<'a, P: FileTrackerPlugin + Send> CoreFileTrackerRef<'a, P> {
                     error,
                 },
             };
-            let _ = self
-                .brain_action_sender
+            self.brain_action_sender
                 .send(BrainAction::NetworkNode(brain_action))
-                .await;
+                .await
+                .expect("Sending to work");
             Box::pin(self.send_next(node_id, entry)).await;
         }
         .instrument(span)
@@ -595,16 +736,16 @@ impl<'a, P: FileTrackerPlugin + Send> CoreFileTrackerRef<'a, P> {
     async fn reset_and_stop(
         &mut self,
         mut entry: OccupiedEntry<'a, PeerId, PeerFiles>,
-        mut sending: LockedSendData<usize>,
+        mut sending: SendSlot<usize>,
         reason: String,
     ) {
         let span = entry.get().span.clone();
         let peer = *entry.key();
         async move {
-            let reset_status = Self::compute_reset_status(&mut sending);
+            let reset_status = send_decision::reset_status(&mut sending);
             debug!(new_status=?reset_status, "reset_and_stop: resetting in brain, interrupting plugin");
             sending.pending_file.status = reset_status.clone();
-            let _ = self
+            self
                 .brain_action_sender
                 .send(BrainAction::NetworkNode(NetworkNodeAction::FileSendReset {
                     pending_file_id: sending.pending_file.id.clone(),
@@ -612,7 +753,8 @@ impl<'a, P: FileTrackerPlugin + Send> CoreFileTrackerRef<'a, P> {
                     retry_count: Some(sending.pending_file.retry_count),
                     reason: Some(reason),
                 }))
-                .await;
+                .await
+                .expect("Sending to work");
             entry.get_mut().pending.push_back(sending.pending_file);
             let mut plugin = self.plugin.timeout_lock().await;
             plugin.interrupt_sending_to_peer(peer).await;
@@ -620,18 +762,16 @@ impl<'a, P: FileTrackerPlugin + Send> CoreFileTrackerRef<'a, P> {
         }.instrument(span).await
     }
 
-    /// Reset the sending file back to pending, respecting retry limits.
-    ///
-    /// If the retry count exceeds the threshold (based on file size), the file
-    /// is terminally completed as `Failed` and we advance to the next file.
-    /// Otherwise it is pushed back to pending, the brain is notified with
-    /// `FileSendReset`, and the plugin is told to interrupt and re-schedule.
-    async fn reset_and_retry(
+    /// Counts the violation and fails the file once the count passes a limit that grows with the
+    /// file's size. Only a violation the authenticated peer could cause may come here, or anyone on
+    /// the path could fail the transfer.
+    async fn count_violation(
         &mut self,
         entry: OccupiedEntry<'a, PeerId, PeerFiles>,
-        sending: LockedSendData<usize>,
+        mut sending: SendSlot<usize>,
         reason: String,
     ) {
+        sending.pending_file.retry_count += 1;
         let span = entry.get().span.clone();
         let file_size = sending.get_file_size_bytes();
         let gigabyte = 1_000_000_000;
@@ -656,82 +796,20 @@ impl<'a, P: FileTrackerPlugin + Send> CoreFileTrackerRef<'a, P> {
         .instrument(span)
         .await;
     }
-
-    /// Compute the appropriate reset status for a file being pushed back to pending.
-    /// Prepared → Pending (ephemeral, brain never knew), everything else → Interrupted.
-    fn compute_reset_status(sending: &mut LockedSendData<usize>) -> SendStatus {
-        match sending.pending_file.status {
-            SendStatus::InProgress(InProgress {
-                status: InProgressSendStatus::Prepared,
-                ref transfer_data,
-                ..
-            }) => {
-                if transfer_data.progress_bytes > 0 {
-                    // Was a ContinueTransfer — preserve progress
-                    SendStatus::InProgress(InProgress {
-                        status: InProgressSendStatus::Interrupted,
-                        transfer_data: transfer_data.clone(),
-                    })
-                } else {
-                    SendStatus::Pending
-                }
-            }
-            SendStatus::InProgress(InProgress {
-                ref transfer_data, ..
-            }) => SendStatus::InProgress(InProgress {
-                status: InProgressSendStatus::Interrupted,
-                transfer_data: transfer_data.clone(),
-            }),
-            _ => SendStatus::Pending,
-        }
-    }
-
-    /// Reset any active sending state for a peer (e.g. on connection loss or protocol violation).
-    ///
-    /// Takes the sending slot, pushes back to pending with appropriate status,
-    /// notifies brain and plugin. Returns the contact_id if there was a sending file.
-    async fn reset_all(&mut self, entry: Entry<'a, PeerId, PeerFiles>) -> Option<ContactId> {
-        if let Entry::Occupied(peer_files) = entry {
-            peer_files.get().span.in_scope(|| {
-                debug!("Resetting");
-            });
-            self.reset_all_with_occupied(peer_files).await
-        } else {
-            None
-        }
-    }
-
-    async fn reset_all_with_occupied(
-        &mut self,
-        mut entry: OccupiedEntry<'a, PeerId, PeerFiles>,
-    ) -> Option<ContactId> {
-        let span = entry.get().span.clone();
-        async move {
-            let peer_files = entry.get_mut();
-            let Some(sending) = peer_files.sending.take() else {
-                trace!("No sending state - nothing to reset");
-                return None;
-            };
-            let contact_id = sending.pending_file.contact_id.clone();
-            self.reset_and_stop(entry, sending, "Peer disconnected while sending".into())
-                .await;
-            Some(contact_id)
-        }
-        .instrument(span)
-        .await
-    }
 }
 
 pub fn new_core_file_tracker(
     brain_action_sender: mpsc::Sender<BrainAction>,
     send: SendFn,
     send_idempotent: SendFn,
+    start_attempt: StartAttemptFn,
 ) -> CoreFileTracker<NoOpFileTrackerPlugin> {
     CoreFileTracker {
         files: Default::default(),
         brain_action_sender,
         send,
         send_idempotent,
+        start_attempt,
         plugin: Mutex::new(NoOpFileTrackerPlugin {}).into(),
     }
 }
@@ -741,6 +819,7 @@ impl<P: FileTrackerPlugin + Send> CoreFileTracker<P> {
         brain_action_sender: mpsc::Sender<BrainAction>,
         send: SendFn,
         send_idempotent: SendFn,
+        start_attempt: StartAttemptFn,
         plugin: P,
     ) -> Self {
         Self {
@@ -748,314 +827,373 @@ impl<P: FileTrackerPlugin + Send> CoreFileTracker<P> {
             brain_action_sender,
             send,
             send_idempotent,
+            start_attempt,
             plugin: Mutex::new(plugin).into(),
         }
     }
 
     pub async fn has_pending_files_for(&self, peer: &PeerId) -> bool {
-        if let Some(peer_files) = self.files.read().await.get(peer) {
+        if let Some(peer_files) = self.files.timeout_read().await.get(peer) {
             !peer_files.pending.is_empty()
         } else {
             false
         }
     }
 
-    /// Common loop that sends file chunks to a peer until the send manager
-    /// reports not-ready, done, an I/O error, or an interrupt.
-    /// Re-acquires the write lock each iteration to avoid holding it across await points.
-    /// Handles `send_next_after_error` internally.
+    /// Sends chunks until the window is full, the last chunk is out, or the transfer stops.
     async fn send_chunks_loop(&self, node_id: PeerId, connected_contact_id: &Option<ContactId>) {
         loop {
-            let mut files = self.files.write().await;
-            let raw_entry = files.entry(node_id);
-            let Entry::Occupied(mut entry) = raw_entry else {
+            let mut files = self.files.timeout_write().await;
+            let Entry::Occupied(mut entry) = files.entry(node_id) else {
                 // Could be that a parallel receive thread has finished the transfer, so this
                 // is a valid case
                 break;
             };
-            let peer_files = entry.get_mut();
-            let Some(sd) = &mut peer_files.sending else {
-                peer_files.span.in_scope(|| {
-                    trace!("No send data, exiting send loop");
-                });
+            let span = entry.get().span.clone();
+            let Some(mut sending) = entry.get_mut().sending.take() else {
+                span.in_scope(|| trace!("No send data, exiting send loop"));
                 break;
             };
-            let Some(sending) = sd.unlock_mut(connected_contact_id) else {
-                warn!(expected=?sd.pending_file.contact_id, got=?connected_contact_id, "Incorrect contact id for file send in loop. Aborting.");
+            let Some(SendDataMut { path, pending_file }) =
+                sending.advance_for(connected_contact_id)
+            else {
+                warn!(expected=?sending.pending_file.contact_id, got=?connected_contact_id, "Incorrect contact id for file send in loop. Aborting.");
+                light_ref!(self)
+                    .reset_and_stop(entry, sending, "Contact verification failed".into())
+                    .await;
                 return;
             };
-
             let PendingFile {
                 status,
                 file_path,
-                id,
                 contact_id,
                 ..
-            } = sending.pending_file;
-            let span = peer_files.span.clone();
-            match sending
-                .send_manager
+            } = pending_file;
+            let (
+                Some(send_manager),
+                SendStatus::InProgress(InProgress {
+                    status: phase @ InProgressSendStatus::Sending,
+                    ..
+                }),
+            ) = (path.chunked_mut(), status)
+            else {
+                span.in_scope(|| trace!("Not sending chunks, exiting send loop"));
+                put_back(&mut entry, sending);
+                break;
+            };
+            let res = send_manager
                 .send_next_chunk(|chunk| {
                     self.send_idempotent_instrumented(
                         node_id,
                         Some(contact_id.clone()),
-                        FileRequest::Chunk(chunk),
-                        span,
+                        FileRequest::Chunk(chunk).into(),
+                        span.clone(),
                         Some(file_path.as_str()),
                     )
                 })
-                .await
-            {
-                SendRes::NotReady => {
-                    peer_files.span.in_scope(|| {
-                        trace!("File reader not ready");
-                    });
+                .await;
+            let verdict = match send_decision::on_chunk_send(res) {
+                ChunkStep::Wait => {
+                    span.in_scope(|| trace!("File reader not ready"));
+                    put_back(&mut entry, sending);
                     break;
                 }
-                SendRes::Sent(_id) => {
-                    peer_files.span.in_scope(|| {
-                        trace!(peer=?node_id, "Sent chunk");
-                    });
+                ChunkStep::Continue => {
+                    span.in_scope(|| trace!(peer=?node_id, "Sent chunk"));
+                    put_back(&mut entry, sending);
+                    continue;
                 }
-                SendRes::Done => {
-                    peer_files.span.in_scope(|| {
-                        debug!("File reader is done");
-                    });
-                    if let Ok(_id) = self
+                ChunkStep::SendDone => {
+                    span.in_scope(|| debug!("File reader is done"));
+                    let done = FileRequest::Done {
+                        transfer_uuid: send_manager.transfer_id.clone(),
+                    };
+                    match self
                         .send_instrumented(
                             node_id,
                             Some(contact_id.clone()),
-                            FileRequest::Done {
-                                transfer_uuid: sending.send_manager.transfer_id.clone(),
-                            },
-                            peer_files.span.clone(),
+                            done.into(),
+                            span.clone(),
                             Some(file_path.as_str()),
                         )
                         .await
                     {
-                        if let SendStatus::InProgress(InProgress {
-                            status: status @ InProgressSendStatus::Sending,
-                            ..
-                        }) = status
-                        {
-                            peer_files.span.in_scope(|| {
-                                trace!("Setting status to pending sent");
-                            });
-                            *status = InProgressSendStatus::PendingSent;
-                        } else {
-                            peer_files.span.in_scope(|| {
-                                error!(peer=?node_id, ?status, "File in unexpected send status after being done sending")
-                            });
+                        Ok(request_id) => {
+                            send_manager.await_response(request_id, ControlRequest::Done);
+                            *phase = InProgressSendStatus::PendingSent;
+                            put_back(&mut entry, sending);
+                            break;
                         }
-                    } else {
-                        if status.transfer_data().is_none() {
-                            peer_files.span.in_scope(|| {
-                                error!(peer=?node_id, "File in unexpected send state after failing to send request");
-                            });
-                            return;
-                        };
-                        peer_files.span.in_scope(|| {
-                            warn!(peer=?node_id, "Resetting because sending failed after receiving response");
-                        });
-                        light_ref!(self).reset_all_with_occupied(entry).await;
+                        Err(_) => Verdict::SetBack("Could not send done".into()),
                     }
-                    break;
                 }
-                SendRes::IoError(e) => {
-                    peer_files.span.in_scope(|| {
-                        error!(peer=?node_id, "Error while reading file {}: {e}", file_path);
-                    });
-                    let transfer_id = sending.send_manager.transfer_id.clone();
-                    let contact_id = contact_id.clone();
-                    let file_id = id.clone();
-                    let io_error = e;
-                    // Take the sending slot and abort with the peer
-                    peer_files.sending = None;
-                    let _ = self
-                        .send_instrumented(
-                            node_id,
-                            Some(contact_id),
-                            FileRequest::AbortTransfer {
-                                transfer_uuid: Some(transfer_id),
-                            },
-                            peer_files.span.clone(),
-                            peer_files
-                                .sending
-                                .as_ref()
-                                .map(|it| it.pending_file.file_path.as_str()),
-                        )
-                        .await;
-                    // Notify brain and advance to next file
-                    light_ref!(self)
-                        .complete_file(entry, file_id, FileOutcome::IoError(io_error))
-                        .await;
-                    break;
-                }
-                SendRes::Interrupt => {
-                    // Do not increase retry count. This is likely due to a network issue.
-                    peer_files.span.in_scope(|| {
-                        warn!(peer=?node_id, "Interrupting transfer because file tracker could not send, going to push back into pending files");
-                    });
-                    let Some(transfer_data) = status.transfer_data() else {
-                        peer_files.span.in_scope(|| {
-                            error!(peer=?node_id, "File in unexpected send state after getting interrupt response from send manager");
-                        });
-                        return;
-                    };
-                    let pending_file_id = id.clone();
-                    let interrupted_status: SendStatus = InProgress {
-                        status: InProgressSendStatus::Interrupted,
-                        transfer_data: transfer_data.clone(),
-                    }
-                    .into();
-
-                    // Push the sending file back to pending before releasing the lock
-                    if let Some(mut sending) = peer_files.sending.take() {
-                        sending.pending_file.status = interrupted_status.clone();
-                        peer_files.pending.push_back(sending.pending_file);
-                    }
-
-                    // Drop the files write lock BEFORE acquiring the plugin lock
-                    // to avoid lock ordering inversion with provider_query_completed
-                    // (which acquires plugin → files).
-                    drop(files);
-
-                    let _ = self
-                        .brain_action_sender
-                        .send(BrainAction::NetworkNode(NetworkNodeAction::FileSendReset {
-                            pending_file_id,
-                            status: interrupted_status,
-                            retry_count: None,
-                            reason: Some(
-                                "Send interrupted: file tracker could not send to peer".into(),
-                            ),
-                        }))
-                        .await;
-                    self.plugin
-                        .timeout_lock()
-                        .await
-                        .interrupt_sending_to_peer(node_id)
-                        .await;
-
-                    break;
-                }
+                ChunkStep::Stop(verdict) => verdict,
+            };
+            let after = self
+                .carry_out(entry, sending, verdict)
+                .instrument(span.clone())
+                .await;
+            drop(files);
+            if let Some(after) = after {
+                self.after_unlock(node_id, after).instrument(span).await;
             }
+            break;
         }
     }
 
-    async fn reset_all_on_internal_error_for(&self, peer: PeerId) {
-        let mut files = self.files.write().await;
-        let entry = files.entry(peer);
-        self.reset_all_on_internal_error_for_entry(peer, entry)
+    async fn receive(
+        &self,
+        node_id: PeerId,
+        contact_id: Option<ContactId>,
+        request_id: Result<usize, ()>,
+        response: Response,
+    ) {
+        trace!(peer=?node_id, ?response, ?request_id, "Got filerequest response");
+        let mut files = self.files.timeout_write().await;
+        let Some((entry, mut sending, request)) =
+            claim_for_current_transfer(&mut files, node_id, request_id)
+        else {
+            self.on_unclaimed(files, node_id, request_id, response)
+                .await;
+            return;
+        };
+        let span = entry.get().span.clone();
+        let verdict = span
+            .in_scope(|| send_decision::on_response(&mut sending, &contact_id, request, response));
+        let after = self
+            .carry_out(entry, sending, verdict)
+            .instrument(span.clone())
             .await;
+        drop(files);
+        if let Some(after) = after {
+            self.after_unlock(node_id, after).instrument(span).await;
+        }
     }
 
-    async fn reset_all_on_internal_error_for_entry(
+    async fn on_unclaimed(
         &self,
-        peer: PeerId,
-        mut entry: Entry<'_, PeerId, PeerFiles>,
+        mut files: RwLockWriteGuard<'_, HashMap<PeerId, PeerFiles>>,
+        node_id: PeerId,
+        request_id: Result<usize, ()>,
+        response: Response,
     ) {
-        let (transfer_uuid, contact_id, span) = match &mut entry {
-            Entry::Vacant(_) => (None, None, None),
-            Entry::Occupied(peer_files) => {
-                let peer_files = peer_files.get_mut();
-                let span = peer_files.span.clone();
-                peer_files.span.in_scope(|| {
-                    warn!("Resetting on internal error, sending abort transfer");
-                    if let Some(ref mut sending) = peer_files.sending {
-                        sending.pending_file.retry_count += 1;
-                        warn!(
-                            retry_count = sending.pending_file.retry_count,
-                            "Increased retry count"
-                        );
-                        (
-                            Some(sending.get_transfer_id().clone()),
-                            Some(sending.pending_file.contact_id.clone()),
-                            Some(span),
-                        )
-                    } else {
-                        (None, None, Some(span))
-                    }
+        match response {
+            Response::ConfirmAbort => {
+                let Entry::Occupied(entry) = files.entry(node_id) else {
+                    debug!(peer=?node_id, "Abort confirmed, but we don't know for what");
+                    return;
+                };
+                entry.get().span.in_scope(|| {
+                    debug!(peer=?node_id, ?request_id, "Abort confirmed");
+                });
+                if entry.get().sending.is_none() {
+                    light_ref!(self).send_next(node_id, entry).await;
+                } else {
+                    debug!(peer=?node_id, "Abort confirmed while a newer transfer is under way");
+                }
+            }
+            Response::AcknowledgeViolation => {
+                debug!(peer=?node_id, "Other end acknowledged protocol violation");
+            }
+            response => debug!(
+                peer=?node_id,
+                ?request_id,
+                ?response,
+                "Response to a request the current transfer did not send, ignoring"
+            ),
+        }
+    }
+
+    /// Carries out a verdict while the `files` lock is held, and hands back what has to wait until
+    /// the lock is released.
+    async fn carry_out(
+        &self,
+        mut entry: OccupiedEntry<'_, PeerId, PeerFiles>,
+        sending: SendSlot<usize>,
+        verdict: Verdict,
+    ) -> Option<AfterUnlock> {
+        match verdict {
+            Verdict::Complete(outcome) => {
+                light_ref!(self)
+                    .complete_file(entry, sending.pending_file.id, outcome)
+                    .await;
+                None
+            }
+            Verdict::SetBack(reason) => {
+                light_ref!(self)
+                    .reset_and_stop(entry, sending, reason)
+                    .await;
+                None
+            }
+            Verdict::Violation(Party::Us, reason) => {
+                light_ref!(self)
+                    .count_violation(entry, sending, reason.into())
+                    .await;
+                None
+            }
+            Verdict::Violation(Party::Peer, reason) => {
+                self.violated_by_peer(entry, sending, reason).await;
+                None
+            }
+            Verdict::RestartAsNew(reason) => {
+                let abandoned = sending.get_transfer_id().clone();
+                let wire = wire_of(&sending);
+                light_ref!(self)
+                    .restart_as_new(entry, sending.pending_file, abandoned, wire, reason)
+                    .await;
+                None
+            }
+            Verdict::AbortAndComplete(outcome) => {
+                let peer = *entry.key();
+                let span = entry.get().span.clone();
+                let abort = abort_over(wire_of(&sending), Some(sending.get_transfer_id().clone()));
+                let _ = self
+                    .send_instrumented(
+                        peer,
+                        Some(sending.pending_file.contact_id.clone()),
+                        abort,
+                        span,
+                        Some(sending.pending_file.file_path.as_str()),
+                    )
+                    .await;
+                light_ref!(self)
+                    .complete_file(entry, sending.pending_file.id, outcome)
+                    .await;
+                None
+            }
+            Verdict::Interrupt(reason) => {
+                let mut sending = sending;
+                let status = send_decision::reset_status(&mut sending);
+                let pending_file_id = sending.pending_file.id.clone();
+                sending.pending_file.status = status.clone();
+                entry.get_mut().pending.push_back(sending.pending_file);
+                Some(AfterUnlock::Interrupted {
+                    pending_file_id,
+                    status,
+                    reason,
                 })
             }
-        };
-        let path = match &entry {
-            Entry::Occupied(occupied_entry) => occupied_entry
-                .get()
-                .sending
-                .as_ref()
-                .map(|it| it.pending_file.file_path.clone()),
-            Entry::Vacant(_) => None,
-        };
-        light_ref!(self).reset_all(entry).await;
-        if let Some(span) = span {
-            let _ = self
-                .send_instrumented(
-                    peer,
-                    contact_id,
-                    FileRequest::AbortTransfer { transfer_uuid },
-                    span,
-                    path.as_deref(),
-                )
-                .await;
-        } else {
-            let _ = (self.send)(
-                peer,
-                contact_id,
-                FileRequest::AbortTransfer { transfer_uuid },
-            )
-            .await;
+            Verdict::FallBackToChunks => {
+                self.fall_back_to_chunks(entry, sending).await;
+                None
+            }
+            Verdict::SendChunks { connected } => {
+                put_back(&mut entry, sending);
+                Some(AfterUnlock::SendChunks { connected })
+            }
+            Verdict::ChunkConfirmed { connected } => {
+                let pending_file_id = sending.pending_file.id.clone();
+                let status = sending.pending_file.status.clone();
+                put_back(&mut entry, sending);
+                Some(AfterUnlock::ReportAndSendChunks {
+                    pending_file_id,
+                    status,
+                    connected,
+                })
+            }
+            Verdict::StartAttempt(start) => {
+                put_back(&mut entry, sending);
+                Some(AfterUnlock::StartAttempt(start))
+            }
         }
     }
 
-    async fn reset_all_on_protocol_violation_for(&self, peer: PeerId) {
-        let mut files = self.files.write().await;
-        let mut span = None;
-        let mut path = None;
-        // Named, so the peer drops this transfer rather than every transfer with us.
-        let mut transfer_uuid = None;
-        if let Entry::Occupied(mut entry) = files.entry(peer) {
-            span = Some(entry.get().span.clone());
-            path = entry
-                .get()
-                .sending
-                .as_ref()
-                .map(|it| it.pending_file.file_path.clone());
-            entry.get().span.in_scope(|| {
-                warn!("Resetting on protocol violation");
-            });
-            if let Some(ref mut sending) = entry.get_mut().sending {
-                transfer_uuid = Some(sending.get_transfer_id().clone());
-                sending.pending_file.retry_count += 1;
-                warn!(
-                    retry_count = sending.pending_file.retry_count,
-                    "Increased retry count"
+    async fn after_unlock(&self, peer: PeerId, after: AfterUnlock) {
+        match after {
+            AfterUnlock::SendChunks { connected } => {
+                Box::pin(self.send_chunks_loop(peer, &connected)).await
+            }
+            AfterUnlock::Interrupted {
+                pending_file_id,
+                status,
+                reason,
+            } => {
+                self.brain_action_sender
+                    .send(BrainAction::NetworkNode(NetworkNodeAction::FileSendReset {
+                        pending_file_id,
+                        status,
+                        retry_count: None,
+                        reason: Some(format!("Send interrupted: {reason}")),
+                    }))
+                    .await
+                    .expect("Sending to work");
+                self.plugin
+                    .timeout_lock()
+                    .await
+                    .interrupt_sending_to_peer(peer)
+                    .await;
+            }
+            AfterUnlock::ReportAndSendChunks {
+                pending_file_id,
+                status,
+                connected,
+            } => {
+                self.brain_action_sender
+                    .send(BrainAction::NetworkNode(NetworkNodeAction::FileSending {
+                        pending_file_id,
+                        status,
+                    }))
+                    .await
+                    .expect("Sending to work");
+                Box::pin(self.send_chunks_loop(peer, &connected)).await;
+            }
+            AfterUnlock::StartAttempt(start) => {
+                debug!(
+                    ?peer,
+                    offset = start.offset,
+                    "Receiver admitted a stream attempt"
                 );
+                self.brain_action_sender
+                    .send(BrainAction::NetworkNode(NetworkNodeAction::FileSending {
+                        pending_file_id: start.pending_file_id.clone(),
+                        status: SendStatus::InProgress(InProgress {
+                            status: InProgressSendStatus::Sending,
+                            transfer_data: start.transfer_data.clone(),
+                        }),
+                    }))
+                    .await
+                    .expect("Sending to work");
+                (self.start_attempt)(peer, *start);
             }
         }
-        let contact_id = light_ref!(self).reset_all(files.entry(peer)).await;
-        if let Some(span) = span {
-            let _ = self
-                .send_instrumented(
-                    peer,
-                    contact_id,
-                    FileRequest::ProtocolViolation { transfer_uuid },
-                    span,
-                    path.as_deref(),
-                )
-                .await;
-        } else {
-            let _ = (self.send)(
-                peer,
-                contact_id,
-                FileRequest::ProtocolViolation { transfer_uuid },
-            )
+    }
+
+    async fn violated_by_peer(
+        &self,
+        entry: OccupiedEntry<'_, PeerId, PeerFiles>,
+        sending: SendSlot<usize>,
+        reason: &str,
+    ) {
+        let peer = *entry.key();
+        let span = entry.get().span.clone();
+        span.in_scope(|| warn!(reason, "Resetting on protocol violation"));
+        // Named, so the peer drops this transfer rather than every transfer with us.
+        let violation = violation_over(wire_of(&sending), Some(sending.get_transfer_id().clone()));
+        let contact_id = Some(sending.pending_file.contact_id.clone());
+        let path = sending.pending_file.file_path.clone();
+        light_ref!(self)
+            .count_violation(entry, sending, reason.into())
             .await;
-        }
+        let _ = self
+            .send_instrumented(peer, contact_id, violation, span, Some(&path))
+            .await;
+    }
+
+    async fn fall_back_to_chunks(
+        &self,
+        mut entry: OccupiedEntry<'_, PeerId, PeerFiles>,
+        mut sending: SendSlot<usize>,
+    ) {
+        let peer = *entry.key();
+        let peer_files = entry.get_mut();
+        peer_files.wire = PeerWire::ChunksUntil(Instant::now() + LEGACY_RECHECK);
+        sending.pending_file.status = send_decision::reset_status(&mut sending);
+        peer_files.pending.push_front(sending.pending_file);
+        light_ref!(self).send_next(peer, entry).await;
     }
 
     pub async fn get_peers_with_pending_files(&self) -> Vec<PeerId> {
-        self.files.read().await.keys().cloned().collect()
+        self.files.timeout_read().await.keys().cloned().collect()
     }
 }
 
@@ -1075,549 +1213,8 @@ impl<P: FileTrackerPlugin + Send + Sync> ResponseReceiver<FileResponse> for Core
         request_id: Result<usize, ()>,
         response: FileResponse,
     ) {
-        trace!(peer=?node_id, ?response, ?request_id, "Got filerequest response");
-        match response {
-            FileResponse::AcceptNewTransfer | FileResponse::RestartContinueTransfer => {
-                {
-                    let mut files = self.files.write().await;
-                    let Entry::Occupied(mut entry) = files.entry(node_id) else {
-                        trace!(peer=?node_id, ?response, ?request_id, "Got filerequest response");
-                        warn!(peer=?node_id, "Accepted transfer that was never offered, sending protocol violation");
-                        let _ = (self.send)(
-                            node_id,
-                            None,
-                            FileRequest::ProtocolViolation {
-                                transfer_uuid: None,
-                            },
-                        )
-                        .await;
-                        return;
-                    };
-
-                    let peer_files = entry.get_mut();
-                    peer_files.span.in_scope(|| {
-                        debug!(peer=?node_id, ?response, ?request_id, "Got filerequest response");
-                    });
-                    let Some(LockedSendData {
-                        pending_file,
-                        must_verify_contact_id,
-                        ..
-                    }) = &mut peer_files.sending
-                    else {
-                        peer_files.span.in_scope(|| {
-                            warn!(peer=?node_id, "Accepted transfer that was never offered");
-                        });
-                        drop(files);
-                        self.reset_all_on_protocol_violation_for(node_id).await;
-                        return;
-                    };
-
-                    match self
-                        .verify_target_contact_id(node_id, &pending_file.contact_id, &contact_id)
-                        .await
-                    {
-                        ContactVerificationResult::ContactIsUnknown => {
-                            *must_verify_contact_id = false;
-                        }
-                        ContactVerificationResult::Verified => {}
-                        ContactVerificationResult::VerificationFailed => {
-                            light_ref!(self).reset_all(Entry::Occupied(entry)).await;
-                            return;
-                        }
-                        ContactVerificationResult::InternalError => {
-                            drop(files);
-                            self.reset_all_on_internal_error_for(node_id).await;
-                            return;
-                        }
-                    };
-
-                    let SendStatus::InProgress(
-                        ref mut in_progress @ InProgress {
-                            status: InProgressSendStatus::Prepared,
-                            ..
-                        },
-                    ) = pending_file.status
-                    else {
-                        peer_files.span.in_scope(|| {
-                            warn!(peer=?node_id, "Accepted transfer that was never offered");
-                        });
-                        drop(files);
-                        self.reset_all_on_protocol_violation_for(node_id).await;
-                        return;
-                    };
-
-                    in_progress.status = InProgressSendStatus::Sending;
-                }
-                self.send_chunks_loop(node_id, &contact_id).await;
-            }
-            FileResponse::RejectNewTransfer => {
-                let mut files = self.files.write().await;
-                let Entry::Occupied(mut entry) = files.entry(node_id) else {
-                    trace!(peer=?node_id, ?response, ?request_id, "Got filerequest response");
-                    warn!(peer=?node_id, "Rejected transfer that was never offered");
-                    let _ = (self.send)(
-                        node_id,
-                        None,
-                        FileRequest::ProtocolViolation {
-                            transfer_uuid: None,
-                        },
-                    )
-                    .await;
-                    return;
-                };
-                let peer_files = entry.get_mut();
-                peer_files.span.in_scope(|| {
-                    debug!(peer=?node_id, ?response, ?request_id, "Got filerequest response");
-                });
-
-                let Some(mut locked_send_data) = peer_files.sending.take() else {
-                    peer_files.span.in_scope(|| {
-                        warn!(peer=?node_id, "Rejected transfer that was never offered, resetting with protocol violation");
-                    });
-                    drop(files);
-                    self.reset_all_on_protocol_violation_for(node_id).await;
-                    return;
-                };
-
-                match self
-                    .verify_target_contact_id(
-                        node_id,
-                        &locked_send_data.pending_file.contact_id,
-                        &contact_id,
-                    )
-                    .await
-                {
-                    ContactVerificationResult::ContactIsUnknown => {
-                        locked_send_data.must_verify_contact_id = false;
-                    }
-                    ContactVerificationResult::Verified => {}
-                    ContactVerificationResult::VerificationFailed => {
-                        // put the thing back. Otherwise attackers can permanently stuck this app
-                        peer_files.sending = Some(locked_send_data);
-                        light_ref!(self).reset_all(Entry::Occupied(entry)).await;
-                        return;
-                    }
-                    ContactVerificationResult::InternalError => {
-                        // put the thing back. Otherwise attackers can permanently stuck this app
-                        peer_files.sending = Some(locked_send_data);
-                        drop(files);
-                        self.reset_all_on_internal_error_for(node_id).await;
-                        return;
-                    }
-                };
-
-                light_ref!(self)
-                    .complete_file(
-                        entry,
-                        locked_send_data.pending_file.id,
-                        FileOutcome::Rejected,
-                    )
-                    .await;
-            }
-            FileResponse::AcceptContinueTransfer { offset } => {
-                debug!(?offset, "Accepted to continue transfer");
-                let mut files = self.files.write().await;
-                let raw_entry = files.entry(node_id);
-                let Entry::Occupied(mut entry) = raw_entry else {
-                    trace!(peer=?node_id, ?response, ?request_id, "Got filerequest response");
-                    warn!(peer=?node_id, "Accepted transfer that was never offered");
-                    let _ = (self.send)(
-                        node_id,
-                        None,
-                        FileRequest::ProtocolViolation {
-                            transfer_uuid: None,
-                        },
-                    )
-                    .await;
-                    return;
-                };
-                let peer_files = entry.get_mut();
-                peer_files.span.in_scope(|| {
-                    debug!(peer=?node_id, ?response, ?request_id, "Got filerequest response");
-                });
-                let Some(locked_send_data) = &mut peer_files.sending else {
-                    peer_files.span.in_scope(|| {
-                        warn!(peer=?node_id, "Accepted transfer that was never offered");
-                    });
-                    drop(files);
-                    self.reset_all_on_protocol_violation_for(node_id).await;
-                    return;
-                };
-
-                match self
-                    .verify_target_contact_id(
-                        node_id,
-                        &locked_send_data.pending_file.contact_id,
-                        &contact_id,
-                    )
-                    .await
-                {
-                    ContactVerificationResult::ContactIsUnknown => {
-                        locked_send_data.must_verify_contact_id = false;
-                    }
-                    ContactVerificationResult::Verified => {}
-                    ContactVerificationResult::VerificationFailed => {
-                        light_ref!(self).reset_all(Entry::Occupied(entry)).await;
-                        return;
-                    }
-                    ContactVerificationResult::InternalError => {
-                        drop(files);
-                        self.reset_all_on_internal_error_for(node_id).await;
-                        return;
-                    }
-                };
-
-                let SendStatus::InProgress(InProgress {
-                    status: status @ InProgressSendStatus::Prepared,
-                    transfer_data,
-                }) = &mut locked_send_data.pending_file.status
-                else {
-                    warn!(
-                        status=?locked_send_data.pending_file.status,
-                        "Sending file in unexpected state to continue transfer"
-                    );
-                    drop(files);
-                    self.reset_all_on_protocol_violation_for(node_id).await;
-                    return;
-                };
-                *status = InProgressSendStatus::Sending;
-                transfer_data.progress_bytes = offset;
-                locked_send_data
-                    .unlock_mut(&contact_id)
-                    .expect("Must unlock, is already verified")
-                    .send_manager
-                    .set_progress(offset)
-                    .await;
-
-                drop(files);
-
-                self.send_chunks_loop(node_id, &contact_id).await;
-            }
-            FileResponse::ConfirmChunk => {
-                {
-                    let mut files = self.files.write().await;
-                    let Entry::Occupied(mut entry) = files.entry(node_id) else {
-                        trace!(peer=?node_id, ?response, ?request_id, "Got filerequest response");
-                        warn!(peer=?node_id, "Accepted chunk that wasn't sent (no entry)");
-                        let _ = (self.send)(
-                            node_id,
-                            None,
-                            FileRequest::ProtocolViolation {
-                                transfer_uuid: None,
-                            },
-                        )
-                        .await;
-                        return;
-                    };
-                    let peer_files = &mut entry.get_mut();
-                    peer_files.span.in_scope(|| {
-                        debug!(peer=?node_id, ?response, ?request_id, "Got filerequest response");
-                    });
-                    let Ok(request_id) = request_id else {
-                        peer_files.span.in_scope(|| {
-                            error!(peer=?node_id, "Internal error tracking request ids");
-                        });
-                        drop(files);
-                        self.reset_all_on_internal_error_for(node_id).await;
-                        return;
-                    };
-
-                    let opt = match &mut peer_files.sending {
-                        None => None,
-                        Some(locked_send_data) => {
-                            let Some(unlocked) = locked_send_data.unlock_mut(&contact_id) else {
-                                warn!(peer=?node_id, expected=?locked_send_data.pending_file.contact_id, got=?contact_id, "Unable to unlock send manager. Are we under attack here by this peer?");
-                                light_ref!(self).reset_all(Entry::Occupied(entry)).await;
-                                return;
-                            };
-                            Some(unlocked)
-                        }
-                    };
-                    let Some(SendDataMut {
-                        send_manager: sending,
-                        pending_file: PendingFile { status, id, .. },
-                    }) = opt
-                    else {
-                        peer_files.span.in_scope(|| {
-                            warn!(peer=?node_id, "Accepted chunk that wasn't sent (no send data), sending protocol violation");
-                        });
-                        drop(files);
-                        self.reset_all_on_protocol_violation_for(node_id).await;
-                        return;
-                    };
-
-                    let SendStatus::InProgress(InProgress {
-                        status: InProgressSendStatus::Sending,
-                        transfer_data,
-                    }) = status
-                    else {
-                        peer_files.span.in_scope(|| {
-                            warn!(peer=?node_id, ?status, "Accepted chunk that wasn't sent (not in status sending)");
-                        });
-                        drop(files);
-                        self.reset_all_on_protocol_violation_for(node_id).await;
-                        return;
-                    };
-
-                    peer_files.span.in_scope(|| {
-                        trace!(request_id, "Chunk confirmed");
-                    });
-
-                    sending.receive_ack(request_id);
-
-                    transfer_data.progress_bytes = sending.progress_bytes();
-                    let _ = self
-                        .brain_action_sender
-                        .send(BrainAction::NetworkNode(NetworkNodeAction::FileSending {
-                            pending_file_id: id.clone(),
-                            status: SendStatus::InProgress(InProgress {
-                                status: InProgressSendStatus::Sending,
-                                transfer_data: transfer_data.clone(),
-                            }),
-                        }))
-                        .await;
-                }
-
-                self.send_chunks_loop(node_id, &contact_id).await;
-            }
-            FileResponse::RejectChunk => {
-                let mut files = self.files.write().await;
-                let Entry::Occupied(mut entry) = files.entry(node_id) else {
-                    trace!(peer=?node_id, ?response, ?request_id, "Got filerequest response");
-                    warn!(peer=?node_id, "Rejected chunk that wasn't sent");
-                    let _ = (self.send)(
-                        node_id,
-                        None,
-                        FileRequest::ProtocolViolation {
-                            transfer_uuid: None,
-                        },
-                    )
-                    .await;
-                    return;
-                };
-                let peer_files = entry.get_mut();
-                peer_files.span.in_scope(|| {
-                    debug!(peer=?node_id, ?response, ?request_id, "Got filerequest response");
-                });
-                let opt = peer_files.sending.take();
-                let Some(LockedSendData {
-                    pending_file:
-                        pending_file @ PendingFile {
-                            status:
-                                SendStatus::InProgress(InProgress {
-                                    status: InProgressSendStatus::Sending,
-                                    ..
-                                }),
-                            ..
-                        },
-                    ..
-                }) = opt
-                else {
-                    warn!(peer=?node_id, "Rejected chunk that wasn't sent");
-                    drop(files);
-                    self.reset_all_on_protocol_violation_for(node_id).await;
-                    return;
-                };
-
-                warn!(peer=?node_id, "Rejected file chunk");
-                let file_id = pending_file.id.clone();
-                light_ref!(self)
-                    .complete_file(entry, file_id, FileOutcome::Rejected)
-                    .await;
-            }
-            FileResponse::ConfirmAbort => {
-                let mut files = self.files.write().await;
-                let Entry::Occupied(entry) = files.entry(node_id) else {
-                    debug!(peer=?node_id, "Abort confirmed, but we don't know for what");
-                    return;
-                };
-                entry.get().span.in_scope(|| {
-                    debug!(peer=?node_id, ?response, ?request_id, "Got filerequest response");
-                });
-                if entry.get().sending.is_none() {
-                    light_ref!(self).send_next(node_id, entry).await;
-                } else {
-                    error!("Received AbortConfirmed but we still have sending state");
-                }
-            }
-            FileResponse::ConfirmDone => {
-                let mut files = self.files.write().await;
-                let Entry::Occupied(mut entry) = files.entry(node_id) else {
-                    trace!(peer=?node_id, ?response, ?request_id, "Got filerequest response");
-                    warn!(peer=?node_id, "Accepted done that wasn't sent");
-                    let _ = (self.send)(
-                        node_id,
-                        None,
-                        FileRequest::ProtocolViolation {
-                            transfer_uuid: None,
-                        },
-                    )
-                    .await;
-                    return;
-                };
-                let peer_files = entry.get_mut();
-                peer_files.span.in_scope(|| {
-                    debug!(peer=?node_id, ?response, ?request_id, "Got filerequest response");
-                });
-                let opt = &peer_files.sending;
-                let Some(LockedSendData {
-                    pending_file:
-                        pending_file @ PendingFile {
-                            status:
-                                SendStatus::InProgress(InProgress {
-                                    status: InProgressSendStatus::PendingSent,
-                                    ..
-                                }),
-                            ..
-                        },
-                    ..
-                }) = opt
-                else {
-                    warn!(peer=?node_id, "Accepted done that wasn't sent");
-                    drop(files);
-                    self.reset_all_on_protocol_violation_for(node_id).await;
-                    return;
-                };
-
-                debug!(peer=?node_id, "Accepted file transfer done");
-                let file_id = pending_file.id.clone();
-                peer_files.sending = None;
-                light_ref!(self)
-                    .complete_file(entry, file_id, FileOutcome::Sent)
-                    .await;
-            }
-            FileResponse::RejectDone => {
-                let mut files = self.files.write().await;
-                let Entry::Occupied(mut entry) = files.entry(node_id) else {
-                    trace!(peer=?node_id, ?response, ?request_id, "Got filerequest response");
-                    warn!(peer=?node_id, "Rejected done that wasn't sent");
-                    let _ = (self.send)(
-                        node_id,
-                        None,
-                        FileRequest::ProtocolViolation {
-                            transfer_uuid: None,
-                        },
-                    )
-                    .await;
-                    return;
-                };
-                entry.get().span.in_scope(|| {
-                    debug!(peer=?node_id, ?response, ?request_id, "Got filerequest response");
-                });
-                let send_data = &mut entry.get_mut().sending;
-                let Some((
-                    done,
-                    SendStatus::InProgress(InProgress {
-                        status: InProgressSendStatus::PendingSent,
-                        ..
-                    }),
-                )) = send_data.as_ref().map(|it| (it, &it.pending_file.status))
-                else {
-                    warn!(peer=?node_id, "Rejected done that wasn't sent");
-                    drop(files);
-                    self.reset_all_on_protocol_violation_for(node_id).await;
-                    return;
-                };
-
-                let file_id = done.pending_file.id.clone();
-                *send_data = None;
-                light_ref!(self)
-                    .complete_file(entry, file_id, FileOutcome::Rejected)
-                    .await;
-            }
-            FileResponse::AcknowledgeProtocolViolation => {
-                debug!(peer=?node_id, "Other end acknowledged protocol violation");
-            }
-            FileResponse::ProtocolViolation => {
-                let mut files = self.files.write().await;
-                let Entry::Occupied(mut entry) = files.entry(node_id) else {
-                    trace!(peer=?node_id, ?response, ?request_id, "Got filerequest response");
-                    error!(peer=?node_id, "Peer reports that we violated the filerequest protocol, but we have no state for them");
-                    return;
-                };
-                entry.get().span.in_scope(|| {
-                    debug!(peer=?node_id, ?response, ?request_id, "Got filerequest response");
-                });
-                let Some(mut sending) = entry.get_mut().sending.take() else {
-                    error!(peer=?node_id, "Peer reports that we violated the filerequest protocol, but we have no sending state for them");
-                    return;
-                };
-                sending.pending_file.retry_count += 1;
-                error!(peer=?node_id, sending_file=sending.pending_file.file_path, retry_count = sending.pending_file.retry_count, "Peer reports that we violated the filerequest protocol while sending, increased retry count");
-                light_ref!(self)
-                    .reset_and_retry(entry, sending, "Peer reported protocol violation".into())
-                    .await;
-            }
-            FileResponse::InternalError => {
-                let mut files = self.files.write().await;
-                let Entry::Occupied(mut entry) = files.entry(node_id) else {
-                    trace!(peer=?node_id, ?response, ?request_id, "Got filerequest response");
-                    error!(peer=?node_id, "Peer reported internal error, but we have no state for them");
-                    return;
-                };
-                let peer_files = entry.get_mut();
-                peer_files.span.in_scope(|| {
-                    debug!(peer=?node_id, ?response, ?request_id, "Got filerequest response");
-                });
-                let Some(mut sending) = peer_files.sending.take() else {
-                    error!(peer=?node_id, "Peer reported internal error, but we have no send state for them");
-                    return;
-                };
-                warn!(peer=?node_id, "Peer reported an internal error");
-                sending.pending_file.retry_count += 1;
-                // Don't continue sending — reset_and_stop lets kademlia requery add natural delay
-                light_ref!(self)
-                    .reset_and_stop(entry, sending, "Peer reported internal error".into())
-                    .await;
-            }
-            FileResponse::RejectContinueTransfer => {
-                let mut files = self.files.write().await;
-                let Entry::Occupied(mut entry) = files.entry(node_id) else {
-                    trace!(peer=?node_id, ?response, ?request_id, "Got filerequest response");
-                    error!(peer=?node_id, "Peer rejected continue transfer but we have no send state for them");
-                    return;
-                };
-                entry.get().span.in_scope(|| {
-                    debug!(peer=?node_id, ?response, ?request_id, "Got filerequest response");
-                });
-                let Some(locked_send_data) = entry.get_mut().sending.take() else {
-                    error!(peer=?node_id, "Peer rejected continue transfer which we didn't send");
-                    self.reset_all_on_protocol_violation_for(node_id).await;
-                    return;
-                };
-
-                match self
-                    .verify_target_contact_id(
-                        node_id,
-                        &locked_send_data.pending_file.contact_id,
-                        &contact_id,
-                    )
-                    .await
-                {
-                    ContactVerificationResult::ContactIsUnknown => true,
-                    ContactVerificationResult::Verified => true,
-                    ContactVerificationResult::VerificationFailed => {
-                        // put the thing back. Otherwise attackers can permanently stuck this app
-                        entry.get_mut().sending = Some(locked_send_data);
-                        light_ref!(self).reset_all(Entry::Occupied(entry)).await;
-                        return;
-                    }
-                    ContactVerificationResult::InternalError => {
-                        // put the thing back. Otherwise attackers can permanently stuck this app
-                        entry.get_mut().sending = Some(locked_send_data);
-                        drop(files);
-                        self.reset_all_on_internal_error_for(node_id).await;
-                        return;
-                    }
-                };
-
-                warn!(peer=?node_id, "Peer rejected continue transfer");
-                let file_id = locked_send_data.pending_file.id;
-                light_ref!(self)
-                    .complete_file(entry, file_id, FileOutcome::Rejected)
-                    .await;
-            }
-        }
+        self.receive(node_id, contact_id, request_id, response.into())
+            .await
     }
 
     async fn handle_receive_error(
@@ -1632,77 +1229,101 @@ impl<P: FileTrackerPlugin + Send + Sync> ResponseReceiver<FileResponse> for Core
         >,
     ) {
         warn!(peer=?node_id, ?error, ?request_id, "Error in filerequest protocol");
-        let mut files = self.files.write().await;
-        let Entry::Occupied(mut entry) = files.entry(node_id) else {
-            error!(peer=?node_id, ?error, "Received a receive error while not in sending state");
+        let mut files = self.files.timeout_write().await;
+        let Some((entry, sending, _request)) =
+            claim_for_current_transfer(&mut files, node_id, request_id)
+        else {
+            debug!(peer=?node_id, ?error, ?request_id, "The failed request does not belong to the current transfer, ignoring");
             return;
         };
         let span = entry.get().span.clone();
-        async move {
-            let Some(sending) = entry.get_mut().sending.take() else {
-                error!(peer=?node_id, ?error, ?request_id, "Received a receive error while not in sending state");
-                return;
-            };
-            match error {
-                ReceiveError::RemoteError(_) => {
-                    // Can't fix this. Increase retry count and push back
-                    light_ref!(self)
-                        .reset_and_retry(entry, sending, format!("Remote error: {error:?}"))
-                        .await;
-                }
-                ReceiveError::LocalError(local_error) => {
-                    match local_error {
-                        LocalReceiveError::Timeout => {
-                            // Just push back, do not increase retry count
-                            warn!(peer=?node_id, ?request_id, "Resetting due to timeout");
-                            light_ref!(self)
-                                .reset_and_stop(entry, sending, "Request timeout".into())
-                                .await;
-                        }
-                        LocalReceiveError::TransportError(transport_error) => {
-                            match transport_error {
-                                OutboundFailure::DialFailure
-                                | OutboundFailure::Timeout
-                                | OutboundFailure::Io(_)
-                                | OutboundFailure::ConnectionClosed => {
-                                    // Just push back, do not increase retry count
-                                    warn!(peer=?node_id, ?request_id, error=?transport_error, "Resetting due to outbound failure");
-                                    light_ref!(self)
-                                        .reset_and_stop(entry, sending, format!("Transport error: {transport_error:?}"))
-                                        .await;
-                                }
-                                OutboundFailure::UnsupportedProtocols => {
-                                    // File rejected — terminal
-                                    let file_id = sending.pending_file.id.clone();
-                                    light_ref!(self)
-                                        .complete_file(entry, file_id, FileOutcome::Rejected)
-                                        .await;
-                                }
-                            }
-                        }
-                        LocalReceiveError::MissingSession | LocalReceiveError::DecryptError(_) => {
-                            // Can only occur on persistent problem with session management. Increase retry count and push back
-                            light_ref!(self)
-                                .reset_and_retry(entry, sending, format!("Session/decrypt error: {local_error:?}"))
-                                .await;
-                        }
-                        LocalReceiveError::ResendError(_) => {
-                            // Can only occur on persistent problem with session management. Increase retry count and push back
-                            light_ref!(self)
-                                .reset_and_retry(entry, sending, format!("Resend error: {local_error:?}"))
-                                .await;
-                        }
-                    }
-                }
-            }
-        }.instrument(span).await;
+        let verdict = span.in_scope(|| send_decision::on_receive_error(&sending, error));
+        let after = self
+            .carry_out(entry, sending, verdict)
+            .instrument(span.clone())
+            .await;
+        drop(files);
+        if let Some(after) = after {
+            self.after_unlock(node_id, after).instrument(span).await;
+        }
+    }
+}
+
+#[async_trait]
+impl<P: FileTrackerPlugin + Send + Sync> ResponseReceiver<FileResponseV2> for CoreFileTracker<P> {
+    type DecryptError = DeSerCryptError;
+    type TransportError = OutboundFailure;
+    type EncryptError = SerCryptError;
+    type GetSessionError = Arc<SessionEstablishmentError>;
+    type NodeId = PeerId;
+    type RequestId = usize;
+
+    async fn receive_response(
+        &self,
+        node_id: PeerId,
+        contact_id: Option<ContactId>,
+        request_id: Result<usize, ()>,
+        response: FileResponseV2,
+    ) {
+        self.receive(node_id, contact_id, request_id, response.into())
+            .await
+    }
+
+    async fn handle_receive_error(
+        &self,
+        node_id: PeerId,
+        request_id: Result<usize, ()>,
+        error: ReceiveError<
+            OutboundFailure,
+            DeSerCryptError,
+            SerCryptError,
+            Arc<SessionEstablishmentError>,
+        >,
+    ) {
+        ResponseReceiver::<FileResponse>::handle_receive_error(self, node_id, request_id, error)
+            .await
     }
 }
 
 #[async_trait]
 impl<P: FileTrackerPlugin + Send + Sync> FileTracker for CoreFileTracker<P> {
+    async fn on_attempt_finished(&self, peer: PeerId, attempt: AttemptId, outcome: AttemptOutcome) {
+        let mut files = self.files.timeout_write().await;
+        let Entry::Occupied(mut entry) = files.entry(peer) else {
+            debug!(
+                ?peer,
+                ?outcome,
+                "Attempt finished for a peer we no longer send to"
+            );
+            return;
+        };
+        let Some(sending) = entry
+            .get_mut()
+            .sending
+            .take_if(|it| it.running_attempt().is_some_and(|it| it.attempt == attempt))
+        else {
+            debug!(
+                ?peer,
+                ?outcome,
+                "Attempt finished that is no longer current"
+            );
+            return;
+        };
+        let span = entry.get().span.clone();
+        span.in_scope(|| debug!(?peer, ?outcome, "Stream attempt finished"));
+        let verdict = send_decision::on_attempt_outcome(outcome);
+        let after = self
+            .carry_out(entry, sending, verdict)
+            .instrument(span.clone())
+            .await;
+        drop(files);
+        if let Some(after) = after {
+            self.after_unlock(peer, after).instrument(span).await;
+        }
+    }
+
     async fn add_pending_file(&self, peer: PeerId, file: PendingFile) {
-        let mut files = self.files.write().await;
+        let mut files = self.files.timeout_write().await;
         match file.status {
             SendStatus::Pending
             | SendStatus::InProgress(InProgress {
@@ -1731,7 +1352,7 @@ impl<P: FileTrackerPlugin + Send + Sync> FileTracker for CoreFileTracker<P> {
     }
 
     async fn trigger_interaction_with(&self, peer: PeerId) {
-        let mut files = self.files.write().await;
+        let mut files = self.files.timeout_write().await;
         trace!(
             "Triggering interaction with peer with these files: {:?}",
             files
@@ -1772,7 +1393,7 @@ impl<P: FileTrackerPlugin + Send + Sync> FileTracker for CoreFileTracker<P> {
     }
 
     async fn has_pending_files_for(&self, peer: &PeerId) -> bool {
-        if let Some(peer_files) = self.files.read().await.get(peer) {
+        if let Some(peer_files) = self.files.timeout_read().await.get(peer) {
             !peer_files.pending.is_empty()
         } else {
             false
@@ -1780,7 +1401,7 @@ impl<P: FileTrackerPlugin + Send + Sync> FileTracker for CoreFileTracker<P> {
     }
 
     async fn cancel_file(&self, file_id: FylesId) -> Option<PeerId> {
-        let mut files = self.files.write().await;
+        let mut files = self.files.timeout_write().await;
         // Find which peer has this file
         let peer = files.iter().find_map(|(peer, pf)| {
             let in_sending = pf
@@ -1808,9 +1429,7 @@ impl<P: FileTrackerPlugin + Send + Sync> FileTracker for CoreFileTracker<P> {
                 .send_instrumented(
                     peer,
                     Some(sending.pending_file.contact_id.clone()),
-                    FileRequest::AbortTransfer {
-                        transfer_uuid: Some(sending.get_transfer_id().clone()),
-                    },
+                    abort_over(wire_of(&sending), Some(sending.get_transfer_id().clone())),
                     peer_files.span.clone(),
                     peer_files
                         .sending
@@ -1852,7 +1471,7 @@ impl<P: FileTrackerPlugin + Send + Sync> FileTracker for CoreFileTracker<P> {
         target_filerequest_id: FylesId,
         peer_id: PeerId,
     ) -> Option<PeerId> {
-        let mut files = self.files.write().await;
+        let mut files = self.files.timeout_write().await;
         let Entry::Occupied(mut peer_files) = files.entry(peer_id) else {
             return None;
         };
@@ -1870,9 +1489,7 @@ impl<P: FileTrackerPlugin + Send + Sync> FileTracker for CoreFileTracker<P> {
                 .send_instrumented(
                     peer_id,
                     Some(sending.pending_file.contact_id.clone()),
-                    FileRequest::AbortTransfer {
-                        transfer_uuid: Some(sending.get_transfer_id().clone()),
-                    },
+                    abort_over(wire_of(&sending), Some(sending.get_transfer_id().clone())),
                     peer_files.get().span.clone(),
                     peer_files
                         .get()
@@ -1916,19 +1533,8 @@ impl<P: FileTrackerPlugin + Send + Sync> FileTracker for CoreFileTracker<P> {
         None
     }
 
-    async fn handle_outgoing_connection_error(&self, peer: PeerId, address: &Multiaddr) {
-        self.plugin
-            .timeout_lock()
-            .await
-            .outgoing_connection_error(&peer, address)
-            .await;
-    }
-
-    async fn handle_non_correlatable_error(&self, peer: PeerId) {
-        self.plugin
-            .timeout_lock()
-            .await
-            .non_correlatable_outgoing_connection_error(&peer)
-            .await;
+    #[cfg(feature = "debug-server")]
+    async fn get_debug_blob(&self) -> Box<dyn SerializeDebug + Send> {
+        self.plugin.timeout_lock().await.get_debug_blob().await
     }
 }

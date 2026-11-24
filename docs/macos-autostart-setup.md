@@ -137,6 +137,7 @@ spctl -a -vvv -t exec "$APP"          # accepted, source=Notarized Developer ID
 log stream --predicate 'eventMessage CONTAINS "Fyles:"' --style compact   # watch while launching
 launchctl print "gui/$(id -u)/app.fyles.fyles.backend" | head -20
 ls -l ~/Library/Application\ Support/Fyles/fyles.sock
+tail ~/Library/Logs/Fyles/daemon.err.log      # the daemon's own output, per user
 ```
 
 There is also `build_macos_installer.sh` (repo root) — a CLI wrapper that builds, then notarizes via

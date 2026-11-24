@@ -10,7 +10,14 @@ use thiserror::Error;
 
 use rolling_nonce_window::{NonceGenerationError, NonceGeneratorValidator, NonceValidationError};
 
+pub mod backup;
+pub mod contact_id;
 pub mod rolling_nonce_window;
+pub mod session;
+pub mod signed;
+pub mod stream;
+
+pub use contact_id::{ContactId, ContactIdParseError};
 
 // All of this essentially implements https://datatracker.ietf.org/doc/html/draft-ietf-tls-hybrid-design
 
@@ -19,12 +26,13 @@ pub const BINCODE_CONFIG: bincode::config::Configuration = bincode::config::stan
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Encrypted<T: ?Sized> {
     nonce: u64,
+    #[serde(with = "serde_bytes")]
     message: Vec<u8>,
     _type: PhantomData<T>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
-impl<T: ?Sized + Serialize + DeserializeOwned> Encrypted<T> {
+impl<T: Serialize + DeserializeOwned> Encrypted<T> {
     pub fn new_plain(message: &T) -> Self {
         Self {
             nonce: 0,
@@ -35,7 +43,7 @@ impl<T: ?Sized + Serialize + DeserializeOwned> Encrypted<T> {
     }
 
     pub fn extract_plain(&self) -> T {
-        let (value, _) = bincode::serde::decode_from_slice(&*self.message, BINCODE_CONFIG)
+        let (value, _) = bincode::serde::decode_from_slice(&self.message, BINCODE_CONFIG)
             .expect("deserialization to work");
         value
     }
@@ -190,14 +198,7 @@ pub struct ContactPublicKeys {
     pub ed25519: ed25519_dalek::VerifyingKey,
 }
 #[cfg(any(test, feature = "test-support"))]
-static CONTACT_PUBLIC_KEYS: std::sync::LazyLock<ContactPublicKeys> =
-    std::sync::LazyLock::new(|| ContactKeys::new().public);
-#[cfg(any(test, feature = "test-support"))]
 impl ContactPublicKeys {
-    pub fn new() -> Self {
-        CONTACT_PUBLIC_KEYS.to_owned()
-    }
-
     pub fn random() -> Self {
         ContactKeys::new().public.to_owned()
     }

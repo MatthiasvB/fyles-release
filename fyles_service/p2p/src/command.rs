@@ -1,13 +1,17 @@
 use std::{error::Error, sync::Arc};
 
 use crypto::ContactKeys;
-use libp2p::{Multiaddr, PeerId};
+use libp2p::PeerId;
 use tokio::sync::oneshot;
+
+#[cfg(feature = "debug-server")]
+use crate::debug::SerializeDebug;
 
 use fyles_core::core::{
     brain::types::{ContactShareChallenge, SelfContactInviteChallenge},
     domain_models::{ContactId, FylesId, PeerIdWrapper},
-    p2p::{FileToSend, NodeStatusInfo},
+    listen::{ListenFailure, ListenPort},
+    p2p::{FileToSend, NodeConfig, NodeStatusInfo},
     sync::{DocKind, SyncRequest},
 };
 
@@ -38,21 +42,22 @@ impl From<DataCommand> for P2pCommand {
 pub enum LoopCommand {
     /// Needs the loop task because the peer set is read straight off the swarm.
     TriggerVisiblePeerInteractions,
-    /// The base crate has no settings schema and answers empty; `p2p_internet` overrides it and
-    /// needs `&mut self` to persist changes.
-    ProcessSettingsRequest {
-        request: Vec<u8>,
-        sender: oneshot::Sender<Result<Vec<u8>, Arc<dyn Error + Send + Sync>>>,
+    /// Rebuild from an opaque runtime configuration. The base crate has nothing to rebuild and
+    /// drops it. `p2p_internet` overrides this and needs `&mut self` to swap the swarm.
+    Restart(NodeConfig),
+    ListenOnPort {
+        port: ListenPort,
+        reply: oneshot::Sender<Result<(), ListenFailure>>,
+    },
+    #[cfg(feature = "debug-server")]
+    GetDebugBlob {
+        sender: oneshot::Sender<Box<dyn SerializeDebug + Send>>,
     },
 }
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum DataCommand {
-    StartListening {
-        addr: Multiaddr,
-        sender: oneshot::Sender<Result<(), Arc<dyn Error + Send + Sync>>>,
-    },
     SendFiles {
         files_to_send: Vec<FileToSend>,
         sender: oneshot::Sender<Result<(), Arc<dyn Error + Send + Sync>>>,
@@ -97,5 +102,10 @@ pub enum DataCommand {
     SyncDocsWithReachable {
         devices: Vec<PeerIdWrapper>,
         kind: DocKind,
+    },
+
+    #[cfg(feature = "debug-server")]
+    GetDebugBlob {
+        sender: oneshot::Sender<Box<dyn SerializeDebug + Send>>,
     },
 }

@@ -1,21 +1,25 @@
-use crate::core::domain_models::{ContactId, FylesId, PeerIdWrapper};
-use crate::core::sync::{self, ContactEntry, DocKind, RemoteFrEntry};
+use crate::core::sync::{self, DocKind};
 
-use super::Migration;
+use super::doc_v1::{
+    ContactEntryV1, ContactsDocV1, DeviceEntryV1, DevicesDocV1, RemoteFrDocV1, RemoteFrEntryV1,
+    fc1_contact_id, fc1_fingerprint, key_fingerprint_v1, new_blob,
+};
+use super::{Migration, MigrationError};
+use autosurgeon::{Hydrate, Reconcile};
+use crypto::{
+    ContactKeys, ContactPrivateKeys, deserialize_ed25519_private_key,
+    deserialize_pq_signing_private_key, serialize_ed25519_public_key,
+    serialize_pq_signing_public_key,
+};
 use rusqlite::{Connection, OptionalExtension};
 use semver::Version;
 use std::collections::HashMap;
 use uuid::Uuid;
 
-/// Map a `core::sync` build error into a `rusqlite::Error` for use inside migrations.
-fn sync_err(e: sync::SyncDocError) -> rusqlite::Error {
-    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e.to_string())))
-}
-
 /// Create the `sync_docs` table and seed the three CRDT documents from the existing
 /// (local) SQLite rows. Every document starts from the shared deterministic genesis so
 /// that documents seeded independently on different devices still converge on sync.
-fn seed_sync_docs(conn: &Connection) -> rusqlite::Result<()> {
+fn seed_sync_docs(conn: &Connection) -> Result<(), MigrationError> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS sync_docs (
              doc_kind TEXT PRIMARY KEY,
@@ -24,8 +28,7 @@ fn seed_sync_docs(conn: &Connection) -> rusqlite::Result<()> {
         [],
     )?;
 
-    // Contacts -> ContactsDoc. The fingerprint is computed directly over the stored,
-    // already-serialized public-key blobs (same bytes core::sync::fingerprint expects).
+    // Contacts -> ContactsDoc, fingerprinted over the stored, already-serialized key blobs.
     let mut contacts = HashMap::new();
     {
         let mut stmt = conn
@@ -33,17 +36,22 @@ fn seed_sync_docs(conn: &Connection) -> rusqlite::Result<()> {
         let rows = stmt.query_map([], |row| {
             let id: String = row.get(0)?;
             let name: String = row.get(1)?;
-            let pq: Vec<u8> = row.get(2)?;
-            let ed: Vec<u8> = row.get(3)?;
+            // Migration 1.10 -> 1.11 mints contacts for unrecognised peers with no key material.
+            let pq: Option<Vec<u8>> = row.get(2)?;
+            let ed: Option<Vec<u8>> = row.get(3)?;
             Ok((id, name, pq, ed))
         })?;
         for row in rows {
             let (id, name, pq, ed) = row?;
+            let key_fingerprint = match (pq, ed) {
+                (Some(pq), Some(ed)) => key_fingerprint_v1(&pq, &ed),
+                _ => vec![],
+            };
             contacts.insert(
-                ContactId(id),
-                ContactEntry {
+                id,
+                ContactEntryV1 {
                     name,
-                    key_fingerprint: sync::fingerprint(&pq, &ed),
+                    key_fingerprint,
                 },
             );
         }
@@ -67,28 +75,29 @@ fn seed_sync_docs(conn: &Connection) -> rusqlite::Result<()> {
         for row in rows {
             let (id, peer_id, filerequest_id, contact_id, name) = row?;
             remote_filerequests.insert(
-                FylesId(id),
-                RemoteFrEntry {
-                    peer_id_hint: PeerIdWrapper(peer_id),
-                    filerequest_id: FylesId(filerequest_id),
-                    contact_id: ContactId(contact_id),
+                id,
+                RemoteFrEntryV1 {
+                    peer_id_hint: peer_id,
+                    filerequest_id,
+                    contact_id,
                     name,
                 },
             );
         }
     }
 
-    let contacts_blob = sync::new_contacts_blob(contacts).map_err(sync_err)?;
-    let remote_fr_blob = sync::new_remote_fr_blob(remote_filerequests).map_err(sync_err)?;
+    let contacts_blob = new_blob(DocKind::Contacts, &ContactsDocV1 { contacts })?;
+    let remote_fr_blob = new_blob(
+        DocKind::RemoteFilerequests,
+        &RemoteFrDocV1 {
+            remote_filerequests,
+        },
+    )?;
 
-    // Seed this device into the Devices document, derived from the stored node keypair. Doing it
-    // here (not only at runtime via `ensure_own_device_registered`) matters for a restore: the
-    // restored DB runs migrations but the app doesn't restart, so the runtime self-registration
-    // never re-fires and the device would otherwise be missing from the owned-device list until a
-    // full restart. Falls back to an empty doc if the keypair is absent/undecodable (a fresh
-    // install goes through `initialize_tables`, not this migration, so a real upgrade has it).
-    // Best-effort: any failure (missing table/row, undecodable keypair) falls back to an empty
-    // devices doc — exactly the prior behaviour, where the local device self-registered at runtime.
+    // Seed this device into the Devices document, derived from the stored node keypair. A fresh
+    // install goes through `initialize_tables`, not this migration, so a real upgrade has one.
+    // Any failure falls back to an empty devices doc, and the device then registers itself at
+    // runtime via `ensure_own_device_registered`.
     let own_peer_id: Option<String> =
         match conn.query_row("SELECT key_bytes FROM node_keys WHERE id = 1", [], |row| {
             row.get::<_, Vec<u8>>(0)
@@ -109,14 +118,14 @@ fn seed_sync_docs(conn: &Connection) -> rusqlite::Result<()> {
         Some(peer_id) => {
             let mut devices = HashMap::new();
             devices.insert(
-                PeerIdWrapper(peer_id),
-                sync::DeviceEntry {
+                peer_id,
+                DeviceEntryV1 {
                     name: Uuid::new_v4().to_string(),
                 },
             );
-            sync::new_devices_blob(devices).map_err(sync_err)?
+            new_blob(DocKind::Devices, &DevicesDocV1 { devices })?
         }
-        None => sync::empty_blob(DocKind::Devices).map_err(sync_err)?,
+        None => sync::empty_blob(DocKind::Devices)?,
     };
 
     for (kind, blob) in [
@@ -216,7 +225,8 @@ pub fn get_migrations() -> Vec<Migration> {
                     FROM remote_filerequests;
                     DROP TABLE remote_filerequests;
                     ALTER TABLE new_remote_filerequests RENAME TO remote_filerequests;",
-                )
+                )?;
+                Ok(())
             },
         ),
         Migration::new(
@@ -241,7 +251,8 @@ pub fn get_migrations() -> Vec<Migration> {
                     FROM peers;
                     DROP TABLE peers;
                     ALTER TABLE new_peers RENAME TO peers;"
-                )
+                )?;
+                Ok(())
             },
             |conn: &Connection| {
                 conn.execute_batch(
@@ -261,7 +272,8 @@ pub fn get_migrations() -> Vec<Migration> {
                     FROM peers;
                     DROP TABLE peers;
                     ALTER TABLE new_peers RENAME TO peers;"
-                )
+                )?;
+                Ok(())
             },
         ),
         Migration::new(
@@ -354,7 +366,7 @@ pub fn get_migrations() -> Vec<Migration> {
                         Some(id) => id,
                         None => {
                             // Create new contact for this peer
-                            let contact_id = FylesId::new().0;
+                            let contact_id = Uuid::new_v4().to_string();
                             conn.execute(
                                 "INSERT INTO contacts (id, name, created_at, updated_at)
                                  VALUES (?, ?, datetime('now'), datetime('now'))",
@@ -365,7 +377,7 @@ pub fn get_migrations() -> Vec<Migration> {
                             )?;
 
                             // Create new peer under its own contact
-                            let new_peer_id = FylesId::new().0;
+                            let new_peer_id = Uuid::new_v4().to_string();
                             conn.execute(
                                 "INSERT INTO peers (id, peer_id, contact_id, name, is_active, created_at, updated_at)
                                  VALUES (?, ?, ?, ?, true, datetime('now'), datetime('now'))",
@@ -527,7 +539,8 @@ pub fn get_migrations() -> Vec<Migration> {
                      DROP TABLE peers;
                      ALTER TABLE new_peers RENAME TO peers;
                      CREATE UNIQUE INDEX idx_peers_peer_id ON peers(peer_id);"
-                )
+                )?;
+                Ok(())
             },
         ),
         Migration::new(
@@ -704,7 +717,8 @@ pub fn get_migrations() -> Vec<Migration> {
                     -- Drop old table and rename new one
                     DROP TABLE received_files;
                     ALTER TABLE new_received_files RENAME TO received_files;"
-                )
+                )?;
+                Ok(())
             },
             |conn| {
                 // Downgrade - recreate table with old structure
@@ -733,7 +747,8 @@ pub fn get_migrations() -> Vec<Migration> {
                     -- Drop old table and rename new one
                     DROP TABLE received_files;
                     ALTER TABLE new_received_files RENAME TO received_files;"
-                )
+                )?;
+                Ok(())
             },
         ),
         Migration::new(
@@ -781,7 +796,8 @@ pub fn get_migrations() -> Vec<Migration> {
                      ALTER TABLE pending_files_new RENAME TO pending_files;
                      
                      PRAGMA foreign_keys=ON;"
-                )
+                )?;
+                Ok(())
             },
             |conn| {
                 conn.execute_batch(
@@ -824,7 +840,8 @@ pub fn get_migrations() -> Vec<Migration> {
                      ALTER TABLE pending_files_new RENAME TO pending_files;
                      
                      PRAGMA foreign_keys=ON;"
-                )
+                )?;
+                Ok(())
             },
         ),
         // Migration to remove is_active from peers
@@ -849,7 +866,8 @@ pub fn get_migrations() -> Vec<Migration> {
                      DROP TABLE peers;
                      ALTER TABLE new_peers RENAME TO peers;
                      PRAGMA foreign_keys=ON;",
-                )
+                )?;
+                Ok(())
             },
             |conn| {
                 conn.execute_batch(
@@ -869,7 +887,8 @@ pub fn get_migrations() -> Vec<Migration> {
                      DROP TABLE peers;
                      ALTER TABLE new_peers RENAME TO peers;
                      PRAGMA foreign_keys=ON;"
-                )
+                )?;
+                Ok(())
             },
         ),
         // Migration to add self_contact CRDT storage
@@ -883,9 +902,10 @@ pub fn get_migrations() -> Vec<Migration> {
                         data BLOB NOT NULL,
                         schema_version TEXT NOT NULL
                      );",
-                )
+                )?;
+                Ok(())
             },
-            |conn| conn.execute_batch("DROP TABLE IF EXISTS self_contact;"),
+            |conn| Ok(conn.execute_batch("DROP TABLE IF EXISTS self_contact;")?),
         ),
         Migration::new(
             Version::new(1, 9, 0),
@@ -1823,9 +1843,28 @@ pub fn get_migrations() -> Vec<Migration> {
                 )?;
                 Ok(())
             },
-            // Downgrades are not implemented across this codebase; this reset is intentionally
-            // irreversible (the discarded key material cannot be recovered).
-            |_conn: &Connection| Ok(()),
+            |conn: &Connection| {
+                conn.execute_batch(
+                    // The discarded signing keys and the wiped contacts and transfers cannot be
+                    // restored.
+                    "CREATE TABLE self_contact_old (
+                         id INTEGER PRIMARY KEY CHECK (id = 1),
+                         contact_id TEXT NOT NULL,
+                         name TEXT NOT NULL,
+                         dilithium_private_key BLOB,
+                         dilithium_public_key BLOB,
+                         ed25519_private_key BLOB,
+                         ed25519_public_key BLOB
+                     );
+                     INSERT INTO self_contact_old (id, contact_id, name)
+                         SELECT id, contact_id, name FROM self_contact WHERE id = 1;
+                     DROP TABLE self_contact;
+                     ALTER TABLE self_contact_old RENAME TO self_contact;
+
+                     ALTER TABLE contacts RENAME COLUMN pq_signing_public_key TO dilithium_public_key;",
+                )?;
+                Ok(())
+            },
         ),
         Migration::new(
             Version::new(1, 20, 0),
@@ -1840,8 +1879,10 @@ pub fn get_migrations() -> Vec<Migration> {
                 )?;
                 Ok(())
             },
-            // Downgrades are not implemented across this codebase.
-            |_conn: &Connection| Ok(()),
+            |conn: &Connection| {
+                conn.execute_batch("ALTER TABLE received_files DROP COLUMN persisted_as_name;")?;
+                Ok(())
+            },
         ),
         Migration::new(
             Version::new(1, 21, 0),
@@ -1852,6 +1893,145 @@ pub fn get_migrations() -> Vec<Migration> {
             seed_sync_docs,
             unseed_sync_docs,
         ),
+        Migration::new(
+            Version::new(1, 22, 0),
+            Version::new(1, 23, 0),
+            "Add license_cache table for the cached pro-licensing state.",
+            |conn: &Connection| {
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS license_cache (
+                        id INTEGER PRIMARY KEY CHECK (id = 1),
+                        data BLOB NOT NULL DEFAULT X'',
+                        version TEXT NOT NULL DEFAULT '0.0.0'
+                    );",
+                )?;
+                Ok(())
+            },
+            |conn: &Connection| {
+                conn.execute_batch("DROP TABLE IF EXISTS license_cache;")?;
+                Ok(())
+            },
+        ),
+        Migration::new(
+            Version::new(1, 23, 0),
+            Version::new(1, 24, 0),
+            "Re-key every contact onto an id derived from its public keys, and drop the \
+             self contact's stored id in favour of deriving it from the signing keys.",
+            derive_contact_ids,
+            underive_contact_ids,
+        ),
+        Migration::new(
+            Version::new(1, 24, 0),
+            Version::new(1, 25, 0),
+            "Store the port peers reach this node on, keeping 24256 for every existing install \
+             so the firewall rules made for it still apply.",
+            |conn: &Connection| {
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS listen_port (
+                        id INTEGER PRIMARY KEY CHECK (id = 1),
+                        port INTEGER NOT NULL CHECK (port BETWEEN 1024 AND 65535)
+                    );
+                    INSERT INTO listen_port (id, port) VALUES (1, 24256);",
+                )?;
+                Ok(())
+            },
+            |conn: &Connection| {
+                conn.execute_batch("DROP TABLE IF EXISTS listen_port;")?;
+                Ok(())
+            },
+        ),
+        Migration::new(
+            Version::new(1, 25, 0),
+            Version::new(1, 26, 0),
+            "Remember when the source file of a transfer was last modified, so a resume can tell \
+             whether it changed since.",
+            |conn: &Connection| {
+                // A transfer recorded without the stamp cannot be resumed safely, so it starts over.
+                conn.execute_batch(
+                    "CREATE TABLE pending_files_new (
+                        id TEXT PRIMARY KEY,
+                        file_path TEXT NOT NULL,
+                        target_filerequest_id TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'Pending'
+                            CHECK (status IN ('Pending', 'Sending', 'Interrupted', 'Sent', 'Rejected', 'Failed')),
+                        retry_count INTEGER NOT NULL DEFAULT 0,
+                        progress_bytes INTEGER,
+                        file_size_bytes INTEGER,
+                        transfer_id TEXT,
+                        display_name TEXT,
+                        interruption_reasons TEXT NOT NULL DEFAULT '[]',
+                        created_at TEXT NOT NULL,
+                        source_modified_ms INTEGER,
+
+                        CHECK (
+                            (status = 'Pending'
+                                AND progress_bytes IS NULL AND file_size_bytes IS NULL
+                                AND transfer_id IS NULL AND source_modified_ms IS NULL)
+                            OR
+                            (status IN ('Sending', 'Interrupted')
+                                AND progress_bytes IS NOT NULL AND progress_bytes >= 0
+                                AND file_size_bytes IS NOT NULL AND file_size_bytes >= 0
+                                AND transfer_id IS NOT NULL AND source_modified_ms IS NOT NULL)
+                            OR
+                            (status IN ('Sent', 'Rejected', 'Failed'))
+                        )
+                    );
+
+                    INSERT INTO pending_files_new (id, file_path, target_filerequest_id, status, retry_count, progress_bytes, file_size_bytes, transfer_id, display_name, interruption_reasons, created_at)
+                    SELECT id, file_path, target_filerequest_id,
+                           CASE WHEN status IN ('Sending', 'Interrupted') THEN 'Pending' ELSE status END,
+                           retry_count,
+                           CASE WHEN status IN ('Sending', 'Interrupted') THEN NULL ELSE progress_bytes END,
+                           CASE WHEN status IN ('Sending', 'Interrupted') THEN NULL ELSE file_size_bytes END,
+                           CASE WHEN status IN ('Sending', 'Interrupted') THEN NULL ELSE transfer_id END,
+                           display_name, interruption_reasons, created_at
+                    FROM pending_files;
+
+                    DROP TABLE pending_files;
+                    ALTER TABLE pending_files_new RENAME TO pending_files;",
+                )?;
+                Ok(())
+            },
+            |conn: &Connection| {
+                conn.execute_batch(&format!(
+                    "{}
+
+                    INSERT INTO pending_files_new (id, file_path, target_filerequest_id, status, retry_count, progress_bytes, file_size_bytes, transfer_id, display_name, interruption_reasons, created_at)
+                    SELECT id, file_path, target_filerequest_id, status, retry_count, progress_bytes, file_size_bytes, transfer_id, display_name, interruption_reasons, created_at
+                    FROM pending_files;
+
+                    DROP TABLE pending_files;
+                    ALTER TABLE pending_files_new RENAME TO pending_files;",
+                    pending_files_1_25("pending_files_new")
+                ))?;
+                Ok(())
+            },
+        ),
+        Migration::new(
+            Version::new(1, 26, 0),
+            Version::new(1, 27, 0),
+            "Keep the key derived from this device's backup password and when to ask for it again.",
+            |conn: &Connection| {
+                conn.execute_batch(
+                    "CREATE TABLE backup_secret (
+                        id INTEGER PRIMARY KEY CHECK (id = 1),
+                        salt BLOB NOT NULL CHECK (length(salt) = 16),
+                        m_cost_kib INTEGER NOT NULL,
+                        t_cost INTEGER NOT NULL,
+                        p_cost INTEGER NOT NULL,
+                        key BLOB NOT NULL CHECK (length(key) = 32),
+                        verify_gap INTEGER NOT NULL CHECK (verify_gap BETWEEN 0 AND 3),
+                        verify_due_at_ms INTEGER NOT NULL,
+                        verify_missed INTEGER NOT NULL CHECK (verify_missed IN (0, 1))
+                    );",
+                )?;
+                Ok(())
+            },
+            |conn: &Connection| {
+                conn.execute_batch("DROP TABLE IF EXISTS backup_secret;")?;
+                Ok(())
+            },
+        ),
     ])
     .collect()
 }
@@ -1860,7 +2040,38 @@ pub fn get_migrations() -> Vec<Migration> {
 /// entirely (the CRDT document is authoritative), so recreate it and backfill every column from
 /// the synced document, then drop the `sync_docs` table. The `pending_files` foreign key is not
 /// restored — downgrades are best-effort and unsupported across this codebase.
-fn unseed_sync_docs(conn: &Connection) -> rusqlite::Result<()> {
+pub(super) fn pending_files_1_25(table: &str) -> String {
+    format!(
+        "CREATE TABLE {table} (
+            id TEXT PRIMARY KEY,
+            file_path TEXT NOT NULL,
+            target_filerequest_id TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'Pending'
+                CHECK (status IN ('Pending', 'Sending', 'Interrupted', 'Sent', 'Rejected', 'Failed')),
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            progress_bytes INTEGER,
+            file_size_bytes INTEGER,
+            transfer_id TEXT,
+            display_name TEXT,
+            interruption_reasons TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL,
+
+            CHECK (
+                (status = 'Pending'
+                    AND progress_bytes IS NULL AND file_size_bytes IS NULL AND transfer_id IS NULL)
+                OR
+                (status IN ('Sending', 'Interrupted')
+                    AND progress_bytes IS NOT NULL AND progress_bytes >= 0
+                    AND file_size_bytes IS NOT NULL AND file_size_bytes >= 0
+                    AND transfer_id IS NOT NULL)
+                OR
+                (status IN ('Sent', 'Rejected', 'Failed'))
+            )
+        );"
+    )
+}
+
+fn unseed_sync_docs(conn: &Connection) -> Result<(), MigrationError> {
     // Rehydrate the remote-filerequests document before we drop it.
     let blob: Option<Vec<u8>> = conn
         .query_row(
@@ -1871,8 +2082,8 @@ fn unseed_sync_docs(conn: &Connection) -> rusqlite::Result<()> {
         .optional()?;
     let remote_fr = match blob {
         Some(blob) => {
-            let doc = sync::load(&blob).map_err(sync_err)?;
-            let view: sync::RemoteFrDoc = sync::hydrate(&doc).map_err(sync_err)?;
+            let doc = sync::load(&blob)?;
+            let view: RemoteFrDocV1 = sync::hydrate(&doc)?;
             view.remote_filerequests
         }
         None => Default::default(),
@@ -1894,15 +2105,311 @@ fn unseed_sync_docs(conn: &Connection) -> rusqlite::Result<()> {
             "INSERT INTO remote_filerequests (id, peer_id, filerequest_id, contact_id, name, created_at)
              VALUES (?, ?, ?, ?, ?, datetime('now'))",
             rusqlite::params![
-                id.0,
-                entry.peer_id_hint.0,
-                entry.filerequest_id.0,
-                entry.contact_id.0,
+                id,
+                entry.peer_id_hint,
+                entry.filerequest_id,
+                entry.contact_id,
                 entry.name
             ],
         )?;
     }
 
     conn.execute("DROP TABLE sync_docs", [])?;
+    Ok(())
+}
+
+/// Re-keys every contact onto the id its public keys derive, taken from the cached key columns or
+/// else the contacts document's fingerprint. The documents are rewritten in place, because a
+/// rebuilt one would drop whatever another device has not yet sent.
+fn derive_contact_ids(conn: &Connection) -> Result<(), MigrationError> {
+    conn.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
+
+    let mut mapping: HashMap<String, String> = HashMap::new();
+
+    let mut contacts_doc = match load_doc(conn, DocKind::Contacts)? {
+        Some(blob) => Some(sync::load(&blob)?),
+        None => None,
+    };
+    let contacts_view: ContactsDocV1 = match &contacts_doc {
+        Some(doc) => sync::hydrate(doc)?,
+        None => ContactsDocV1::default(),
+    };
+    for (old_id, entry) in &contacts_view.contacts {
+        match fc1_contact_id(&entry.key_fingerprint) {
+            Ok(new_id) => {
+                mapping.insert(old_id.clone(), new_id);
+            }
+            Err(error) => tracing::error!(
+                contact_id = %old_id,
+                %error,
+                "Synced contact has no usable key fingerprint"
+            ),
+        }
+    }
+
+    {
+        let mut stmt =
+            conn.prepare("SELECT id, pq_signing_public_key, ed25519_public_key FROM contacts")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<Vec<u8>>>(1)?,
+                row.get::<_, Option<Vec<u8>>>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (old_id, Some(pq), Some(ed)) = row? else {
+                continue;
+            };
+            let new_id = fc1_contact_id(&key_fingerprint_v1(&pq, &ed))?;
+            match mapping.get(&old_id) {
+                Some(from_doc) if *from_doc != new_id => tracing::error!(
+                    contact_id = %old_id,
+                    %from_doc,
+                    from_columns = %new_id,
+                    "Cached key bytes disagree with the synced fingerprint. Keeping the \
+                     document's, which is the authoritative copy"
+                ),
+                _ => {
+                    mapping.insert(old_id, new_id);
+                }
+            }
+        }
+    }
+
+    // Two contacts rows could in theory hold one key pair. Remapping them collides on the primary
+    // key and fails the migration, which is unlikely enough to leave unhandled.
+    for (table, column, on_miss) in [
+        ("contacts", "id", OnMiss::DeleteRow),
+        ("filerequest_audience", "contact_id", OnMiss::DeleteRow),
+        ("received_files", "contact_id", OnMiss::SetNull),
+    ] {
+        for contact_id in remap_column(conn, table, column, &mapping, on_miss)? {
+            tracing::error!(
+                %table,
+                %contact_id,
+                "No derived id for this contact, so the rows referencing it cannot be kept"
+            );
+        }
+    }
+
+    if let Some(doc) = contacts_doc.as_mut() {
+        let contacts = contacts_view
+            .contacts
+            .iter()
+            .filter_map(|(old_id, entry)| {
+                Some((
+                    mapping.get(old_id)?.clone(),
+                    ContactEntryV2 {
+                        name: entry.name.clone(),
+                    },
+                ))
+            })
+            .collect();
+        sync::reconcile(doc, &ContactsDocV2 { contacts })?;
+        save_doc(conn, DocKind::Contacts, doc.save())?;
+    }
+
+    if let Some(blob) = load_doc(conn, DocKind::RemoteFilerequests)? {
+        let mut doc = sync::load(&blob)?;
+        let view: RemoteFrDocV1 = sync::hydrate(&doc)?;
+        let remote_filerequests = view
+            .remote_filerequests
+            .into_iter()
+            .filter_map(|(id, entry)| match mapping.get(&entry.contact_id) {
+                Some(new_id) => Some((
+                    id,
+                    RemoteFrEntryV1 {
+                        contact_id: new_id.clone(),
+                        ..entry
+                    },
+                )),
+                None => {
+                    // An unmapped value would fail `Hydrate` for the whole document from here on.
+                    tracing::warn!(
+                        remote_filerequest = %id,
+                        contact_id = %entry.contact_id,
+                        "Dropping a remote filerequest whose contact is unknown"
+                    );
+                    None
+                }
+            })
+            .collect();
+        sync::reconcile(
+            &mut doc,
+            &RemoteFrDocV1 {
+                remote_filerequests,
+            },
+        )?;
+        save_doc(conn, DocKind::RemoteFilerequests, doc.save())?;
+    }
+
+    conn.execute_batch(
+        "CREATE TABLE self_contact_new (
+             id INTEGER PRIMARY KEY CHECK (id = 1),
+             name TEXT NOT NULL,
+             pq_signing_private_key BLOB,
+             ed25519_private_key BLOB
+         );
+         INSERT INTO self_contact_new (id, name, pq_signing_private_key, ed25519_private_key)
+             SELECT 1, name, pq_signing_private_key, ed25519_private_key
+             FROM self_contact WHERE id = 1;
+         DROP TABLE self_contact;
+         ALTER TABLE self_contact_new RENAME TO self_contact;",
+    )?;
+
+    Ok(())
+}
+
+/// The contact ids stay derived, since the ones they replaced are gone. The self contact's stored
+/// id is the one its keys derive, so devices of one identity still agree after downgrading.
+fn underive_contact_ids(conn: &Connection) -> Result<(), MigrationError> {
+    if let Some(blob) = load_doc(conn, DocKind::Contacts)? {
+        let mut doc = sync::load(&blob)?;
+        let view: ContactsDocV2 = sync::hydrate(&doc)?;
+        let contacts = view
+            .contacts
+            .into_iter()
+            .map(|(id, entry)| {
+                let key_fingerprint = fc1_fingerprint(&id)?;
+                Ok((
+                    id,
+                    ContactEntryV1 {
+                        name: entry.name,
+                        key_fingerprint,
+                    },
+                ))
+            })
+            .collect::<Result<_, MigrationError>>()?;
+        sync::reconcile(&mut doc, &ContactsDocV1 { contacts })?;
+        save_doc(conn, DocKind::Contacts, doc.save())?;
+    }
+
+    let private_keys = conn
+        .query_row(
+            "SELECT pq_signing_private_key, ed25519_private_key FROM self_contact WHERE id = 1",
+            [],
+            |row| {
+                Ok(row
+                    .get::<_, Option<Vec<u8>>>(0)?
+                    .zip(row.get::<_, Option<Vec<u8>>>(1)?))
+            },
+        )
+        .optional()?
+        .flatten();
+    let self_contact_id = match private_keys {
+        Some((pq, ed)) => self_contact_id_from_private_keys(pq, ed)?,
+        None => Uuid::new_v4().to_string(),
+    };
+
+    conn.execute_batch(
+        "CREATE TABLE self_contact_old (
+             id INTEGER PRIMARY KEY CHECK (id = 1),
+             contact_id TEXT NOT NULL UNIQUE,
+             name TEXT NOT NULL,
+             pq_signing_private_key BLOB,
+             ed25519_private_key BLOB
+         );",
+    )?;
+    conn.execute(
+        "INSERT INTO self_contact_old (id, contact_id, name, pq_signing_private_key, ed25519_private_key)
+             SELECT 1, ?, name, pq_signing_private_key, ed25519_private_key
+             FROM self_contact WHERE id = 1",
+        [self_contact_id],
+    )?;
+    conn.execute_batch(
+        "DROP TABLE self_contact;
+         ALTER TABLE self_contact_old RENAME TO self_contact;",
+    )?;
+
+    Ok(())
+}
+
+fn self_contact_id_from_private_keys(
+    pq_signing_private: Vec<u8>,
+    ed25519_private: Vec<u8>,
+) -> Result<String, MigrationError> {
+    let public = ContactKeys::from_private(ContactPrivateKeys {
+        pq_signing: Box::new(deserialize_pq_signing_private_key(pq_signing_private)?),
+        ed25519: deserialize_ed25519_private_key(ed25519_private)?,
+    })
+    .public;
+    let fingerprint = key_fingerprint_v1(
+        &serialize_pq_signing_public_key(&public.pq_signing),
+        &serialize_ed25519_public_key(&public.ed25519),
+    );
+    Ok(fc1_contact_id(&fingerprint).expect("a SHA-256 fingerprint to be 32 bytes"))
+}
+
+#[derive(Reconcile, Hydrate)]
+struct ContactEntryV2 {
+    name: String,
+}
+
+#[derive(Reconcile, Hydrate)]
+struct ContactsDocV2 {
+    #[autosurgeon(with = "autosurgeon::map_with_parseable_keys")]
+    contacts: HashMap<String, ContactEntryV2>,
+}
+
+enum OnMiss {
+    DeleteRow,
+    SetNull,
+}
+
+/// Returns the values that had no mapping, after applying `on_miss` to their rows.
+fn remap_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    mapping: &HashMap<String, String>,
+    on_miss: OnMiss,
+) -> rusqlite::Result<Vec<String>> {
+    let existing: Vec<String> = conn
+        .prepare(&format!(
+            "SELECT DISTINCT {column} FROM {table} WHERE {column} IS NOT NULL"
+        ))?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<_, _>>()?;
+
+    let mut unmapped = Vec::new();
+    for old_id in existing {
+        match mapping.get(&old_id) {
+            Some(new_id) => {
+                conn.execute(
+                    &format!("UPDATE {table} SET {column} = ? WHERE {column} = ?"),
+                    rusqlite::params![new_id, old_id],
+                )?;
+            }
+            None => {
+                let statement = match on_miss {
+                    OnMiss::DeleteRow => format!("DELETE FROM {table} WHERE {column} = ?"),
+                    OnMiss::SetNull => {
+                        format!("UPDATE {table} SET {column} = NULL WHERE {column} = ?")
+                    }
+                };
+                conn.execute(&statement, [&old_id])?;
+                unmapped.push(old_id);
+            }
+        }
+    }
+    Ok(unmapped)
+}
+
+fn load_doc(conn: &Connection, kind: DocKind) -> rusqlite::Result<Option<Vec<u8>>> {
+    conn.query_row(
+        "SELECT data FROM sync_docs WHERE doc_kind = ?",
+        [kind.as_str()],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+fn save_doc(conn: &Connection, kind: DocKind, blob: Vec<u8>) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO sync_docs (doc_kind, data) VALUES (?, ?)
+         ON CONFLICT(doc_kind) DO UPDATE SET data = excluded.data",
+        rusqlite::params![kind.as_str(), blob],
+    )?;
     Ok(())
 }

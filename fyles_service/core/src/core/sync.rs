@@ -5,8 +5,8 @@
 //! - Each collection is a map keyed by a globally-stable id, so documents converge by key
 //!   without a shared ancestor (contacts key on [`ContactId`], remote filerequests on their
 //!   local [`FylesId`]).
-//! - Public keys never enter a document, only their [`fingerprint`]; the bytes are synced
-//!   out of band.
+//! - Public keys never enter a document. A contact's key bytes are synced out of band and
+//!   checked against the [`ContactId`] they derive, which is the map key.
 
 use std::collections::HashMap;
 
@@ -17,7 +17,9 @@ use autosurgeon::{Hydrate, Reconcile};
 use sha2::{Digest, Sha256};
 
 use crate::core::db::{DbError, FilerequestDb};
-use crate::core::domain_models::{ContactId, FylesId, PeerIdWrapper};
+use crate::core::domain_models::{
+    ContactId, DisplayContact, FylesId, GivenName, PeerIdWrapper, RemoteFilerequest,
+};
 
 /// Which synced document — each is an independent automerge blob with its own schema major.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -27,20 +29,56 @@ pub enum DocKind {
     Devices,
 }
 
-/// Evidence that a *local* call wrote to a synced document, and to which one. A convergence merge
-/// writes through `mutate_sync_doc`, which returns `()`, so it cannot announce and cannot gossip.
-#[must_use = "a local write to a synced document should be announced to the user's other devices \
-              — pass it to `GigaBrain::announce`, or discard it explicitly with a comment saying why"]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LocalDocWrite(DocKind);
+#[derive(Debug, Clone)]
+pub enum ContactChange {
+    Upserted(DisplayContact),
+    Removed(ContactId),
+}
+
+#[derive(Debug, Clone)]
+pub enum RemoteFilerequestChange {
+    Upserted(RemoteFilerequest),
+    Removed(FylesId),
+}
+
+#[derive(Debug, Clone)]
+pub enum DeviceChange {
+    Upserted(PeerIdWrapper, String),
+    Removed(PeerIdWrapper),
+}
+
+/// What a local write did, split by concern so the sync side can match on the concern alone.
+#[derive(Debug, Clone)]
+pub enum DocChange {
+    Contacts(ContactChange),
+    RemoteFilerequests(RemoteFilerequestChange),
+    Devices(DeviceChange),
+}
+
+/// Evidence that a *local* call wrote to a synced document, carrying the change it made. A
+/// convergence merge writes through `mutate_sync_doc`, which returns `()`, so it cannot announce
+/// and cannot gossip.
+#[must_use = "a local write to a synced document should reach the attached clients and the user's \
+              other devices — pass it to `GigaBrain::commit_local_write`, or discard it explicitly \
+              with a comment saying why"]
+#[derive(Debug, Clone)]
+pub struct LocalDocWrite(DocChange);
 
 impl LocalDocWrite {
-    pub(crate) fn new(kind: DocKind) -> Self {
-        Self(kind)
+    pub(crate) fn new(change: DocChange) -> Self {
+        Self(change)
     }
 
-    pub fn kind(self) -> DocKind {
-        self.0
+    pub fn kind(&self) -> DocKind {
+        match self.0 {
+            DocChange::Contacts(_) => DocKind::Contacts,
+            DocChange::RemoteFilerequests(_) => DocKind::RemoteFilerequests,
+            DocChange::Devices(_) => DocKind::Devices,
+        }
+    }
+
+    pub fn change(&self) -> &DocChange {
+        &self.0
     }
 }
 
@@ -61,11 +99,11 @@ impl DocKind {
 
     /// Peers on a different major skip this document rather than risk a corrupt hydrate.
     /// Bump only on an incompatible shape change (add-via-`missing`/removal are compatible;
-    /// see `schema_evolution_spike`).
+    /// see `core/proofs/schema_evolution_spike.rs`).
     pub fn schema_major(self) -> u32 {
         match self {
-            DocKind::Contacts => 1,
-            DocKind::RemoteFilerequests => 1,
+            DocKind::Contacts => 2,
+            DocKind::RemoteFilerequests => 2,
             DocKind::Devices => 1,
         }
     }
@@ -87,7 +125,6 @@ impl std::str::FromStr for DocKind {
 #[derive(Debug, Clone, PartialEq, Reconcile, Hydrate)]
 pub struct ContactEntry {
     pub name: String,
-    pub key_fingerprint: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Reconcile, Hydrate)]
@@ -95,8 +132,31 @@ pub struct RemoteFrEntry {
     /// A re-resolvable locator, not identity — resolve via `contact_id` when stale.
     pub peer_id_hint: PeerIdWrapper,
     pub filerequest_id: FylesId,
+    #[autosurgeon(with = "contact_id_codec")]
     pub contact_id: ContactId,
     pub name: String,
+}
+
+mod contact_id_codec {
+    use autosurgeon::{Hydrate, HydrateError, Prop, ReadDoc, Reconcile, Reconciler};
+
+    use super::ContactId;
+
+    pub(super) fn reconcile<R: Reconciler>(id: &ContactId, reconciler: R) -> Result<(), R::Error> {
+        id.as_ref().to_string().reconcile(reconciler)
+    }
+
+    pub(super) fn hydrate<D: ReadDoc>(
+        doc: &D,
+        obj: &automerge::ObjId,
+        prop: Prop<'_>,
+    ) -> Result<ContactId, HydrateError> {
+        String::hydrate(doc, obj, prop)?
+            .parse()
+            .map_err(|e: crypto::ContactIdParseError| {
+                HydrateError::unexpected("a contact id", e.to_string())
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Reconcile, Hydrate)]
@@ -120,20 +180,6 @@ pub struct RemoteFrDoc {
 pub struct DevicesDoc {
     #[autosurgeon(with = "autosurgeon::map_with_parseable_keys")]
     pub devices: HashMap<PeerIdWrapper, DeviceEntry>,
-}
-
-pub fn fingerprint(pq_signing_public: &[u8], ed25519_public: &[u8]) -> Vec<u8> {
-    let mut hasher = Sha256::new();
-    hasher.update(pq_signing_public);
-    hasher.update(ed25519_public);
-    hasher.finalize().to_vec()
-}
-
-pub fn fingerprint_of(keys: &crypto::ContactPublicKeys) -> Vec<u8> {
-    fingerprint(
-        &crypto::serialize_pq_signing_public_key(&keys.pq_signing),
-        &crypto::serialize_ed25519_public_key(&keys.ed25519),
-    )
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -356,23 +402,10 @@ async fn mutate_devices_doc<F>(
     f: F,
 ) -> Result<LocalDocWrite, CrdtPersistenceError>
 where
-    F: FnOnce(&mut DevicesDoc) + Send + 'static,
+    F: FnOnce(&mut DevicesDoc) -> DeviceChange + Send + 'static,
 {
-    // Read-modify-write as one atomic DB op: `reconcile` overwrites the whole doc to match the
-    // view, so a stale read followed by an overwrite would drop entries a concurrent sync
-    // convergence merged in. Doing load+reconcile+save in one actor turn prevents that.
-    db.mutate_sync_doc(
-        DocKind::Devices,
-        Box::new(move |blob| {
-            let mut doc = load(&blob).map_err(sync_doc_err)?;
-            let mut view: DevicesDoc = hydrate(&doc).map_err(sync_doc_err)?;
-            f(&mut view);
-            reconcile(&mut doc, &view).map_err(sync_doc_err)?;
-            Ok(doc.save())
-        }),
-    )
-    .await?;
-    Ok(LocalDocWrite::new(DocKind::Devices))
+    let change = db.mutate_devices_doc(Box::new(f)).await?;
+    Ok(LocalDocWrite::new(DocChange::Devices(change)))
 }
 
 pub async fn add_or_update_owned_device(
@@ -381,7 +414,9 @@ pub async fn add_or_update_owned_device(
     name: String,
 ) -> Result<LocalDocWrite, CrdtPersistenceError> {
     mutate_devices_doc(db, move |view| {
-        view.devices.insert(peer_id, DeviceEntry { name });
+        view.devices
+            .insert(peer_id.clone(), DeviceEntry { name: name.clone() });
+        DeviceChange::Upserted(peer_id, name)
     })
     .await
 }
@@ -392,11 +427,13 @@ pub async fn ensure_own_device_registered(
     own_peer_id: PeerIdWrapper,
 ) -> Result<LocalDocWrite, CrdtPersistenceError> {
     mutate_devices_doc(db, move |view| {
-        view.devices
-            .entry(own_peer_id)
+        let entry = view
+            .devices
+            .entry(own_peer_id.clone())
             .or_insert_with(|| DeviceEntry {
-                name: uuid::Uuid::new_v4().to_string(),
+                name: GivenName::unnamed(),
             });
+        DeviceChange::Upserted(own_peer_id, entry.name.clone())
     })
     .await
 }
@@ -409,6 +446,7 @@ pub async fn remove_owned_device(
     let peer_id = peer_id.clone();
     mutate_devices_doc(db, move |view| {
         view.devices.remove(&peer_id);
+        DeviceChange::Removed(peer_id)
     })
     .await
 }
@@ -464,10 +502,7 @@ mod doc_tests {
     }
 
     fn contact_entry(name: &str) -> ContactEntry {
-        ContactEntry {
-            name: name.into(),
-            key_fingerprint: vec![1, 2, 3],
-        }
+        ContactEntry { name: name.into() }
     }
 
     /// A contacts document seeded from the shared genesis with a single entry — the way
@@ -476,7 +511,7 @@ mod doc_tests {
         let mut doc = genesis(DocKind::Contacts).unwrap();
         let mut view: ContactsDoc = hydrate(&doc).unwrap();
         view.contacts
-            .insert(ContactId(id.into()), contact_entry(name));
+            .insert(ContactId::for_test_labelled(id), contact_entry(name));
         reconcile(&mut doc, &view).unwrap();
         doc
     }
@@ -497,7 +532,10 @@ mod doc_tests {
 
         let loaded = load(&blob).unwrap();
         let hydrated: ContactsDoc = hydrate(&loaded).unwrap();
-        assert_eq!(hydrated.contacts[&ContactId("c1".into())].name, "alice");
+        assert_eq!(
+            hydrated.contacts[&ContactId::for_test_labelled("c1")].name,
+            "alice"
+        );
     }
 
     #[test]
@@ -521,7 +559,10 @@ mod doc_tests {
 
         drive_sync(&mut populated, &mut fresh);
         let hydrated: ContactsDoc = hydrate(&fresh).unwrap();
-        assert_eq!(hydrated.contacts[&ContactId("c1".into())].name, "alice");
+        assert_eq!(
+            hydrated.contacts[&ContactId::for_test_labelled("c1")].name,
+            "alice"
+        );
     }
 
     /// The auto-sync dirty gate compares the current doc-heads fingerprint against the
@@ -598,8 +639,16 @@ mod doc_tests {
         a.merge(&mut b).unwrap();
         let hydrated: ContactsDoc = hydrate(&a).unwrap();
         assert_eq!(hydrated.contacts.len(), 2);
-        assert!(hydrated.contacts.contains_key(&ContactId("c_a".into())));
-        assert!(hydrated.contacts.contains_key(&ContactId("c_b".into())));
+        assert!(
+            hydrated
+                .contacts
+                .contains_key(&ContactId::for_test_labelled("c_a"))
+        );
+        assert!(
+            hydrated
+                .contacts
+                .contains_key(&ContactId::for_test_labelled("c_b"))
+        );
     }
 
     #[test]
@@ -609,13 +658,13 @@ mod doc_tests {
         let mut a = AutoCommit::new();
         let mut va = ContactsDoc::default();
         va.contacts
-            .insert(ContactId("c_a".into()), contact_entry("alice"));
+            .insert(ContactId::for_test_labelled("c_a"), contact_entry("alice"));
         reconcile(&mut a, &va).unwrap();
 
         let mut b = AutoCommit::new();
         let mut vb = ContactsDoc::default();
         vb.contacts
-            .insert(ContactId("c_b".into()), contact_entry("bob"));
+            .insert(ContactId::for_test_labelled("c_b"), contact_entry("bob"));
         reconcile(&mut b, &vb).unwrap();
 
         a.merge(&mut b).unwrap();
@@ -634,7 +683,7 @@ mod doc_tests {
         let entry = |peer: &str| RemoteFrEntry {
             peer_id_hint: PeerIdWrapper(peer.into()),
             filerequest_id: FylesId("fr-remote".into()),
-            contact_id: ContactId("contact-x".into()),
+            contact_id: ContactId::for_test_labelled("contact-x"),
             name: "shared drop".into(),
         };
         let seed = |local_id: &str, peer: &str| {
@@ -658,16 +707,24 @@ mod doc_tests {
         let mut doc = seeded_contacts("c1", "alice");
         let mut d: ContactsDoc = hydrate(&doc).unwrap();
         d.contacts
-            .insert(ContactId("c2".into()), contact_entry("bob"));
+            .insert(ContactId::for_test_labelled("c2"), contact_entry("bob"));
         reconcile(&mut doc, &d).unwrap();
 
         // Remove c1 and reconcile the smaller map back in.
-        d.contacts.remove(&ContactId("c1".into()));
+        d.contacts.remove(&ContactId::for_test_labelled("c1"));
         reconcile(&mut doc, &d).unwrap();
 
         let hydrated: ContactsDoc = hydrate(&doc).unwrap();
-        assert!(!hydrated.contacts.contains_key(&ContactId("c1".into())));
-        assert!(hydrated.contacts.contains_key(&ContactId("c2".into())));
+        assert!(
+            !hydrated
+                .contacts
+                .contains_key(&ContactId::for_test_labelled("c1"))
+        );
+        assert!(
+            hydrated
+                .contacts
+                .contains_key(&ContactId::for_test_labelled("c2"))
+        );
     }
 }
 
@@ -766,7 +823,7 @@ mod service_tests {
                 peer_id: PeerIdWrapper("peer-a".into()),
                 filerequest_id: "fr-a".into(),
                 name: "from A".into(),
-                contact_id: alice.id.clone(),
+                contact_id: alice.id(),
             })
             .await
             .unwrap();
@@ -777,8 +834,8 @@ mod service_tests {
         for (label, db) in [("A", a), ("B", b)] {
             let contacts = db.get_contacts().await.unwrap();
             assert!(
-                contacts.iter().any(|c| c.id == alice.id)
-                    && contacts.iter().any(|c| c.id == bob.id),
+                contacts.iter().any(|c| c.id == alice.id())
+                    && contacts.iter().any(|c| c.id == bob.id()),
                 "device {label} should have both contacts, got {contacts:?}"
             );
             let all = db.get_all_remote_filerequests().await.unwrap();
@@ -799,7 +856,8 @@ mod service_tests {
         let a = &*dev_a;
         let b = &*dev_b;
 
-        let _ = a.update_contact_projection(Contact::for_test())
+        let _ = a
+            .update_contact_projection(Contact::for_test())
             .await
             .unwrap();
         run_full_sync(a, b).await;
@@ -864,10 +922,9 @@ mod service_tests {
         // bytes are still in the local cache until we prune.
         let mut only_bob = HashMap::new();
         only_bob.insert(
-            bob.id.clone(),
+            bob.id(),
             ContactEntry {
                 name: bob.name.clone(),
-                key_fingerprint: fingerprint_of(&bob.public_keys),
             },
         );
         db.save_sync_doc(DocKind::Contacts, new_contacts_blob(only_bob).unwrap())
@@ -877,14 +934,17 @@ mod service_tests {
         db.prune_contact_key_cache().await.unwrap();
 
         assert!(
-            db.get_contact_public_keys(alice.id)
+            db.get_contact_public_keys(alice.id())
                 .await
                 .unwrap()
                 .is_none(),
             "removed contact's keys should be pruned"
         );
         assert!(
-            db.get_contact_public_keys(bob.id).await.unwrap().is_some(),
+            db.get_contact_public_keys(bob.id())
+                .await
+                .unwrap()
+                .is_some(),
             "present contact's keys should be kept"
         );
     }
@@ -901,7 +961,8 @@ mod service_tests {
         assert_eq!(fp0, doc_fingerprint(db, DocKind::Contacts).await);
 
         // A contact write changes the contacts document.
-        let _ = db.update_contact_projection(Contact::for_test())
+        let _ = db
+            .update_contact_projection(Contact::for_test())
             .await
             .unwrap();
         let fp1 = doc_fingerprint(db, DocKind::Contacts).await;
@@ -912,14 +973,15 @@ mod service_tests {
 
         // ...but leaves the remote-filerequest document untouched.
         let rfp0 = doc_fingerprint(db, DocKind::RemoteFilerequests).await;
-        let _ = db.create_remote_filerequest(&CreateRemoteFilerequest {
-            peer_id: PeerIdWrapper("p".into()),
-            filerequest_id: "fr".into(),
-            name: "n".into(),
-            contact_id: ContactId("c".into()),
-        })
-        .await
-        .unwrap();
+        let _ = db
+            .create_remote_filerequest(&CreateRemoteFilerequest {
+                peer_id: PeerIdWrapper("p".into()),
+                filerequest_id: "fr".into(),
+                name: "n".into(),
+                contact_id: ContactId::for_test_labelled("c"),
+            })
+            .await
+            .unwrap();
         let rfp1 = doc_fingerprint(db, DocKind::RemoteFilerequests).await;
         assert_ne!(rfp0, rfp1);
 
@@ -941,147 +1003,5 @@ mod service_tests {
             assert!(kind.schema_major() >= 1);
         }
         assert!("not-a-doc-kind".parse::<DocKind>().is_err());
-    }
-}
-
-#[cfg(test)]
-mod schema_evolution_spike {
-    //! Verifies, against the pinned `autosurgeon` 0.9 / `automerge` 0.7, how a struct
-    //! hydrates from a document written under a *different* schema. Conclusions:
-    //!
-    //! 1. **Adding a field** is only compatible via `#[autosurgeon(missing = "fn")]`.
-    //!    A bare `Option<T>` field does NOT tolerate an absent key — it errors.
-    //! 2. **Removing a field** is always safe: unknown keys in the doc are ignored.
-    //! 3. **Adding an enum variant** is NOT safe: an unknown variant tag fails to
-    //!    hydrate. Mitigation: a catch-all variant with a custom `hydrate_with`.
-
-    use automerge::AutoCommit;
-    use autosurgeon::{Hydrate, Reconcile, hydrate, reconcile};
-
-    fn default_kind() -> String {
-        "unknown".to_string()
-    }
-
-    #[derive(Debug, Clone, Reconcile, Hydrate)]
-    struct EntryV1 {
-        name: String,
-    }
-
-    #[derive(Debug, Clone, Reconcile, Hydrate)]
-    struct EntryV2Missing {
-        name: String,
-        #[autosurgeon(missing = "default_kind")]
-        kind: String,
-    }
-
-    #[derive(Debug, Clone, Reconcile, Hydrate)]
-    struct EntryV2Option {
-        name: String,
-        extra: Option<String>,
-    }
-
-    #[test]
-    fn added_field_with_missing_attr_hydrates_with_default() {
-        let mut doc = AutoCommit::new();
-        reconcile(
-            &mut doc,
-            EntryV1 {
-                name: "alice".into(),
-            },
-        )
-        .unwrap();
-
-        let hydrated: EntryV2Missing = hydrate(&doc).unwrap();
-        assert_eq!(hydrated.name, "alice");
-        assert_eq!(hydrated.kind, default_kind());
-    }
-
-    #[test]
-    fn added_bare_option_field_fails_on_absent_key() {
-        let mut doc = AutoCommit::new();
-        reconcile(
-            &mut doc,
-            EntryV1 {
-                name: "alice".into(),
-            },
-        )
-        .unwrap();
-
-        let hydrated: Result<EntryV2Option, _> = hydrate(&doc);
-        assert!(
-            hydrated.is_err(),
-            "bare Option must NOT silently tolerate an absent key"
-        );
-    }
-
-    #[test]
-    fn removed_field_is_ignored() {
-        let mut doc = AutoCommit::new();
-        reconcile(
-            &mut doc,
-            EntryV2Missing {
-                name: "bob".into(),
-                kind: "person".into(),
-            },
-        )
-        .unwrap();
-
-        let hydrated: EntryV1 = hydrate(&doc).unwrap();
-        assert_eq!(hydrated.name, "bob");
-    }
-
-    #[derive(Debug, Clone, Reconcile, Hydrate)]
-    enum ColorV1 {
-        Red,
-        Blue,
-    }
-
-    #[derive(Debug, Clone, Reconcile, Hydrate)]
-    enum ColorV2 {
-        Blue,
-        Green,
-    }
-
-    #[derive(Debug, Clone, Reconcile, Hydrate)]
-    struct HolderV1 {
-        color: ColorV1,
-    }
-
-    #[derive(Debug, Clone, Reconcile, Hydrate)]
-    struct HolderV2 {
-        color: ColorV2,
-    }
-
-    #[test]
-    fn unknown_enum_variant_fails_to_hydrate() {
-        let mut doc = AutoCommit::new();
-        reconcile(
-            &mut doc,
-            HolderV1 {
-                color: ColorV1::Red,
-            },
-        )
-        .unwrap();
-
-        let hydrated: Result<HolderV2, _> = hydrate(&doc);
-        assert!(
-            hydrated.is_err(),
-            "an unknown enum variant tag must fail to hydrate"
-        );
-    }
-
-    #[test]
-    fn known_enum_variant_still_hydrates() {
-        let mut doc = AutoCommit::new();
-        reconcile(
-            &mut doc,
-            HolderV1 {
-                color: ColorV1::Blue,
-            },
-        )
-        .unwrap();
-
-        let hydrated: HolderV2 = hydrate(&doc).unwrap();
-        assert!(matches!(hydrated.color, ColorV2::Blue));
     }
 }

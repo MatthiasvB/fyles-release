@@ -99,7 +99,7 @@ async fn always_accept_files_from_self() {
         filerequest_id: filerequest_id.clone(),
         file_path: test_file_path.to_str().unwrap().to_string(),
         retry_count: 0,
-        contact_id: owner_harness.node_info.self_contact_id.clone(),
+        contact_id: owner_harness.node_info.self_contact_keys.id(),
         status: SendStatus::Pending,
     };
 

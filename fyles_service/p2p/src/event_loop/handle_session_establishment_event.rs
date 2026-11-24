@@ -1,12 +1,13 @@
 use libp2p::request_response::{self, Event};
 use tracing::{Instrument, error, instrument, trace, warn};
 
+use crypto::session::{
+    AuthWireRequest, AuthWireResponse, KeyExchangeResponseMessage, SessionInitiationRequest,
+};
+
 use crate::{
-    crypto::{
-        AuthWireRequest, AuthWireResponse, KeyExchangeResponseMessage,
-        ResponderSessionEstablishmentError, SessionInitiationRequest,
-    },
     event_loop::{FileTracker, LocalNetworkSwarm, RefCountEventLoopData, with_swarm::WithSwarm},
+    sessions::ResponderSessionEstablishmentError,
 };
 
 impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoopData<T, S> {

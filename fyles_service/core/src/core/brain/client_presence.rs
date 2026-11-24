@@ -7,6 +7,7 @@
 use std::future::pending;
 use std::time::Duration;
 use tokio::time::Instant;
+use tracing::trace;
 
 use crate::constants::CLIENT_HEARTBEAT_TTL;
 use crate::core::brain::GigaBrain;
@@ -44,8 +45,9 @@ impl ClientPresence {
 
     pub(super) fn level(&self) -> WakenessLevel {
         let now = Instant::now();
-        let live =
-            |beat: Option<Instant>| beat.is_some_and(|t| now.saturating_duration_since(t) < CLIENT_HEARTBEAT_TTL);
+        let live = |beat: Option<Instant>| {
+            beat.is_some_and(|t| now.saturating_duration_since(t) < CLIENT_HEARTBEAT_TTL)
+        };
         if live(self.foreground) {
             WakenessLevel::Active
         } else if live(self.any) {
@@ -87,6 +89,7 @@ impl GigaBrain {
             let next_decay = self.ephemeral().await.client_presence.next_decay_in();
             tokio::select! {
                 _ = sweep.tick() => {
+                    trace!("Triggering visible peer sweep");
                     self.network.read().await.trigger_interactions_with_visible_peers().await;
                 }
                 // The only thing that makes a rise take effect before the decay deadline.

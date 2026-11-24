@@ -1,12 +1,16 @@
+use crate::core::backup::{RestoredFrom, StoredBackupSecret, VerificationSchedule};
 use crate::core::brain::action_p2p::NodeInfo;
 use crate::core::db::DbError;
 use crate::core::domain_models::{
     CompleteReceivedFile, Contact, ContactId, CreateFilerequest, CreateIncomingFile,
-    CreatePendingFiles, CreateRemoteFilerequest, DisplayContact, Filerequest, FylesId, PendingFile,
-    ReceiveStatus, ReceivedFile, RemoteFilerequest, SelfContact, SendStatus,
+    CreatePendingFiles, CreateRemoteFilerequest, DisplayContact, Filerequest, FilerequestId,
+    FylesId, PendingFile, ReceiveStatus, ReceivedFile, RemoteFilerequest, SelfContact, SendStatus,
 };
+use crate::core::listen::ListenPort;
 use crate::core::p2p::NodeKeyPairBinary;
-use crate::core::sync::DocKind;
+use crate::core::settings::SettingsBlob;
+use crate::core::sync::{DeviceChange, DevicesDoc, DocKind};
+use automerge::AutoCommit;
 use crypto::{ContactKeys, ContactPublicKeys};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -41,7 +45,7 @@ pub enum SqliteMsg {
     DeleteContact(ContactId, Sender<Result<(), DbError>>),
     StoreNodeKeys(NodeInfo, Sender<Result<(), DbError>>),
     GetNodeInfo(Sender<Result<NodeInfo, DbError>>),
-    GetNodeAndSelfContactId(Sender<Result<(NodeKeyPairBinary, ContactId), DbError>>),
+    GetNodeKeypair(Sender<Result<NodeKeyPairBinary, DbError>>),
     GetSelfContactId(Sender<Result<ContactId, DbError>>),
     StoreSigningKeys(ContactKeys, Sender<Result<(), DbError>>),
     // Remote filerequest messages
@@ -71,7 +75,7 @@ pub enum SqliteMsg {
     GetReceivedFileByTransferId(FylesId, Sender<Result<ReceivedFile, DbError>>),
     CompleteReceivedFile(CompleteReceivedFile, Sender<Result<FylesId, DbError>>),
     ListReceivedFiles(FylesId, Sender<Result<Vec<ReceivedFile>, DbError>>),
-    DeleteReceivedFile(FylesId, Sender<Result<(), DbError>>),
+    DeleteReceivedFile(FylesId, Sender<Result<FilerequestId, DbError>>),
     GetStaleReceivedFiles(i64, Sender<Result<Vec<ReceivedFile>, DbError>>),
 
     // SelfContact messages
@@ -79,35 +83,35 @@ pub enum SqliteMsg {
     GetSelfContactForDisplay(Sender<Result<DisplayContact, DbError>>),
     UpdateSelfContactName(String, Sender<Result<(), DbError>>),
     UpdateIdentity(SelfContact, Sender<Result<(), DbError>>),
-    GetSharablePublicSelfContact(Sender<Result<Contact, DbError>>),
     UpdateContactProjection(Contact, Sender<Result<(), DbError>>),
     PruneContactKeyCache(Sender<Result<(), DbError>>),
     PruneOrphanedPendingFiles(Sender<Result<(), DbError>>),
 
-    Backup {
-        backup_file: std::fs::File,
-        internal_data_dir: PathBuf,
-        response_sender: Sender<Result<(), DbError>>,
-    },
-
-    Restore {
-        backup_file: tokio::fs::File,
-        response_sender: Sender<Result<(), DbError>>,
-    },
+    Snapshot(PathBuf, Sender<Result<(), DbError>>),
+    Restore(PathBuf, RestoredFrom, Sender<Result<(), DbError>>),
+    GetBackupSecret(Sender<Result<Option<StoredBackupSecret>, DbError>>),
+    StoreBackupSecret(StoredBackupSecret, Sender<Result<(), DbError>>),
+    StoreVerificationSchedule(VerificationSchedule, Sender<Result<(), DbError>>),
 
     // Opaque settings
-    GetSettings(Sender<Result<Vec<u8>, DbError>>),
-    StoreSettings(Vec<u8>, Sender<Result<(), DbError>>),
+    GetSettings(Sender<Result<SettingsBlob, DbError>>),
+    StoreSettings(SettingsBlob, Sender<Result<(), DbError>>),
+
+    GetLicenseCache(Sender<Result<Option<Vec<u8>>, DbError>>),
+    StoreLicenseCache(Vec<u8>, Sender<Result<(), DbError>>),
+
+    GetListenPort(Sender<Result<Option<ListenPort>, DbError>>),
+    StoreListenPort(ListenPort, Sender<Result<(), DbError>>),
 
     // Multi-device CRDT sync documents (one automerge blob per DocKind)
     GetSyncDoc(DocKind, Sender<Result<Vec<u8>, DbError>>),
     SaveSyncDoc(DocKind, Vec<u8>, Sender<Result<(), DbError>>),
-    /// Atomic read-modify-write: load the blob, apply the transform, store the result — all in
-    /// one actor turn so concurrent writers can't interleave a stale read with an overwrite.
-    MutateSyncDoc(
-        DocKind,
+    /// Atomic read-modify-write, all in one actor turn so concurrent writers can't interleave a
+    /// stale read with an overwrite.
+    MutateDevicesDoc(
         #[allow(clippy::type_complexity)]
-        Box<dyn FnOnce(Vec<u8>) -> Result<Vec<u8>, DbError> + Send>,
-        Sender<Result<(), DbError>>,
+        Box<dyn for<'a> FnOnce(&'a mut DevicesDoc) -> DeviceChange + Send>,
+        Sender<Result<DeviceChange, DbError>>,
     ),
+    MergeSyncDoc(DocKind, Box<AutoCommit>, Sender<Result<(), DbError>>),
 }

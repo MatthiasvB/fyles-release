@@ -6,7 +6,7 @@
 
 ## 1. Workspace Structure
 
-The backend is a Cargo workspace with 8 crates:
+The backend is a Cargo workspace. Its main crates:
 
 | Crate | Type | Purpose |
 |-------|------|---------|
@@ -18,6 +18,7 @@ The backend is a Cargo workspace with 8 crates:
 | `daemon_internet` | bin | Desktop entrypoint — internet mode |
 | `c_ffi` | lib (cdylib) | C FFI bridge for iOS (Swift calls Rust via C function pointers) |
 | `kotlin_ffi` | lib (cdylib) | JNI bridge for Android (Kotlin calls Rust via JNI) |
+| `zxcvbn_lite` | lib | Vendored zxcvbn 3.1.1 without dictionaries, MIT-licensed. Estimates backup passwords ([ADR-0012](adr/0012-password-encrypted-backups.md)) |
 
 All crates share workspace-level dependency versions via `[workspace.dependencies]` in the root `Cargo.toml`.
 
@@ -34,8 +35,9 @@ These traits define the boundaries of the hexagonal architecture:
 | Trait | File | Role |
 |-------|------|------|
 | `FilerequestDb` | `core/src/core/db.rs` | ~30 async CRUD operations for filerequests, contacts, peers, pending files, received files, settings |
-| `HostController` | `core/src/io_controller.rs` | File system abstraction: read, write, create directories, rename, remove, backup, plus partial-transfer (`.part`) and temporary-outgoing-file management (see [§4 File Storage & Cleanup](#4-file-storage--cleanup)) |
+| `HostController` | `core/src/io_controller.rs` | File system abstraction: read, write, create directories, rename, remove, backup, plus partial-transfer (`.part`) and temporary-outgoing-file management (see [§4 File Storage & Cleanup](#4-file-storage--cleanup)). Also carries host policy signals — power source and network cost — as a `watch::Receiver<HostState>`, defaulted to "unsupported" so a platform that cannot observe them needs no code (see [ADR-0008](adr/0008-host-run-conditions-for-internet-mode.md)) |
 | `NetworkNode` | `core/src/core/p2p.rs` | P2P operations: send files, cancel, update identity, get node info |
+| `BrainPlugin` | `core/src/core/brain/plugin.rs` | Behaviour that depends on a schema `core` must stay ignorant of. Reaches back only through `PluginAction`. `daemon` uses `NoOpBrainPlugin`; the internet builds use `p2p_internet::brain_plugin::InternetBrainPlugin` (see [ADR-0008](adr/0008-host-run-conditions-for-internet-mode.md)) |
 | `RunnableFilerequestServer` | `core/src/core/api_server.rs` | API server lifecycle (start/stop) |
 
 ### 2.2 The Brain
@@ -83,18 +85,34 @@ Key models in `core/src/core/domain_models.rs`:
 ```rust
 pub fn entrypoint(
     internal_data_dir: PathBuf,
-    db_factory: impl AsyncFactory<BrainDb>,
-    host_controller_factory: impl AsyncFactory<BrainHostController>,
-    network_node_factory: impl AsyncFactory<BrainNetwork>,
-    api_server_factory: impl AsyncFactory<BrainApiServer>,
-    brain_receiver: mpsc::Receiver<BrainAction>,
-    client_sender: mpsc::Sender<ClientMessage>,
+    db_factory: impl AsyncFn() -> BrainDb,
+    host_controller_factory: impl AsyncFn() -> BrainHostController,
+    network_factory: impl AsyncFn(Sender<BrainAction>, CancellationToken) -> BrainNetwork,
+    plugin_factory: impl AsyncFn(Sender<BrainAction>) -> BrainPluginRef,
+    api_server_factory: impl AsyncFn(
+        Sender<BrainAction>,
+        Receiver<ServerMessage>,
+        CancellationToken,
+    ) -> BrainApiServer,
 )
 ```
 
-Each caller (daemon, kotlin_ffi, c_ffi) provides different concrete factories, enabling the same core logic to run on every platform.
+Each caller (daemon, kotlin_ffi, c_ffi) provides different concrete factories, enabling the same core logic to run on every platform. The internet builds share `p2p_internet::internet_network` and `internet_plugin`. The factories receive the ends of the current generation's channels and its `CancellationToken` (§2.6). Whatever they build must stop on that token.
 
-### 2.6 Database
+### 2.6 Generations
+
+The brain runs in generations (`run_generations` in `core/src/lib.rs`). Each one creates its own action channel, client push channel and `CancellationToken`, and builds the database, the host controller, the API server, the plugin and the network node from the factories. Only the tokio runtime outlives a generation.
+
+A generation ends with a `GenerationEnd`:
+
+- `Stop` comes from `ClientAction::Shutdown`. The loop returns and `entrypoint` with it.
+- `Restart` comes from a successful restore. The restore replaces the database in place, answers the client and then ends the generation. Everything that read the database once, such as the node keypair, the signing identity and the cached internet settings, is read again by the next generation, exactly as at startup.
+
+The teardown cancels the token and waits for every task the generation spawned, the action handlers included. Meanwhile it discards incoming actions, so a sender outside the generation cannot block it on a full channel. The API server is not cancelled from outside. It shuts down gracefully on the token, so an answer in flight, like the restore's own, still reaches the client. Open client streams end on the same token, which lets their connections close. Only then does the next generation bind the socket and the swarm ports again.
+
+Clients see their stream end and reconnect, reading the TCP port and token afresh, then reload all data. That reload on every reattach is also how a client picks up a restore, so no "database restored" push exists, since it could never be timed reliably. Transfers in flight are dropped, as they would be by a process restart.
+
+### 2.7 Database
 
 **Production:** `Sqlite` (`core/src/library/sqlite/`) — uses `rusqlite` with a schema defined in `schema.rs`.
 
@@ -102,7 +120,7 @@ Each caller (daemon, kotlin_ffi, c_ffi) provides different concrete factories, e
 
 Both are validated with the same shared test suite in `db.rs`, ensuring behavioural equivalence.
 
-### 2.7 Proto ↔ Domain Conversion
+### 2.8 Proto ↔ Domain Conversion
 
 `domain_proto_conversion.rs` contains 100+ `From`, `Into`, and `TryFrom` implementations translating between generated `tonic`/`prost` types and domain models. This is the backend's anti-corruption layer.
 
@@ -138,7 +156,7 @@ The `HostController` keeps everything received or in-flight under a single root:
 ```
 <root>/
 ├── Received/<filerequest-title>/<file>   ← completed incoming files
-├── Backup/<date>_fyles.bak               ← database backups
+├── Backup/<date>_<time>_fyles.bak.crypt  ← password-encrypted database backups (ADR-0012)
 └── Partial/<part-file>.part              ← in-progress incoming transfers
 ```
 
@@ -174,6 +192,7 @@ The cleanup flows are expressed entirely through `HostController` methods, keepi
 | `list_partial_files()` | Names of all `.part` files (input to the sweep) |
 | `remove_source_file_if_temporary(path)` | Delete a source file **only if** it lives in `fyles_outgoing/` |
 | `list_temporary_outgoing_files()` | `Vec<OutgoingFileInfo { path, modified_ms }>` (input to the sweep) |
+| `get_path_to_db_backup_file(file_name)` | Create the backup file. Core chooses the name, `{date}_{time}_fyles.bak.crypt` ([ADR-0012](adr/0012-password-encrypted-backups.md)) |
 
 `.part` files are named deterministically so the exact name can be reconstructed at resume, finalize, abort, or cleanup time without extra bookkeeping:
 
@@ -186,10 +205,11 @@ The cleanup flows are expressed entirely through `HostController` methods, keepi
 ### 4.4 Receiver-side `.part` Lifecycle
 
 ```
-NewTransfer       → get_partial_file_for_writing → stream chunks into Partial/<name>.part
+NewTransfer       → get_partial_file_for_writing → write data frames into Partial/<name>.part
 ContinueTransfer  → reopen the same .part (append), resume from its current length
-Done              → finalize_partial_file → move to Received/<filerequest>/<file>
-Abort / I/O error → remove_partial_file, mark ReceivedFile = Failed
+End (Done on v1)  → finalize_partial_file → move to Received/<filerequest>/<file>
+Abort             → remove_partial_file, delete the ReceivedFile record
+I/O error         → remove_partial_file, mark ReceivedFile = Failed
 ```
 
 Because the file is opened for **append**, resume is just "reopen and keep writing" — the deterministic name guarantees the continuation hits the same file.
@@ -222,7 +242,7 @@ Each synced concern is one **automerge document** identified by a `DocKind` (`sy
 
 | `DocKind` | View type (autosurgeon) | Contents |
 |-----------|-------------------------|----------|
-| `Contacts` | `ContactsDoc { contacts: Map<ContactId, ContactEntry> }` | Contact `name` + **`key_fingerprint`** — *not* the public keys themselves (see §5.7) |
+| `Contacts` | `ContactsDoc { contacts: Map<ContactId, ContactEntry> }` | Contact `name` only — the key fingerprint *is* the `ContactId` it is keyed under, and the public keys themselves never enter the document (see §5.7) |
 | `Devices` | `DevicesDoc { devices: Map<PeerIdWrapper, DeviceEntry> }` | This identity's owned devices (peer id → device name) |
 | `RemoteFilerequests` | `RemoteFrDoc { remote_filerequests: Map<…> }` | Filerequests learned from other devices |
 
@@ -306,4 +326,15 @@ The receiver mutates its **in-memory** exchange document across the round-trips 
 
 ### 5.7 Public-Key Side Channel
 
-The `Contacts` document carries only each contact's **`key_fingerprint`**, never the (large) public keys — this keeps the CRDT small and avoids leaking key material through the doc. After the `Contacts` document converges, `post_convergence` runs `prune_contact_key_cache` (drops keys for contacts removed elsewhere) and `fetch_missing_contact_keys`: it lists contacts present in the doc but missing their key bytes locally (`keyless_synced_contacts`) and fetches them over a separate `/fyles/pubkey-fetch` request-response protocol. Fetched keys are **verified against the fingerprint** in the synced doc before being cached via `update_contact_projection`; a mismatch is dropped. Like sync, the pubkey-fetch responder serves only owned-device sessions.
+The `Contacts` document never carries the (large) public keys — this keeps the CRDT small and avoids leaking key material through the doc. It does not need a separate fingerprint either: a `ContactId` is `SHA-256` of the contact's public keys ([ADR 0009](adr/0009-contact-id-derived-from-identity-keys.md)), so the map key already holds those bytes. After the `Contacts` document converges, `post_convergence` runs `prune_contact_key_cache` (drops keys for contacts removed elsewhere) and `fetch_missing_contact_keys`: it lists contacts present in the doc but missing their key bytes locally (`keyless_synced_contacts`) and fetches them over a separate `/fyles/pubkey-fetch` request-response protocol. The response carries keys alone, and the requester **derives the `ContactId` from them**: keys that derive an id the document does not hold are dropped, so a lying responder is harmless. Like sync, the pubkey-fetch responder serves only owned-device sessions.
+
+### 5.8 Migrating a Synced Document
+
+A synced document's shape is part of the wire contract between a user's own devices, so changing it is not a SQL migration with extra steps. Schema 1.24.0 is the first one, and these are the rules it established.
+
+- **A migration must not use live domain types.** It reads data written by an older build, so it works on frozen copies of the document shapes and of any id encoding, kept beside the migration (`migrations/doc_v1.rs`). A live type that later changes, or starts validating, would silently change what an old migration produces. Document mechanism (genesis, load, hydrate, reconcile) stays shared, since a change to any of it is a `schema_major` bump in its own right.
+- **Rewrite the loaded document, never a rebuilt one.** The synced document is authoritative and the SQL table is only a projection. A document rebuilt from SQL silently drops entries another device has not yet sent. Reconciling the new value into the loaded document deletes the old keys and keeps the history.
+- **Bump `schema_major` so no cross-version merge can happen.** Devices then migrate independently and converge, as long as the transformation is a pure function of data both already hold. A peer that has not migrated declines the document with `DocumentVersionNotSupported` and keeps syncing the other kinds (§5.2).
+- **Write the downgrade too.** A downgrade restores the older shape from what survives, and it cannot resurrect data the upgrade dropped. Where the upgrade replaced identifiers, the downgrade keeps the new ones rather than inventing replacements, so two downgraded devices still agree.
+
+Verify convergence against document fixtures captured from a real pre-migration sync exchange, not from freshly built documents: only a captured pair carries genuine shared history followed by divergence. The 1.24.0 fixtures and proof are in `fyles_service/core/proofs/`.

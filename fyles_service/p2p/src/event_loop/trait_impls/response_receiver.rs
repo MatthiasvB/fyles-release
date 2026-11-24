@@ -1,16 +1,16 @@
-use crate::crypto::SessionEstablishmentError;
 use crate::event_loop::filerequest::file_tracker::FileTracker;
 use crate::event_loop::{LocalNetworkSwarm, RefCountEventLoopData};
 use crate::send_receive_traits::response_receiver::ResponseReceiver;
 use crate::send_receive_traits::session_send_receive::ReceiveError;
-use crate::types::FileResponse;
+use crate::sessions::SessionEstablishmentError;
 use crate::types::Wrap;
+use crate::types::{FileResponse, FileResponseV2};
 use async_trait::async_trait;
 use crypto::{DeSerCryptError, SerCryptError};
 use fyles_core::core::brain::action::BrainAction;
 use fyles_core::core::brain::action_p2p::NetworkNodeAction;
-use fyles_core::core::brain::types::PubkeyFetchResponse;
-use fyles_core::core::domain_models::{Contact, ContactId, SelfContact};
+use fyles_core::core::brain::types::{PubkeyFetchResponse, SignedContactShare};
+use fyles_core::core::domain_models::{ContactId, SelfContact};
 use fyles_core::core::sync::SyncResponse;
 use libp2p::PeerId;
 use libp2p::request_response::OutboundFailure;
@@ -36,9 +36,14 @@ impl<T: FileTracker, S: LocalNetworkSwarm> ResponseReceiver<FileResponse>
         response: FileResponse,
     ) {
         trace!(peer=?node_id, ?response, "Received response");
-        self.file_tracker
-            .receive_response(node_id, contact_id, request_id, response)
-            .await
+        ResponseReceiver::<FileResponse>::receive_response(
+            &self.file_tracker,
+            node_id,
+            contact_id,
+            request_id,
+            response,
+        )
+        .await
     }
 
     async fn handle_receive_error(
@@ -52,9 +57,63 @@ impl<T: FileTracker, S: LocalNetworkSwarm> ResponseReceiver<FileResponse>
             Self::GetSessionError,
         >,
     ) {
-        self.file_tracker
-            .handle_receive_error(node_id, request_id, error)
-            .await
+        ResponseReceiver::<FileResponse>::handle_receive_error(
+            &self.file_tracker,
+            node_id,
+            request_id,
+            error,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl<T: FileTracker, S: LocalNetworkSwarm> ResponseReceiver<FileResponseV2>
+    for RefCountEventLoopData<T, S>
+{
+    type DecryptError = DeSerCryptError;
+    type TransportError = OutboundFailure;
+    type EncryptError = SerCryptError;
+    type GetSessionError = Arc<SessionEstablishmentError>;
+    type NodeId = PeerId;
+    type RequestId = usize;
+
+    async fn receive_response(
+        &self,
+        node_id: Self::NodeId,
+        contact_id: Option<ContactId>,
+        request_id: Result<Self::RequestId, ()>,
+        response: FileResponseV2,
+    ) {
+        trace!(peer=?node_id, ?response, "Received response");
+        ResponseReceiver::<FileResponseV2>::receive_response(
+            &self.file_tracker,
+            node_id,
+            contact_id,
+            request_id,
+            response,
+        )
+        .await
+    }
+
+    async fn handle_receive_error(
+        &self,
+        node_id: Self::NodeId,
+        request_id: Result<Self::RequestId, ()>,
+        error: ReceiveError<
+            Self::TransportError,
+            Self::DecryptError,
+            Self::EncryptError,
+            Self::GetSessionError,
+        >,
+    ) {
+        ResponseReceiver::<FileResponseV2>::handle_receive_error(
+            &self.file_tracker,
+            node_id,
+            request_id,
+            error,
+        )
+        .await
     }
 }
 
@@ -204,7 +263,7 @@ impl<T: FileTracker, S: LocalNetworkSwarm> ResponseReceiver<PubkeyFetchResponse>
 }
 
 #[async_trait]
-impl<T: FileTracker, S: LocalNetworkSwarm> ResponseReceiver<Contact>
+impl<T: FileTracker, S: LocalNetworkSwarm> ResponseReceiver<SignedContactShare>
     for RefCountEventLoopData<T, S>
 {
     type DecryptError = DeSerCryptError;
@@ -219,13 +278,13 @@ impl<T: FileTracker, S: LocalNetworkSwarm> ResponseReceiver<Contact>
         node_id: Self::NodeId,
         _contact_id: Option<ContactId>,
         _request_id: Result<Self::RequestId, ()>,
-        response: Contact,
+        response: SignedContactShare,
     ) {
         trace!("Received contact share response from {node_id:?}");
         self.brain_action_sender
-            .send(BrainAction::NetworkNode(NetworkNodeAction::CreateContact(
-                response,
-            )))
+            .send(BrainAction::NetworkNode(
+                NetworkNodeAction::ContactShareReceived(response),
+            ))
             .await
             .expect("Sending to work");
     }

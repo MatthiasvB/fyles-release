@@ -1,9 +1,13 @@
 pub mod api_server;
+pub mod backup;
 pub mod brain;
 pub mod db;
 pub mod domain_models;
 pub mod domain_proto_conversion;
 pub mod filerequest_drive_handler;
+pub mod license;
+pub mod listen;
 pub mod notification;
 pub mod p2p;
+pub mod settings;
 pub mod sync;

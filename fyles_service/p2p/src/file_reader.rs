@@ -57,16 +57,16 @@ impl FileReader {
                     let (mut file, mut buffer, read_res) =
                         handle.await.expect("Pending task to complete");
                     self.swap(&mut buffer);
-                    if let Ok(bytes_read) = read_res {
-                        if bytes_read > 0 {
-                            self.pending_read = Some(tokio::spawn(
-                                async move {
-                                    let read_res = file.read(&mut **buffer.as_mut()).await;
-                                    (file, buffer, read_res)
-                                }
-                                .instrument(preload_next_span),
-                            ));
-                        }
+                    if let Ok(bytes_read) = read_res
+                        && bytes_read > 0
+                    {
+                        self.pending_read = Some(tokio::spawn(
+                            async move {
+                                let read_res = file.read(&mut **buffer.as_mut()).await;
+                                (file, buffer, read_res)
+                            }
+                            .instrument(preload_next_span),
+                        ));
                     }
                     match read_res {
                         Err(e) => Some(Err(e)),

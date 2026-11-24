@@ -53,9 +53,14 @@ fyles_service/
   core/                     # domain core: the Brain actor, ports (traits), SQLite, wire/gRPC
   p2p/                      # local-network P2P adapter built on libp2p
   direct_host_utils/        # desktop host integration (filesystem, notifications, i18n)
+  license_format/           # pro-licence certificate format and the trusted keys of record
   daemon/                   # the fyles-daemon binary that wires it all together
 docs/                       # architecture documentation — start at docs/ARCHITECTURE.md
+flake.nix                   # nix dev shell pinning the exact Rust toolchain (`nix develop`)
 ```
+
+The `libp2p` fork this workspace patches in is pinned by an `ssh://` URL, so `cargo build`
+needs a GitHub account with an SSH key — or that URL rewritten to `https://`.
 
 ## Architecture at a glance
 

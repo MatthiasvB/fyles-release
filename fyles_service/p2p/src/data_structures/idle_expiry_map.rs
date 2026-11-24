@@ -106,13 +106,8 @@ where
         let now = Instant::now();
         self.cleanup_if_due(now);
 
-        let entry = self.entries.get_mut(key);
-        let (expired, entry) = match entry {
-            Some(entry) => (entry.is_expired(self.idle_ttl, now), entry),
-            None => return None,
-        };
-
-        if expired {
+        let entry = self.entries.get_mut(key)?;
+        if entry.is_expired(self.idle_ttl, now) {
             return None;
         }
 
@@ -384,16 +379,15 @@ where
             IdleEntry::Occupied(occupied_idle_entry) => Some(occupied_idle_entry.remove()),
             IdleEntry::Vacant(_vacant_idle_entry) => None,
         }
-
     }
 
     /// Returns whether something was destroyed
     pub fn destruct(self) -> bool {
         match self {
-            IdleEntry::Occupied(occupied_idle_entry) =>  {
+            IdleEntry::Occupied(occupied_idle_entry) => {
                 occupied_idle_entry.destruct();
                 true
-            },
+            }
             IdleEntry::Vacant(_vacant_idle_entry) => false,
         }
     }
@@ -455,7 +449,7 @@ mod tests {
         advance(ms(60)).await;
 
         assert_eq!(map.get(&1), None);
-        assert!(matches!(map.get(&1), None));
+        assert!(map.get(&1).is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -538,7 +532,9 @@ mod tests {
         match map.entry(1) {
             IdleEntry::Occupied(mut entry) => {
                 assert_eq!(entry.get().map(|it| it.as_str()), Some("a"));
-                entry.get_mut().map(|it| it.push_str("b"));
+                if let Some(it) = entry.get_mut() {
+                    it.push('b')
+                }
             }
             IdleEntry::Vacant(_) => panic!("expected occupied entry"),
         }
@@ -554,7 +550,9 @@ mod tests {
         match map.entry(1) {
             IdleEntry::Occupied(mut entry) => {
                 assert_eq!(entry.get().map(|it| it.as_str()), Some("a"));
-                entry.get_mut().map(|it| it.push('b'));
+                if let Some(it) = entry.get_mut() {
+                    it.push('b')
+                }
                 assert_eq!(entry.get().map(|it| it.as_str()), Some("ab"));
             }
             IdleEntry::Vacant(_) => panic!("expected occupied entry"),
@@ -571,7 +569,7 @@ mod tests {
         match map.entry(1) {
             IdleEntry::Occupied(entry) => {
                 let value = entry.into_mut().expect("entry should not be expired");
-                value.push_str("b");
+                value.push('b');
             }
             IdleEntry::Vacant(_) => panic!("expected occupied entry"),
         }
@@ -866,9 +864,11 @@ mod tests {
         assert!(expired.borrow().is_empty());
     }
 
+    type Destructed = Rc<RefCell<Vec<String>>>;
+
     /// Recorder for the tests below: every value handed to `on_expire` lands in the returned vec.
     fn recording_map() -> (
-        Rc<RefCell<Vec<String>>>,
+        Destructed,
         IdleExpiryMap<u32, String, impl FnMut(String) + Clone>,
     ) {
         let destructed = Rc::new(RefCell::new(Vec::new()));

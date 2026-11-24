@@ -1,17 +1,18 @@
-use crate::crypto::{
-    AuthWireRequest, AuthWireResponse, InitiatorSessionCreation,
-    InitiatorSessionEstablishmentError, KeyExchangeResponseMessage,
-    ResponderSessionEstablishmentError, SessionBuildStore, SessionFromRequestError,
-    SessionInitiationRequest, SessionInitiatorSecrets, SessionStore,
-};
-use crate::crypto::{Session as CryptoSession, SessionEstablishmentError};
 use crate::data_structures::scoped_expiry_map::ScopedExpiryMap;
 use crate::event_loop::with_swarm::{GetInnerEventSender, WithSwarm};
 use crate::event_loop::{EventLoopSender, LocalNetworkSwarm};
 use crate::send_receive_traits::session::Session;
+use crate::sessions::{
+    InitiatorSessionCreation, InitiatorSessionEstablishmentError,
+    ResponderSessionEstablishmentError, SessionBuildStore, SessionEstablishmentError, SessionStore,
+};
 use crate::utils::{W, Wrapper};
 use async_trait::async_trait;
 use crypto::ContactKeys;
+use crypto::session::{
+    AuthWireRequest, AuthWireResponse, KeyExchangeResponseMessage, Session as CryptoSession,
+    SessionFromRequestError, SessionInitiationRequest, SessionInitiatorSecrets,
+};
 use fyles_core::core::brain::action::BrainAction;
 use fyles_core::core::brain::action_p2p::NetworkNodeAction;
 use fyles_core::core::brain::types::BrainRequest;
@@ -19,17 +20,17 @@ use fyles_core::core::domain_models::ContactId;
 use fyles_core::library::util::util::TimeoutLock;
 use itertools::Itertools;
 use libp2p::PeerId;
-use tap::Pipe;
 use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::time::SystemTime;
+use tap::Pipe;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tracing::{debug, error, trace, warn};
 
 use crate::constants::{
     EXPIRED_SESSION_IDLE, EXPIRED_SESSION_MAX, EXPIRED_SESSION_SCOPE,
-    SESSION_ESTABLISHMENT_TIMEOUT,
+    SESSION_ESTABLISHMENT_TIMEOUT, SESSION_LIFETIME,
 };
 
 #[async_trait]
@@ -123,8 +124,12 @@ impl<NodeId: Hash + Eq + Clone + Send + Debug, Swarm: LocalNetworkSwarm>
     {
         debug!(?peer, "Received session establishment request");
         trace!("Optimistically verifying other end");
+        let claimed_contact_id: ContactId = request
+            .claimed_signed_by()
+            .parse()
+            .map_err(|_| ResponderSessionEstablishmentError::MalformedContactId)?;
         let (brain_request, keys_response) =
-            BrainRequest::with_receiver(request.payload.sender.clone());
+            BrainRequest::with_receiver(claimed_contact_id.clone());
         trace!("Requesting public keys to verify other end during request");
         self.brain_action_sender
             .send(BrainAction::NetworkNode(
@@ -134,29 +139,32 @@ impl<NodeId: Hash + Eq + Clone + Send + Debug, Swarm: LocalNetworkSwarm>
             .expect("Brain action sender to be alive");
         let maybe_keys = keys_response.await.expect("Keys response to be received");
         let self_contact_id = self.self_contact_id.read().await.clone();
-        trace!(
-            "Signing session response for peer {peer:?} with self contact id {self_contact_id}"
-        );
+        trace!("Signing session response for peer {peer:?} with self contact id {self_contact_id}");
         let result = request.to_session_and_response(
             match maybe_keys {
-                Some(ref keys) => Some((request.payload.sender.clone(), keys)),
+                Some(ref keys) => Some((claimed_contact_id.clone(), keys)),
                 None => None,
             },
             self_contact_id,
             &mut self.keys.write().await.private,
+            SESSION_LIFETIME,
         );
         match result {
             Err(SessionFromRequestError::SignatureVerification(e)) => {
                 error!("Initiator signature verification failed: {e:?}");
                 Err(
                     ResponderSessionEstablishmentError::ContactVerificationFailed(
-                        request.payload.sender,
+                        claimed_contact_id,
                     ),
                 )
             }
             Err(SessionFromRequestError::Signing(e)) => {
                 error!("Failed to sign the key exchange response: {e:?}");
                 Err(ResponderSessionEstablishmentError::SharedSecretGenerationFailed)
+            }
+            Err(SessionFromRequestError::Serialize(e)) => {
+                error!("Failed to serialize the handshake transcript: {e:?}");
+                Err(ResponderSessionEstablishmentError::Internal(e.to_string()))
             }
             Ok((session, response)) => {
                 debug!(
@@ -209,7 +217,7 @@ impl<NodeId: Hash + Eq + Clone + Send + Debug, Swarm: LocalNetworkSwarm>
             Ok(response) => {
                 trace!(
                     "Response is Ok. Authenticated: {}",
-                    response.payload.is_authenticated
+                    response.payload_unverified().is_authenticated
                 );
                 let session_builder = match self
                     .session_build_store
@@ -225,8 +233,12 @@ impl<NodeId: Hash + Eq + Clone + Send + Debug, Swarm: LocalNetworkSwarm>
                     Some(session_builder) => session_builder,
                 };
                 trace!("Session builder found for peer {peer:?}");
-                let (request, brain_response) =
-                    BrainRequest::with_receiver(response.payload.sender.clone());
+                let Ok(claimed_contact_id) = response.claimed_signed_by().parse::<ContactId>()
+                else {
+                    error!(peer=?peer, "Session response claims a malformed contact id");
+                    return;
+                };
+                let (request, brain_response) = BrainRequest::with_receiver(claimed_contact_id);
                 self.brain_action_sender
                     .send(BrainAction::NetworkNode(
                         NetworkNodeAction::GetContactPublicKeys(request),
@@ -380,9 +392,12 @@ impl<Swarm: LocalNetworkSwarm + 'static> GetSession for SessionManager<PeerId, C
                         Arc::new(InitiatorSessionEstablishmentError::SigningError.into())
                     })?
                 };
+                let request_transcript = request.canonical_payload_bytes().map_err(|e| {
+                    Arc::new(InitiatorSessionEstablishmentError::Internal(e.to_string()).into())
+                })?;
                 let session_creation = InitiatorSessionCreation::new(
                     session_initiator_secrets.private,
-                    request.transcript_bytes(),
+                    request_transcript,
                 );
                 let mut response_receiver = session_creation.get_session_receiver();
                 session_build_store_lock

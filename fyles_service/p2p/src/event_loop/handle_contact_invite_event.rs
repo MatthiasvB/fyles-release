@@ -2,9 +2,10 @@ use crypto::Encrypted;
 use libp2p::request_response::{self, Event};
 use tracing::{Instrument, debug, error, instrument, trace, warn};
 
-use fyles_core::core::{
-    brain::{action::BrainAction, action_p2p::NetworkNodeAction, types::ContactShareChallenge},
-    domain_models::Contact,
+use fyles_core::core::brain::{
+    action::BrainAction,
+    action_p2p::NetworkNodeAction,
+    types::{ContactShareChallenge, SignedContactShare},
 };
 
 use crate::{
@@ -22,7 +23,7 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
         self,
         event: Event<
             Encrypted<ContactShareChallenge>,
-            Result<Encrypted<Contact>, SessionErrorResponse>,
+            Result<Encrypted<SignedContactShare>, SessionErrorResponse>,
         >,
     ) {
         tokio::spawn(async move {

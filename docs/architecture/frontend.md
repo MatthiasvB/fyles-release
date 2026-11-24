@@ -27,7 +27,7 @@ fyles/lib/
 │   ├── app_bloc.dart      ← Central BLoC (~50 event handlers)
 │   ├── app_event.dart     ← ~50 event classes (sealed AppEvent hierarchy)
 │   ├── app_state.dart     ← Immutable AppState with copyWith
-│   ├── dialog_state.dart  ← Sealed DialogState hierarchy (~18 subtypes)
+│   ├── overlay_state.dart ← Sealed AppOverlay hierarchy (dialogs and pushed pages)
 │   ├── app_message.dart   ← Snackbar message model
 │   └── ui_state.dart      ← ActivePage enum
 ├── models/
@@ -41,12 +41,10 @@ fyles/lib/
 │   └── share_data.dart    ← ShareData types for QR/clipboard exchange
 ├── services/
 │   ├── protobuf_client.dart      ← gRPC client façade
-│   ├── dialog_manager.dart       ← Stateless dialog-showing service
+│   ├── overlay_manager.dart      ← Presents AppOverlay states as dialogs and pages
 │   ├── filesystem.dart           ← StorageAccess abstract class
 │   ├── filesystem_android.dart   ← Android SAF implementation
 │   ├── filesystem_default.dart   ← Desktop/iOS implementation
-│   ├── app_initialization_service.dart
-│   ├── permissions_service.dart
 │   └── log.dart
 ├── pages/                 ← 10 screen-level widgets
 ├── widgets/               ← 25 reusable components
@@ -89,21 +87,25 @@ A single immutable `AppState` holding:
 - `Map<String, RemoteFileRequest> remoteFileRequests`
 - `Map<String, List<ReceivedFile>> receivedFiles`
 - `Map<String, ActiveReceiveTransfer> activeReceiveTransfers`
-- `DialogState dialogState` (sealed hierarchy)
+- `AppOverlay overlay` (sealed hierarchy)
 - `ActivePage activePage`
-- `StorageAccess? storageAccess`
 - Navigation, loading, error, and self-contact fields
 
 Updates use `copyWith()` for immutable transitions.
 
 ### 3.3 BLoC (`app_bloc.dart`)
 
-The `AppBloc` constructor registers ~50 typed `on<EventType>` handlers. Each handler:
-1. Optionally sets a loading flag
-2. Calls `ProtobufClient` methods
-3. Emits new state via `emit(state.copyWith(...))`
+The `AppBloc` constructor registers ~50 typed `on<EventType>` handlers, split by what they do:
 
-The BLoC also owns a `Timer.periodic` for polling refresh (received files, self-contact display) and bridges server push notifications via `getServerMessageHandler()`.
+- **Mutation handlers** call a `ProtobufClient` method through `_mutate` and emit no state of
+  their own. The resulting state arrives as a push, so that it reaches every open window and not
+  just this one — see [Wire Protocol](wire-protocol.md).
+- **Push handlers**, fed by `getServerMessageHandler()`, are what actually emit state.
+- **Read handlers** (bootstrap, node status, dialogs that need service-minted data) emit what
+  they read.
+
+There is no polling. `_licenseTimer` is the only remaining `Timer.periodic`, and it pokes a
+schedule the core owns rather than refreshing anything.
 
 ---
 
@@ -150,14 +152,14 @@ This unifies server-push and user-initiated events into a single processing pipe
 
 ## 5. Dialog Management
 
-Dialogs are managed through the BLoC as state, not imperatively:
+Dialogs and pushed pages are managed through the BLoC as state, not imperatively:
 
-1. UI dispatches `Open*DialogEvent`
-2. BLoC prepares data, emits `state.copyWith(dialogState: SomeDialog(...))`
+1. UI dispatches `Open*Event`
+2. BLoC prepares data, emits `state.copyWith(overlay: SomeOverlay(...))`
 3. `BlocListener` in `main.dart` detects the change
-4. `DialogManager.showDialogForState()` exhaustively switches over `DialogState` sealed hierarchy
-5. Dialog result is dispatched back as a `*DialogResultEvent`
-6. BLoC processes the result, emits `NoDialog` to close
+4. `OverlayManager.showOverlayForState()` exhaustively switches over the `AppOverlay` sealed hierarchy
+5. The result is dispatched back as a `*ResultEvent`
+6. BLoC processes the result, emits `NoOverlay` to close
 
 This keeps all dialog logic in the BLoC, not scattered across widgets.
 
@@ -181,7 +183,7 @@ Selected at runtime via `StorageAccess.instance()` factory method.
 The app handles incoming files from the OS share sheet:
 
 1. `ReceiveSharingIntent.instance.getMediaStream()` provides a stream of shared files
-2. `copySharedFilesToOutgoing()` (`services/outgoing_files_service.dart`, shared by `main.dart` and `AppInitializationService`) copies each shared file into `<app-support>/fyles_outgoing/` and returns `PathAndDisplayName` objects pointing at the copies
+2. `copySharedFilesToOutgoing()` (`services/outgoing_files_service.dart`) copies each shared file into `<app-support>/fyles_outgoing/` and returns `PathAndDisplayName` objects pointing at the copies
 3. Navigates to `ShareTargetPage` where the user picks a remote file request target
 4. BLoC dispatches `UploadFileToPendingFiles` → gRPC → backend queues the transfer
 

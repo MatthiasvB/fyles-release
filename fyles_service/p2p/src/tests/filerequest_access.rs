@@ -108,7 +108,7 @@ async fn run_private_filerequest_access(config: FilerequestAccessTestConfig) {
             // technically, these should be internal IDs, but we're not testing the
             // DB here, so we simply omit this detail
             contact_ids: if config.sender_known {
-                vec![sender_harness.node_info.self_contact_id.clone()]
+                vec![sender_harness.node_info.self_contact_keys.id()]
             } else {
                 vec![]
             },
@@ -136,7 +136,7 @@ async fn run_private_filerequest_access(config: FilerequestAccessTestConfig) {
         filerequest_id: filerequest_id.clone(),
         file_path: test_file_path.to_str().unwrap().to_string(),
         retry_count: 0,
-        contact_id: owner_harness.node_info.self_contact_id.clone(),
+        contact_id: owner_harness.node_info.self_contact_keys.id(),
         status: SendStatus::Pending,
     };
 
@@ -214,7 +214,7 @@ async fn run_private_filerequest_access(config: FilerequestAccessTestConfig) {
         filerequest_id: filerequest_id.clone(),
         file_path: test_file_path.to_str().unwrap().to_string(),
         retry_count: 0,
-        contact_id: owner_harness.node_info.self_contact_id.clone(),
+        contact_id: owner_harness.node_info.self_contact_keys.id(),
         status: SendStatus::Pending,
     };
 

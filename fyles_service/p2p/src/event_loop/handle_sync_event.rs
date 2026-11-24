@@ -33,20 +33,22 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
         tokio::spawn(
             async move {
                 match event {
-                    Event::Message { peer, message, .. } => match message {
-                        request_response::Message::Request {
-                            request,
-                            channel,
-                            request_id,
-                            ..
-                        } => {
-                            debug!("Received sync request from {peer}");
-                            tokio::spawn(async move {
-                                if let Some(response) =
-                                    self.decrypt_respond(peer, request, request_id).await
-                                {
-                                    self.with_swarm(move |swarm| {
-                                        if swarm
+                    Event::Message { peer, message, .. } => {
+                        match message {
+                            request_response::Message::Request {
+                                request,
+                                channel,
+                                request_id,
+                                ..
+                            } => {
+                                debug!("Received sync request from {peer}");
+                                tokio::spawn(
+                                    async move {
+                                        if let Some(response) =
+                                            self.decrypt_respond(peer, request, request_id).await
+                                        {
+                                            self.with_swarm(move |swarm| {
+                                                if swarm
                                             .get_sync_behaviour()
                                             .send_response(
                                                 channel,
@@ -59,41 +61,44 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
                                         {
                                             warn!(?peer, "Unable to send sync response to peer");
                                         };
-                                    })
-                                } else {
-                                    trace!("Not sending a sync response");
-                                }
-                            }.in_current_span());
-                        }
-                        request_response::Message::Response {
-                            response,
-                            request_id,
-                        } => {
-                            trace!("Received sync response from {peer}");
-                            let payload = match response {
-                                Ok(response) => ReceivePayload::Response(response),
-                                Err(e) => match e {
-                                    SessionErrorResponse::MissingSession => {
-                                        ReceivePayload::ReceiveError(ReceiveError::RemoteError(
-                                            RemoteReceiveError::MissingSession,
-                                        ))
+                                            })
+                                        } else {
+                                            trace!("Not sending a sync response");
+                                        }
                                     }
-                                    SessionErrorResponse::CryptError => {
-                                        ReceivePayload::ReceiveError(ReceiveError::RemoteError(
-                                            RemoteReceiveError::CannotDecrypt,
-                                        ))
-                                    }
-                                },
-                            };
-                            self.receive_encrypted_response(
-                                peer,
+                                    .in_current_span(),
+                                );
+                            }
+                            request_response::Message::Response {
+                                response,
                                 request_id,
-                                payload,
-                                &self.sync_request_registry,
-                            )
-                            .await;
+                            } => {
+                                trace!("Received sync response from {peer}");
+                                let payload = match response {
+                                    Ok(response) => ReceivePayload::Response(response),
+                                    Err(e) => match e {
+                                        SessionErrorResponse::MissingSession => {
+                                            ReceivePayload::ReceiveError(ReceiveError::RemoteError(
+                                                RemoteReceiveError::MissingSession,
+                                            ))
+                                        }
+                                        SessionErrorResponse::CryptError => {
+                                            ReceivePayload::ReceiveError(ReceiveError::RemoteError(
+                                                RemoteReceiveError::CannotDecrypt,
+                                            ))
+                                        }
+                                    },
+                                };
+                                self.receive_encrypted_response(
+                                    peer,
+                                    request_id,
+                                    payload,
+                                    &self.sync_request_registry,
+                                )
+                                .await;
+                            }
                         }
-                    },
+                    }
                     Event::OutboundFailure {
                         peer,
                         request_id,

@@ -16,6 +16,8 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
             CoreBehaviourEvent::Filerequest(filerequest_event) => {
                 self.handle_filerequest_event(filerequest_event)
             }
+            CoreBehaviourEvent::FilerequestV2(event) => self.handle_filerequest_v2_event(event),
+            CoreBehaviourEvent::FileStream(()) => {}
             CoreBehaviourEvent::SessionEstablishment(event) => {
                 self.handle_session_establishment_event(event)
             }

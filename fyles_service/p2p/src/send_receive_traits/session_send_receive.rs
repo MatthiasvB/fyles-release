@@ -1,4 +1,5 @@
 use crate::behaviour::SessionErrorResponse;
+use crate::event_loop::with_swarm::SwarmWorkDiscarded;
 use crate::send_receive_traits::get_session::GetSession;
 use crate::send_receive_traits::request_registry::{
     RequestForResend, RequestForResendAfterSessionError, RequestRegistry,
@@ -23,6 +24,8 @@ pub enum SessionSendError<EE: error::Error, GSE: error::Error> {
     EncryptError(EE),
     #[error("{0}")]
     GetSessionError(GSE),
+    #[error("{0}")]
+    SwarmWorkDiscarded(#[from] SwarmWorkDiscarded),
 }
 
 /// Important: This enum must only contain errors that, when they occur, means that the remote's
@@ -585,7 +588,7 @@ where
 
         let request_id = self
             .send_encrypted_request(node_id.clone(), encrypted)
-            .await;
+            .await?;
 
         let external_request_id = match config {
             SendInternalConfig::Register { idempotent } => {

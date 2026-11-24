@@ -1,13 +1,12 @@
 use async_trait::async_trait;
+use crypto::session::Session as CryptoSession;
 use crypto::{ContactKeys, DeSerCryptError, SerCryptError};
 use fyles_core::core::brain::types::{
     ContactShareChallenge, PubkeyFetchRequest, PubkeyFetchResponse, SelfContactInviteChallenge,
+    SignedContactShare,
 };
 use fyles_core::core::sync::{SyncRequest, SyncResponse};
-use libp2p::{
-    Swarm, TransportError, identity::Keypair, noise, request_response::ResponseChannel,
-    swarm::DialError, tcp, yamux,
-};
+use libp2p::{Swarm, TransportError, identity::Keypair, noise, swarm::DialError, tcp, yamux};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::{collections::HashMap, error::Error, io, time::SystemTime};
@@ -15,6 +14,8 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Level, Span, debug, error, info, instrument, span, trace, warn};
 
+#[cfg(feature = "debug-server")]
+use crate::debug::NoContent;
 use crate::types::{Unwrap, Wrap};
 use libp2p::{
     Multiaddr, PeerId, core::transport::ListenerId, multiaddr::Protocol,
@@ -44,15 +45,9 @@ use fyles_core::{
 pub use crate::{
     SwarmFactory,
     behaviour::{
-        ContactShareBehaviour, FilerequestBehaviour, LocalNetworkBehaviour,
+        ContactShareBehaviour, FilerequestBehaviour, FilerequestV2Behaviour, LocalNetworkBehaviour,
         LocalNetworkBehaviourEvent, PubkeyFetchBehaviour, SelfContactInviteBehaviour,
         SessionErrorResponse, SessionEstablishmentBehaviour, SyncBehaviour,
-    },
-    crypto::{
-        AuthWireResponse, InitiatorSessionCreation, InitiatorSessionEstablishmentError,
-        KeyExchangeResponseMessage, ResponderSessionEstablishmentError, Session as CryptoSession,
-        SessionBuildStore, SessionEstablishmentError, SessionInitiationRequest,
-        SessionInitiatorSecrets, SessionStore,
     },
     event_loop::{
         filerequest::file_tracker::{CoreFileTracker, FileTracker},
@@ -61,6 +56,11 @@ pub use crate::{
     },
     file_encryptor::ReadCryptResult,
     send_receive_traits::request_sender::RequestSender,
+    sessions::{
+        InitiatorSessionCreation, InitiatorSessionEstablishmentError,
+        ResponderSessionEstablishmentError, SessionBuildStore, SessionEstablishmentError,
+        SessionStore,
+    },
     types::FileResponse,
     utils::{W, decode_stored_keys},
 };
@@ -69,7 +69,9 @@ use super::command::{DataCommand, LoopCommand, P2pCommand};
 use crate::constants::{BRAIN_READY_POLL_INTERVAL, REQUEST_TIMEOUT};
 use crate::event_loop::filerequest::file_tracker::new_core_file_tracker;
 use crate::event_loop::filerequest::receive_manager::FilerequestReceiver;
-use crate::event_loop::with_swarm::GetInnerEventSender;
+use crate::event_loop::filerequest::stream_receiver::spawn_file_stream_acceptor;
+use crate::event_loop::listen::{ActiveListeners, listen_on_port};
+use crate::event_loop::with_swarm::{GetInnerEventSender, SwarmWorkDiscarded};
 #[cfg(test)]
 use crate::send_receive_traits::get_session::GetSession;
 use crate::send_receive_traits::get_session::SessionManager;
@@ -80,9 +82,9 @@ use crate::send_receive_traits::response_receiver::ResponseReceiver;
 use crate::send_receive_traits::session_send_receive::{
     LocalReceiveError, ReceiveError, SessionSend,
 };
-use crate::types::FileRequest;
+use crate::types::{FileRequest, FileRequestV2};
 use futures::StreamExt;
-use fyles_core::core::domain_models::{Contact, PeerIdWrapper, SelfContact};
+use fyles_core::core::domain_models::{PeerIdWrapper, SelfContact};
 
 pub mod filerequest;
 mod handle_behavior_event;
@@ -93,29 +95,12 @@ mod handle_pubkey_fetch_event;
 mod handle_self_contact_invite_event;
 mod handle_session_establishment_event;
 mod handle_sync_event;
+pub mod listen;
+mod stream_attempt;
 mod trait_impls;
 pub mod with_swarm;
 
 pub enum InnerEvent<T: LocalNetworkSwarm = Swarm<LocalNetworkBehaviour>> {
-    /// The signature could not be confirmed to belong to the contact
-    SessionEstablishmentError {
-        channel: ResponseChannel<
-            Result<
-                AuthWireResponse<Box<KeyExchangeResponseMessage>>,
-                ResponderSessionEstablishmentError,
-            >,
-        >,
-        error: ResponderSessionEstablishmentError,
-    },
-    SessionEstablished {
-        channel: ResponseChannel<
-            Result<
-                AuthWireResponse<Box<KeyExchangeResponseMessage>>,
-                ResponderSessionEstablishmentError,
-            >,
-        >,
-        response: AuthWireResponse<Box<KeyExchangeResponseMessage>>,
-    },
     DoWithSwarm {
         block: Box<dyn FnOnce(&mut T) + Send>,
         span: Span,
@@ -182,6 +167,7 @@ pub struct LocalEventLoop<T: FileTracker> {
     pub swarm: Swarm<LocalNetworkBehaviour>,
     #[cfg(not(test))]
     swarm: Swarm<LocalNetworkBehaviour>,
+    listeners: Option<ActiveListeners>,
     filerequest_request_timeouts: TimeoutRequestRegistryWorker<usize, PeerId>,
     contact_share_request_timeouts: TimeoutRequestRegistryWorker<usize, PeerId>,
     self_contact_invite_request_timeouts: TimeoutRequestRegistryWorker<usize, PeerId>,
@@ -245,7 +231,13 @@ pub trait LocalNetworkSwarm {
 
     fn listen_on(&mut self, addr: Multiaddr) -> Result<ListenerId, TransportError<io::Error>>;
 
+    fn remove_listener(&mut self, id: ListenerId) -> bool;
+
     fn get_filerequest_behaviour(&mut self) -> &mut FilerequestBehaviour;
+
+    fn get_filerequest_v2_behaviour(&mut self) -> &mut FilerequestV2Behaviour;
+
+    fn file_stream_control(&mut self) -> libp2p_stream::Control;
 
     fn get_self_contact_invite_behaviour(&mut self) -> &mut SelfContactInviteBehaviour;
 
@@ -287,8 +279,20 @@ impl LocalNetworkSwarm for Swarm<LocalNetworkBehaviour> {
         self.listen_on(addr)
     }
 
+    fn remove_listener(&mut self, id: ListenerId) -> bool {
+        self.remove_listener(id)
+    }
+
     fn get_filerequest_behaviour(&mut self) -> &mut FilerequestBehaviour {
         &mut self.behaviour_mut().core.filerequest
+    }
+
+    fn get_filerequest_v2_behaviour(&mut self) -> &mut FilerequestV2Behaviour {
+        &mut self.behaviour_mut().core.filerequest_v2
+    }
+
+    fn file_stream_control(&mut self) -> libp2p_stream::Control {
+        self.behaviour().core.file_stream.new_control()
     }
 
     fn get_self_contact_invite_behaviour(&mut self) -> &mut SelfContactInviteBehaviour {
@@ -337,8 +341,20 @@ impl<T: FileTracker> LocalNetworkSwarm for LocalEventLoop<T> {
         self.swarm.listen_on(addr)
     }
 
+    fn remove_listener(&mut self, id: ListenerId) -> bool {
+        self.swarm.remove_listener(id)
+    }
+
     fn get_filerequest_behaviour(&mut self) -> &mut FilerequestBehaviour {
         self.swarm.get_filerequest_behaviour()
+    }
+
+    fn get_filerequest_v2_behaviour(&mut self) -> &mut FilerequestV2Behaviour {
+        self.swarm.get_filerequest_v2_behaviour()
+    }
+
+    fn file_stream_control(&mut self) -> libp2p_stream::Control {
+        self.swarm.file_stream_control()
     }
 
     fn get_self_contact_invite_behaviour(&mut self) -> &mut SelfContactInviteBehaviour {
@@ -380,12 +396,21 @@ pub struct EventLoopData<T: FileTracker, S: LocalNetworkSwarm = Swarm<LocalNetwo
     pub file_tracker: T,
     pub inner_event_sender: EventLoopSender<S>,
     pub session_manager: SessionManager<PeerId, ContactId, S>,
-    pub receive_manager: Mutex<FilerequestReceiver>,
+    pub receive_manager: Arc<Mutex<FilerequestReceiver>>,
     pub filerequest_request_registry: TimeoutRequestRegistry<
         PeerId,
         OutboundRequestId,
         usize,
         FileRequest,
+        ContactId,
+        W<Arc<CryptoSession>>,
+    >,
+    /// A sibling of `filerequest_request_registry`: its requests time out through the same worker.
+    pub filerequest_v2_request_registry: TimeoutRequestRegistry<
+        PeerId,
+        OutboundRequestId,
+        usize,
+        FileRequestV2,
         ContactId,
         W<Arc<CryptoSession>>,
     >,
@@ -521,29 +546,31 @@ impl LocalEventLoop<CoreFileTracker> {
 
         let (keypair, self_contact_id, self_contact_keys, persisted_settings) =
             match node_info_result {
-                Ok((
-                    NodeInfo {
+                Ok((node_info, persisted_settings)) => {
+                    let self_contact_id = node_info.self_contact_keys.id();
+                    let NodeInfo {
                         node_key_pair,
+                        self_contact_keys,
+                    } = node_info;
+                    (
+                        decode_stored_keys(&node_key_pair).map_err(|e| {
+                            EventLoopError::Validation {
+                                msg: "Could not decode stored keys".into(),
+                                source: Box::new(e),
+                            }
+                        })?,
                         self_contact_id,
                         self_contact_keys,
-                    },
-                    persisted_settings,
-                )) => (
-                    decode_stored_keys(&node_key_pair).map_err(|e| EventLoopError::Validation {
-                        msg: "Could not decode stored keys".into(),
-                        source: Box::new(e),
-                    })?,
-                    self_contact_id,
-                    self_contact_keys,
-                    persisted_settings,
-                ),
+                        persisted_settings,
+                    )
+                }
                 Err(e) => panic!("Communication error: {}", e),
             };
 
         let peer_id = keypair.public().to_peer_id();
         info!("Local peer id: {}", peer_id.to_base58());
 
-        let swarm = swarm_factory(keypair, &persisted_settings).unwrap();
+        let mut swarm = swarm_factory(keypair, &persisted_settings).unwrap();
 
         brain_action_sender
             .send(BrainAction::NetworkNode(NetworkNodeAction::Ready))
@@ -557,6 +584,7 @@ impl LocalEventLoop<CoreFileTracker> {
             Arc::new(tokio::sync::SetOnce::new());
         let future_event_loop_data_clone_1 = future_event_loop_data.clone();
         let future_event_loop_data_clone_2 = future_event_loop_data_clone_1.clone();
+        let future_event_loop_data_clone_3 = future_event_loop_data_clone_1.clone();
         let (filerequest_request_registry, filerequest_timeouts) =
             TimeoutRequestRegistry::new(REQUEST_TIMEOUT);
         let (self_contact_invite_request_registry, self_contact_invite_timeouts) =
@@ -571,6 +599,7 @@ impl LocalEventLoop<CoreFileTracker> {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .expect("Time to be valid")
                 .as_millis(),
+            filerequest_v2_request_registry: filerequest_request_registry.sibling(),
             filerequest_request_registry,
             self_contact_invite_challenge_request_registry: self_contact_invite_request_registry,
             contact_invite_challenge_request_registry: contact_share_request_registry,
@@ -582,7 +611,9 @@ impl LocalEventLoop<CoreFileTracker> {
                     let clone_clone = future_event_loop_data_clone_1.clone();
                     Box::pin(async move {
                         let event_loop = clone_clone.wait().await;
-                        event_loop.send_request(peer, contact_id, request).await
+                        event_loop
+                            .send_wire_request(peer, contact_id, request, false)
+                            .await
                     })
                 }),
                 Box::new(move |peer, contact_id, request| {
@@ -590,9 +621,19 @@ impl LocalEventLoop<CoreFileTracker> {
                     Box::pin(async move {
                         let event_loop = clone_clone.wait().await;
                         event_loop
-                            .send_request_idempotent(peer, contact_id, request)
+                            .send_wire_request(peer, contact_id, request, true)
                             .await
                     })
+                }),
+                Box::new(move |peer, start| {
+                    let clone_clone = future_event_loop_data_clone_3.clone();
+                    tokio::spawn(
+                        async move {
+                            let event_loop = clone_clone.wait().await;
+                            event_loop.run_stream_attempt(peer, start).await
+                        }
+                        .in_current_span(),
+                    );
                 }),
             ),
             pending_dial: Default::default(),
@@ -602,7 +643,7 @@ impl LocalEventLoop<CoreFileTracker> {
                 self_contact_id,
                 self_contact_keys,
             ),
-            receive_manager: FilerequestReceiver::new(brain_action_sender.clone()).into(),
+            receive_manager: Arc::new(FilerequestReceiver::new(brain_action_sender.clone()).into()),
             brain_action_sender,
             shutdown: shutdown.clone(),
             inner_event_sender: inner_sender,
@@ -610,8 +651,10 @@ impl LocalEventLoop<CoreFileTracker> {
         if let Err(_e) = future_event_loop_data.set(data.clone()) {
             panic!("Multi init");
         }
+        spawn_file_stream_acceptor(&mut swarm, data.receive_manager.clone(), shutdown.clone());
         Ok(LocalEventLoop {
             swarm,
+            listeners: None,
             inner_event_receiver: inner_receiver,
             #[cfg(test)]
             inner_async_event_receiver,
@@ -676,12 +719,14 @@ impl LocalEventLoop<CoreFileTracker> {
             tokio::sync::SetOnce::new();
         let future_event_loop_data_clone_1 = Arc::new(future_event_loop_data.clone());
         let future_event_loop_data_clone_2 = future_event_loop_data_clone_1.clone();
+        let future_event_loop_data_clone_3 = future_event_loop_data_clone_1.clone();
         let data = RefCountEventLoopData(Arc::new(EventLoopData {
             start_timestamp: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .expect("Time to be valid")
                 .as_millis(),
-            filerequest_request_registry: filerequest_request_registry,
+            filerequest_v2_request_registry: filerequest_request_registry.sibling(),
+            filerequest_request_registry,
             contact_invite_challenge_request_registry: contact_share_request_registry,
             self_contact_invite_challenge_request_registry: self_contact_invite_request_registry,
             sync_request_registry,
@@ -692,7 +737,9 @@ impl LocalEventLoop<CoreFileTracker> {
                     let clone_clone = future_event_loop_data_clone_1.clone();
                     Box::pin(async move {
                         let event_loop = clone_clone.wait().await;
-                        event_loop.send_request(peer, contact_id, request).await
+                        event_loop
+                            .send_wire_request(peer, contact_id, request, false)
+                            .await
                     })
                 }),
                 Box::new(move |peer, contact_id, request| {
@@ -700,9 +747,19 @@ impl LocalEventLoop<CoreFileTracker> {
                     Box::pin(async move {
                         let event_loop = clone_clone.wait().await;
                         event_loop
-                            .send_request_idempotent(peer, contact_id, request)
+                            .send_wire_request(peer, contact_id, request, true)
                             .await
                     })
+                }),
+                Box::new(move |peer, start| {
+                    let clone_clone = future_event_loop_data_clone_3.clone();
+                    tokio::spawn(
+                        async move {
+                            let event_loop = clone_clone.wait().await;
+                            event_loop.run_stream_attempt(peer, start).await
+                        }
+                        .in_current_span(),
+                    );
                 }),
             ),
             session_manager: SessionManager::new(
@@ -711,7 +768,7 @@ impl LocalEventLoop<CoreFileTracker> {
                 contact_id,
                 contact_keys,
             ),
-            receive_manager: FilerequestReceiver::new(brain_action_sender.clone()).into(),
+            receive_manager: Arc::new(FilerequestReceiver::new(brain_action_sender.clone()).into()),
             brain_action_sender,
             shutdown: shutdown.clone(),
             pending_dial: Default::default(),
@@ -720,8 +777,11 @@ impl LocalEventLoop<CoreFileTracker> {
         if let Err(_e) = future_event_loop_data.set(data.clone()) {
             panic!("Multi init");
         }
+        let mut swarm = swarm;
+        spawn_file_stream_acceptor(&mut swarm, data.receive_manager.clone(), shutdown.clone());
         Ok(Self {
             swarm,
+            listeners: None,
             inner_event_receiver: inner_receiver,
             #[cfg(test)]
             inner_async_event_receiver,
@@ -740,6 +800,7 @@ impl LocalEventLoop<CoreFileTracker> {
 impl LocalEventLoop<CoreFileTracker> {
     /// Cheap by construction: no queued files is a map lookup, and a peer that is not one of our
     /// devices stops at one indexed database read.
+    #[tracing::instrument(skip_all)]
     fn run_sweep(&mut self) {
         let peers = self.swarm.sweepable_peers();
         trace!(count = peers.len(), "Sweeping visible peers");
@@ -751,13 +812,19 @@ impl LocalEventLoop<CoreFileTracker> {
         }
     }
 
-    async fn handle_loop_command(&mut self, command: LoopCommand) {
+    /// Sync on purpose: this runs inline in the loop's `select!`, so an `.await` here would stop
+    /// the loop polling `inner_event_receiver` — and every task parked on a `with_swarm_res` waits
+    /// on exactly that. Anything async a command needs has to be spawned.
+    fn handle_loop_command(&mut self, command: LoopCommand) {
         match command {
             LoopCommand::TriggerVisiblePeerInteractions => self.run_sweep(),
-            // The base crate has no settings schema; the frontend renders an empty response as a
-            // default view. `p2p_internet` overrides this.
-            LoopCommand::ProcessSettingsRequest { request: _, sender } => {
-                let _ = sender.send(Ok(Vec::new()));
+            LoopCommand::Restart(_) => {}
+            LoopCommand::ListenOnPort { port, reply } => {
+                let _ = reply.send(listen_on_port(&mut self.swarm, &mut self.listeners, port));
+            }
+            #[cfg(feature = "debug-server")]
+            LoopCommand::GetDebugBlob { sender } => {
+                let _ = sender.send(Box::new(NoContent));
             }
         }
     }
@@ -769,7 +836,7 @@ impl LocalEventLoop<CoreFileTracker> {
                 event = self.swarm.select_next_some() => { tokio::spawn(self.data.clone().handle_local_event(event).in_current_span()); },
                 _ = self.shutdown.cancelled() => return Ok(()),
                 command = self.command_receiver.recv() => match command {
-                    Some(P2pCommand::Loop(c)) => self.handle_loop_command(c).await,
+                    Some(P2pCommand::Loop(c)) => self.handle_loop_command(c),
                     Some(P2pCommand::Data(c)) => self.data.clone().handle_command(c),
                     // Closed without a cancellation: the brain went away unexpectedly.
                     None => return Err(()),
@@ -783,7 +850,7 @@ impl LocalEventLoop<CoreFileTracker> {
                 contact_share_timeout = self.contact_share_request_timeouts.next() => {
                     let (request_id, peer_id) = contact_share_timeout.unwrap();
                     let data = self.data.clone();
-                    tokio::spawn(async move { <RefCountEventLoopData<_> as ResponseReceiver<Contact>>::handle_receive_error(&data, peer_id, Ok(request_id), ReceiveError::LocalError(LocalReceiveError::Timeout)).await });
+                    tokio::spawn(async move { <RefCountEventLoopData<_> as ResponseReceiver<SignedContactShare>>::handle_receive_error(&data, peer_id, Ok(request_id), ReceiveError::LocalError(LocalReceiveError::Timeout)).await });
                 },
                 self_contact_invite_timeout = self.self_contact_invite_request_timeouts.next() => {
                     let (request_id, peer_id) = self_contact_invite_timeout.unwrap();
@@ -809,7 +876,7 @@ impl LocalEventLoop<CoreFileTracker> {
                 } => { tokio::spawn(self.data.clone().handle_local_event(event).in_current_span()); },
                 _ = self.shutdown.cancelled() => return Ok(()),
                 command = self.command_receiver.recv() => match command {
-                    Some(P2pCommand::Loop(c)) => self.handle_loop_command(c).await,
+                    Some(P2pCommand::Loop(c)) => self.handle_loop_command(c),
                     Some(P2pCommand::Data(c)) => self.data.clone().handle_command(c),
                     // Closed without a cancellation: the brain went away unexpectedly.
                     None => return Err(()),
@@ -826,7 +893,7 @@ impl LocalEventLoop<CoreFileTracker> {
                 contact_share_timeout = self.contact_share_request_timeouts.next() => {
                     let (request_id, peer_id) = contact_share_timeout.unwrap();
                     let data = self.data.clone();
-                    tokio::spawn(async move { <RefCountEventLoopData<_> as ResponseReceiver<Contact>>::handle_receive_error(&data, peer_id, Ok(request_id), ReceiveError::LocalError(LocalReceiveError::Timeout)).await });
+                    tokio::spawn(async move { <RefCountEventLoopData<_> as ResponseReceiver<SignedContactShare>>::handle_receive_error(&data, peer_id, Ok(request_id), ReceiveError::LocalError(LocalReceiveError::Timeout)).await });
                 },
                 self_contact_invite_timeout = self.self_contact_invite_request_timeouts.next() => {
                     let (request_id, peer_id) = self_contact_invite_timeout.unwrap();
@@ -893,19 +960,6 @@ where
     #[instrument(skip(self, event), level = "trace")]
     fn handle_inner_event(&mut self, event: InnerEvent<S>) {
         match event {
-            InnerEvent::SessionEstablishmentError { channel, error } => {
-                self.get_swarm_mut()
-                    .get_session_establishment_behaviour()
-                    .send_response(channel, Err(error))
-                    .expect("Sending session establishment error to go okay");
-            }
-            InnerEvent::SessionEstablished { channel, response } => {
-                trace!("Sending session establishment response");
-                self.get_swarm_mut()
-                    .get_session_establishment_behaviour()
-                    .send_response(channel, Ok(response))
-                    .expect("Sending session established response to go okay");
-            }
             InnerEvent::DoWithSwarm { block, span } => {
                 let _entered = span.enter();
                 span!(Level::TRACE, "DoWithSwarm block execution").in_scope(|| {
@@ -926,7 +980,7 @@ impl<T: FileTracker, S: LocalNetworkSwarm + 'static> GetInnerEventSender<S>
 }
 
 impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoopData<T, S> {
-    pub async fn get_node_info(&self) -> NodeStatusInfo {
+    pub async fn get_node_info(&self) -> Result<NodeStatusInfo, SwarmWorkDiscarded> {
         let event_loop = self.clone();
         let event_loop2 = self.clone();
         let response = event_loop2.with_swarm_res(move |swarm| NodeStatusInfo {
@@ -957,6 +1011,7 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
     }
 
     pub fn trigger_interaction_with_peer(&self, peer_id: PeerId) {
+        debug!(peer=?peer_id, "Triggering interaction with peer");
         let shutdown = self.shutdown.clone();
         let sender = self.brain_action_sender.clone();
         let data = self.clone();
@@ -1075,10 +1130,10 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
                 trace!("Transport error: {items:?}")
             }
         }
-        if let Some(peer_id) = peer_id {
-            if let Some(sender) = self.pending_dial.timeout_lock().await.remove(&peer_id) {
-                let _ = sender.send(Err(Arc::new(error)));
-            }
+        if let Some(peer_id) = peer_id
+            && let Some(sender) = self.pending_dial.timeout_lock().await.remove(&peer_id)
+        {
+            let _ = sender.send(Err(Arc::new(error)));
         }
     }
 
@@ -1093,12 +1148,12 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
                 let _ = sender.send(Ok(()));
             }
             // If this is one of our own devices, the brain opportunistically syncs.
-            let _ = self
-                .brain_action_sender
+            self.brain_action_sender
                 .send(BrainAction::NetworkNode(
                     NetworkNodeAction::SyncOnPeerConnect(peer_id.wrap()),
                 ))
-                .await;
+                .await
+                .expect("Sending to work");
         }
         if self.file_tracker.has_pending_files_for(&peer_id).await {
             self.send_files_to_peer(peer_id).await;
@@ -1146,16 +1201,6 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
     #[instrument(skip(self))]
     pub fn handle_command(self, command: DataCommand) {
         match command {
-            DataCommand::StartListening { addr, sender } => {
-                self.with_swarm(|swarm| {
-                    match swarm.listen_on(addr) {
-                        Ok(_) => sender.send(Ok(())).expect("Sending value going okay"),
-                        Err(e) => sender
-                            .send(Err(Arc::new(e)))
-                            .expect("Sending error going okay"),
-                    };
-                });
-            }
             DataCommand::SendFiles {
                 files_to_send,
                 sender,
@@ -1219,7 +1264,11 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
             DataCommand::GetNodeInfo { sender } => {
                 tokio::spawn(
                     async move {
-                        let node_info = self.get_node_info().await;
+                        // Dropping `sender` is how the client already reports a node that could
+                        // not answer.
+                        let Ok(node_info) = self.get_node_info().await else {
+                            return;
+                        };
                         debug!(
                             "Local internal addresses: {:?}",
                             node_info
@@ -1236,14 +1285,18 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
             DataCommand::SyncDocsWithReachable { devices, kind } => {
                 tokio::spawn(
                     async move {
-                        let reachable: HashSet<PeerIdWrapper> = self
+                        let Ok(reachable) = self
                             .with_swarm_res(|swarm| {
-                                swarm.sync_reachable_peers()
+                                swarm
+                                    .sync_reachable_peers()
                                     .into_iter()
                                     .map(|p| p.wrap())
-                                    .collect()
+                                    .collect::<HashSet<PeerIdWrapper>>()
                             })
-                            .await;
+                            .await
+                        else {
+                            return;
+                        };
                         for peer in devices.into_iter().filter(|d| reachable.contains(d)) {
                             self.brain_action_sender
                                 .send(BrainAction::NetworkNode(
@@ -1366,6 +1419,17 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
                 } else {
                     error!("Invalid peer ID provided for pubkey fetch: {peer_id}");
                 }
+            }
+            #[cfg(feature = "debug-server")]
+            DataCommand::GetDebugBlob { sender } => {
+                tokio::spawn(
+                    async move {
+                        let blob = self.file_tracker.get_debug_blob().await;
+
+                        sender.send(blob).expect("Sending to work");
+                    }
+                    .in_current_span(),
+                );
             }
         }
     }

@@ -1,6 +1,7 @@
 //! Constants of the core/brain layer. Network-layer ones live in `p2p::constants`, which this
 //! crate sits below and so cannot reference.
 
+use std::ops::RangeInclusive;
 use std::time::Duration;
 
 use crate::core::brain::client_presence::WakenessLevel;
@@ -35,7 +36,7 @@ pub const SYNC_SLOT_STALL_AFTER: Duration = Duration::from_secs(60);
 pub const SYNC_SLOT_COUNT_WARN: usize = 100;
 
 /// Turns a hung task into a loud panic during development; compiled out of release.
-pub const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+pub const LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Fraction of the sweep period applied as random spread, so co-booted devices do not phase-lock.
 pub const SWEEP_JITTER_FRACTION: f64 = 0.2;
@@ -45,6 +46,36 @@ pub const SWEEP_INTERVAL_ATTACHED: Duration = Duration::from_secs(60);
 /// Below `p2p::constants::REQUEST_TIMEOUT` (15s) on purpose: a sweep may fire while the previous
 /// sync is outstanding, and single-flight absorbs it. Not assertable from here — see the module doc.
 pub const SWEEP_INTERVAL_ACTIVE: Duration = Duration::from_secs(10);
+
+/// How long an established install waits between license re-checks.
+pub const LICENSE_RECHECK_INTERVAL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// How long a definitive "no license" answer from the server keeps the app on the free
+/// tier without a fresh check.
+pub const LICENSE_FREE_ANSWER_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Below the ephemeral ranges of Linux (32768+) and of Windows and macOS (49152+), so an outgoing
+/// connection never happens to hold the port a user opened in their firewall.
+pub const RANDOM_LISTEN_PORTS: RangeInclusive<u16> = 20000..=31999;
+
+pub const LISTEN_PORT_PICKS: usize = 20;
+
+/// A rebuilt swarm's predecessor keeps its UDP socket until its QUIC connections drain, so the
+/// configured port can read as taken by ourselves for a moment.
+pub const RELISTEN_DELAYS: [Duration; 3] = [
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+];
+
+/// The last delay repeats for as long as the configured port stays unavailable.
+pub const LISTEN_RECLAIM_BACKOFF: [Duration; 5] = [
+    Duration::from_secs(2),
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+    Duration::from_secs(2 * 60),
+    Duration::from_secs(10 * 60),
+];
 
 pub const fn sweep_interval(level: WakenessLevel) -> Duration {
     match level {

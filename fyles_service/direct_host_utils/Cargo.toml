@@ -1,13 +1,12 @@
 [package]
 name = "direct_host_utils"
-version = "0.1.0"
+version = "0.2.0"
 rust-version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
-chrono = { workspace = true }
 derive_more = { workspace = true, features = ["deref"] }
 fluent = { workspace = true }
 fyles-core = { workspace = true }
@@ -27,11 +26,24 @@ opentelemetry_sdk = { workspace = true, features = ["experimental_async_runtime"
 opentelemetry = { workspace = true, optional = true }
 opentelemetry-stdout = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
+
+[dev-dependencies]
 tempfile.workspace = true
-test-log.workspace = true
+test-log = { workspace = true, features = ["trace"] }
 
 [target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Foundation", "Networking_Connectivity", "System_Power", "Win32_System_Com"] }
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = "5"
+futures.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = { version = "0.6.2", default-features = false, features = ["alloc"] }
+dispatch2 = { version = "0.3.1", default-features = false, features = ["alloc"] }
+objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["std", "CFString"] }
+objc2-io-kit = { version = "0.3.2", default-features = false, features = ["std", "ps"] }
 
 [features]
 otel-jaeger = ["opentelemetry", "opentelemetry-otlp", "tracing-opentelemetry", "opentelemetry-stdout", "opentelemetry_sdk"]

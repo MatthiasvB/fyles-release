@@ -1,0 +1,34 @@
+syntax = "proto3";
+
+package license;
+
+message Entitlement {
+  string id = 1;
+  optional uint64 expires_at_unix_sec = 2;
+  // SHA-256 of the payment provider's transaction id, per entitlement.
+  optional bytes vendor_txn_hash = 3;
+}
+
+message LicenseCertificatePayload {
+  uint32 version = 1;
+  string contact_id = 2;
+  repeated Entitlement entitlements = 3;
+  uint64 issued_at = 4;
+  bytes serial = 5;
+}
+
+message LicenseQuery {
+  reserved 2;
+  uint32 version = 1;
+  bytes identity_keys = 3;
+  optional bytes cached_cert = 4;
+}
+
+message NoLicense {}
+
+message LicenseQueryResponse {
+  oneof result {
+    bytes license = 1;
+    NoLicense no_license = 2;
+  }
+}

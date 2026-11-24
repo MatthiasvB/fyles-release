@@ -82,6 +82,8 @@ No other component holds a mutable reference to the Brain's state. The `ApiServe
 
 **`LocalEventLoop`** (`p2p/src/event_loop.rs`) is another actor — it owns the libp2p `Swarm` and handles swarm events, P2P commands, and internal events via its own `tokio::select!` loop. External code must go through `InnerEvent::DoWithSwarm` closures to touch the swarm, ensuring single-threaded access.
 
+Because the loop is the only thing that runs those closures, it must never await anything another task can hold — a caller parked on `with_swarm_res` may be holding exactly that lock. Its `select!` arm handlers are therefore `fn`, not `async fn`, and any async work a command needs is spawned. See *Event Loop Concurrency* in [AGENTS.md](AGENTS.md).
+
 ---
 
 ## 3. Command Pattern
@@ -162,11 +164,14 @@ Arc::new(move |keypair: Keypair, _config: &[u8]| {
 })
 ```
 
-**Entrypoint factory closures** — the `entrypoint()` function in `core/src/lib.rs` accepts four `async` factory closures:
+**Entrypoint factory closures** — the `entrypoint()` function in `core/src/lib.rs` accepts these factories:
 - `db_factory` — constructs the database adapter.
 - `host_controller_factory` — constructs the file-system adapter.
-- `network_node_factory` — constructs the P2P adapter.
+- `network_factory` — constructs the P2P adapter.
+- `plugin_factory` — constructs the plugin that configures the network.
 - `api_server_factory` — constructs the gRPC server.
+
+Each generation of the brain calls all of them again with its own channel ends and token, so a restore restarts everything on the restored database exactly as at startup (see [backend §2.6](../docs/architecture/backend.md#26-generations)).
 
 This means the entire application composition is defined by the caller (daemon, Android host, test harness), without the core knowing any concrete types.
 
@@ -531,7 +536,6 @@ The shared `wire/` directory at the project root contains `.proto` files that de
 | `filerequest.proto` | Core API: `FileRequestService` with ~30 RPCs, all message types, the bidirectional `Stream` RPC, and push notification `ServerMessage` envelope. |
 | `nodestatus.proto` | Diagnostics: `NodeStatusService` with health-check and status RPCs. |
 | `internet_settings.proto` | Configuration messages for internet-mode toggle. |
-| `pingpong.proto` | Lightweight connectivity probe. |
 
 From these `.proto` files, code is generated into **two completely independent technology stacks**:
 

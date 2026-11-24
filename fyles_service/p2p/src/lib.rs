@@ -2,14 +2,14 @@ use std::{error::Error, sync::Arc};
 
 use command::{DataCommand, LoopCommand, P2pCommand};
 
-use ::crypto::ContactKeys;
 use async_trait::async_trait;
+use crypto::ContactKeys;
+#[cfg(feature = "debug-server")]
+use erased_serde::Serialize;
 use fyles_core::core::brain::action::BrainAction;
 use fyles_core::core::brain::types::{ContactShareChallenge, SelfContactInviteChallenge};
 use fyles_core::library::util::error_handling::{AutoMapError, ToArcedDynError};
 use fyles_core::library::util::util::TimeoutLock;
-#[cfg(not(test))]
-use libp2p::Multiaddr;
 use libp2p::identity::Keypair;
 use libp2p::{Swarm, identity};
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -18,15 +18,17 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, instrument};
 
 use fyles_core::core::domain_models::{ContactId, FylesId, PeerIdWrapper};
+use fyles_core::core::listen::{ListenFailure, ListenPort};
 use fyles_core::core::sync::{DocKind, SyncRequest};
 
 use fyles_core::core::p2p::{
-    FileToSend, KeypairGenerationError, NetworkNode, NodeStatusInfo, P2pError, P2pResult, Runnable,
+    FileToSend, KeypairGenerationError, NetworkNode, NodeConfig, NodeStatusInfo, P2pError,
+    P2pResult, Runnable,
 };
-#[cfg(all(not(test), not(feature = "test-support")))]
-use std::str::FromStr;
 
 use crate::behaviour::LocalNetworkBehaviour;
+#[cfg(feature = "debug-server")]
+use crate::debug::DebugBlob;
 use crate::event_loop::AsyncEventLoopSender;
 use crate::event_loop::filerequest::file_tracker::{CoreFileTracker, FileTracker};
 use crate::event_loop::{AsyncEventLoopReceiver, LocalNetworkSwarm};
@@ -36,13 +38,17 @@ use crate::utils::{encode_keypair, extract_peer_id};
 
 pub mod behaviour;
 pub mod command;
-pub mod crypto;
+pub mod constants;
 mod data_structures;
+#[cfg(feature = "debug-server")]
+pub mod debug;
 pub mod event_loop;
 pub mod file_encryptor;
 mod file_reader;
+pub mod file_stream;
 pub mod send_receive_traits;
-pub mod constants;
+pub mod sessions;
+pub mod source;
 pub mod types;
 pub mod utils;
 
@@ -158,19 +164,6 @@ impl P2pClient<CoreFileTracker, Swarm<LocalNetworkBehaviour>> {
 }
 
 impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> P2pClient<T, S> {
-    #[cfg(not(test))]
-    pub async fn start_listening(
-        &self,
-        addr: Multiaddr,
-    ) -> Result<(), Arc<dyn Error + Send + Sync>> {
-        let (sender, receiver) = oneshot::channel();
-        self.command_sender
-            .send(DataCommand::StartListening { addr, sender }.into())
-            .await
-            .expect("Command receiver not to be dropped.");
-        receiver.await.expect("Sender not to be dropped.")
-    }
-
     pub fn get_channel() -> (
         tokio::sync::mpsc::Sender<P2pCommand>,
         tokio::sync::mpsc::Receiver<P2pCommand>,
@@ -183,57 +176,38 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> P2pClient<T, S> {
 impl Runnable for P2pClient<CoreFileTracker, Swarm<LocalNetworkBehaviour>> {
     #[instrument(skip_all, level = "trace")]
     async fn run(&self) {
-        tokio::join!(
-            async {
-                match self.prepared_event_loop_args.timeout_lock().await.take() {
-                    Some(PreparedEventLoopArgs {
+        match self.prepared_event_loop_args.timeout_lock().await.take() {
+            Some(PreparedEventLoopArgs {
+                p2p_command_receiver,
+                brain_action_sender,
+                shutdown,
+                inner_async_event_loop_receiver,
+            }) => {
+                #[cfg(not(any(test, feature = "test-support")))]
+                let _ = inner_async_event_loop_receiver;
+
+                // Need to allocate future in order to reduce stack usage
+                Box::pin(
+                    LocalEventLoop::new(
                         p2p_command_receiver,
                         brain_action_sender,
                         shutdown,
-                        inner_async_event_loop_receiver,
-                    }) => {
-                        #[cfg(not(any(test, feature = "test-support")))]
-                        let _ = inner_async_event_loop_receiver;
-
-                        // Need to allocate future in order to reduce stack usage
-                        Box::pin(
-                            LocalEventLoop::new(
-                                p2p_command_receiver,
-                                brain_action_sender,
-                                shutdown,
-                                self.swarm_factory.clone(),
-                                #[cfg(any(test, feature = "test-support"))]
-                                inner_async_event_loop_receiver.expect(
-                                    "Inner event loop receiver to be present in test config",
-                                ),
-                            )
-                            .await
-                            .expect("Event loop to be created")
-                            .run(),
-                        )
-                        .await
-                        .expect("Event loop to run");
-                    }
-                    None => {
-                        error!("Trying to run an already running P2pClient");
-                    }
-                }
-            },
-            async {
-                #[cfg(all(not(test), not(feature = "test-support")))]
-                self.start_listening(Multiaddr::from_str("/ip4/0.0.0.0/tcp/24256").unwrap())
+                        self.swarm_factory.clone(),
+                        #[cfg(any(test, feature = "test-support"))]
+                        inner_async_event_loop_receiver
+                            .expect("Inner event loop receiver to be present in test config"),
+                    )
                     .await
-                    .unwrap();
-            },
-            async {
-                #[cfg(all(not(test), not(feature = "test-support")))]
-                self.start_listening(
-                    Multiaddr::from_str("/ip4/0.0.0.0/udp/24256/quic-v1").unwrap(),
+                    .expect("Event loop to be created")
+                    .run(),
                 )
                 .await
-                .unwrap();
+                .expect("Event loop to run");
             }
-        );
+            None => {
+                error!("Trying to run an already running P2pClient");
+            }
+        }
     }
 }
 
@@ -256,10 +230,13 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> NetworkNode for P
             );
         }
         self.command_sender
-            .send(DataCommand::SendFiles {
-                files_to_send,
-                sender,
-            }.into())
+            .send(
+                DataCommand::SendFiles {
+                    files_to_send,
+                    sender,
+                }
+                .into(),
+            )
             .await
             .map_err(|e| P2pError::InternalCommunicationError {
                 msg: "Could not instruct node to send file".into(),
@@ -271,10 +248,13 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> NetworkNode for P
     async fn initial_files_to_send(&self, files: Vec<FileToSend>) -> P2pResult<()> {
         let (sender, receiver) = oneshot::channel();
         self.command_sender
-            .send(DataCommand::InitialFilesToSend {
-                files_to_send: files,
-                sender,
-            }.into())
+            .send(
+                DataCommand::InitialFilesToSend {
+                    files_to_send: files,
+                    sender,
+                }
+                .into(),
+            )
             .await
             .map_err(|e| P2pError::InternalCommunicationError {
                 msg: "Could not instruct node to send file".into(),
@@ -287,9 +267,12 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> NetworkNode for P
         info!("Client: Getting node info");
         let (response_sender, receiver) = oneshot::channel();
         self.command_sender
-            .send(DataCommand::GetNodeInfo {
-                sender: response_sender,
-            }.into())
+            .send(
+                DataCommand::GetNodeInfo {
+                    sender: response_sender,
+                }
+                .into(),
+            )
             .await
             .to_arced_dyn_err()?;
 
@@ -320,11 +303,14 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> NetworkNode for P
             target_filerequest_id
         );
         self.command_sender
-            .send(DataCommand::CancelFilesForRemoteFilerequest {
-                peer_id: peer_id.unwrap_thing(),
-                target_filerequest_id,
-                sender,
-            }.into())
+            .send(
+                DataCommand::CancelFilesForRemoteFilerequest {
+                    peer_id: peer_id.unwrap_thing(),
+                    target_filerequest_id,
+                    sender,
+                }
+                .into(),
+            )
             .await
             .map_err(|e| P2pError::InternalCommunicationError {
                 msg: "Could not instruct node to cancel file".into(),
@@ -398,8 +384,7 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> NetworkNode for P
     }
 
     async fn trigger_interactions_with_visible_peers(&self) {
-        self
-            .command_sender
+        self.command_sender
             .send(LoopCommand::TriggerVisiblePeerInteractions.into())
             .await
             .expect("Command receiver not to be dropped.");
@@ -412,19 +397,54 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> NetworkNode for P
             .expect("Command receiver not to be dropped.");
     }
 
-    async fn process_settings_request(&self, request: &[u8]) -> P2pResult<Vec<u8>> {
-        let (sender, receiver) = oneshot::channel();
+    async fn restart(&self, config: NodeConfig) {
         self.command_sender
-            .send(LoopCommand::ProcessSettingsRequest {
-                request: request.to_vec(),
-                sender,
-            }.into())
+            .send(LoopCommand::Restart(config).into())
             .await
-            .map_err(|e| P2pError::InternalCommunicationError {
-                msg: "Could not send ProcessSettingsRequest command".into(),
-                source: Arc::new(e),
-            })?;
-        receiver.await.to_arced_dyn_err()?.auto_map_err()
+            .expect("Command receiver not to be dropped.");
+    }
+
+    async fn listen_on_port(&self, port: ListenPort) -> Result<(), ListenFailure> {
+        let (reply, outcome) = oneshot::channel();
+        self.command_sender
+            .send(LoopCommand::ListenOnPort { port, reply }.into())
+            .await
+            .map_err(|_| ListenFailure::Other("the network node has stopped".into()))?;
+        outcome
+            .await
+            .map_err(|_| ListenFailure::Other("the network node has stopped".into()))?
+    }
+
+    #[cfg(feature = "debug-server")]
+    async fn get_debug_blob(&self) -> Box<dyn Serialize + Send> {
+        let (swarm_sender, swarm_receiver) = oneshot::channel();
+        let (file_tracker_sender, file_tracker_receiver) = oneshot::channel();
+
+        self.command_sender
+            .send(
+                LoopCommand::GetDebugBlob {
+                    sender: swarm_sender,
+                }
+                .into(),
+            )
+            .await
+            .expect("Command receiver not to be dropped.");
+        self.command_sender
+            .send(
+                DataCommand::GetDebugBlob {
+                    sender: file_tracker_sender,
+                }
+                .into(),
+            )
+            .await
+            .expect("Command receiver not to be dropped.");
+
+        let (swarm, file_tracker) = tokio::join!(swarm_receiver, file_tracker_receiver);
+
+        Box::new(DebugBlob {
+            swarm: swarm.expect("Sender not to be dropped"),
+            file_tracker: file_tracker.expect("Sender not to be dropped"),
+        })
     }
 }
 

@@ -114,7 +114,10 @@ Each sub-document covers one major area in depth:
 | [Deployment & Platform Integration](architecture/deployment.md) | Build targets, FFI bridges (C/Swift, JNI/Kotlin), daemon variants, IPC schemes |
 | [Security & Cryptography](architecture/security.md) | Hybrid PQ crypto, session lifecycle, nonce management, identity sync |
 | [Wire Protocol & API Contract](architecture/wire-protocol.md) | Protobuf schema design, gRPC services, bidirectional streaming, push notifications |
+| [Pro Licensing](architecture/pro-licensing.md) | Identity-bound license certificates, fail-open evaluation, license server, Paddle checkout, activation site |
 | [Design Patterns](../fyles_service/DESIGN_PATTERNS.md) | Catalogue of 22 identified patterns across frontend and backend |
+
+Cross-cutting decisions are recorded as [Architecture Decision Records](architecture/adr/README.md).
 
 ---
 
@@ -122,7 +125,7 @@ Each sub-document covers one major area in depth:
 
 ### 5.1 Hexagonal Architecture with Factory-Based DI
 
-The `core` crate never depends on concrete implementations. All external concerns (DB, P2P, filesystem, API) are defined as Rust traits. The `entrypoint()` function accepts four `async` factory closures that construct the concrete adapters. This allows the same `Brain` to be driven by:
+The `core` crate never depends on concrete implementations. All external concerns (DB, P2P, filesystem, API) are defined as Rust traits. The `entrypoint()` function accepts factories that construct the concrete adapters. It calls them again for every generation of the brain, so a restore restarts everything on the restored database. This allows the same `Brain` to be driven by:
 
 - A desktop `daemon` binary with `DirectFsController` and local P2P
 - An Android foreground service via `kotlin_ffi` with JNI-based `HostController`

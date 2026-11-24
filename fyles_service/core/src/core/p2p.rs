@@ -1,11 +1,15 @@
 use async_trait::async_trait;
 use crypto::ContactKeys;
+use derive_more::{AsRef, Deref, From};
+#[cfg(feature = "debug-server")]
+use erased_serde::Serialize;
 use std::sync::Arc;
 use thiserror::Error;
 
 use crate::core::{
     brain::types::{ContactShareChallenge, SelfContactInviteChallenge},
     domain_models::{ContactId, PeerIdWrapper, SendStatus},
+    listen::{ListenFailure, ListenPort},
     sync::{DocKind, SyncRequest},
 };
 
@@ -37,7 +41,7 @@ pub fn peer_id_from_node_keypair(
 
 #[test]
 fn check_crate_hygiene_restoration_ready() {
-    if crate::library::sqlite::schema::CURRENT_VERSION >= semver::Version::new(1, 100, 0) {
+    if crate::library::sqlite::schema::CURRENT_SCHEMA_VERSION >= semver::Version::new(1, 100, 0) {
         panic!("Crate hygiene should be restored");
     }
 }
@@ -69,6 +73,10 @@ pub enum KeypairGenerationError {
     #[error("Error during key serialization")]
     SerializationError,
 }
+
+/// Opaque to `core`: the brain plugin defines these bytes, the node consumes them.
+#[derive(Debug, Clone, PartialEq, Eq, Deref, AsRef, From)]
+pub struct NodeConfig(pub Vec<u8>);
 
 #[async_trait]
 pub trait Runnable {
@@ -118,13 +126,13 @@ pub trait NetworkNode: Send + Sync {
     /// [`NetworkNodeAction::SyncDocWithPeer`](crate::core::brain::action_p2p::NetworkNodeAction)
     /// per hit.
     async fn sync_docs_with_reachable(&self, devices: Vec<PeerIdWrapper>, kind: DocKind);
-    /// Process an opaque, serialized settings request and return an opaque,
-    /// serialized response. Core stays schema-agnostic: it neither builds nor
-    /// interprets these bytes, it only relays them. The concrete network
-    /// implementation decodes the request, applies/persists any changes, and
-    /// encodes a response. This is the single channel for all settings reads and
-    /// mutations from the frontend.
-    async fn process_settings_request(&self, request: &[u8]) -> P2pResult<Vec<u8>>;
+    async fn restart(&self, config: NodeConfig);
+    /// Accept peers on `port` alone, over TCP and QUIC. On failure the node keeps whatever port it
+    /// listened on before.
+    async fn listen_on_port(&self, port: ListenPort) -> Result<(), ListenFailure>;
+
+    #[cfg(feature = "debug-server")]
+    async fn get_debug_blob(&self) -> Box<dyn Serialize + Send>;
 }
 
 pub trait RunnableNetworkNode: NetworkNode + Runnable {}

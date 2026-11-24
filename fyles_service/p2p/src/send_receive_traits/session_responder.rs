@@ -78,7 +78,10 @@ where
     ) -> Option<Result<Encrypted<Res>, SessionResponderError<S::EncryptError>>> {
         let mut decrypt_errors = vec![];
         let recent_sessions = self.get_recent_receive_sessions(&node_id).await;
-        trace!(count = recent_sessions.len(), "Sessions to try decrypting with");
+        trace!(
+            count = recent_sessions.len(),
+            "Sessions to try decrypting with"
+        );
         for session in &recent_sessions {
             let decrypted = match session.decrypt(&request).await {
                 Err(e) => {

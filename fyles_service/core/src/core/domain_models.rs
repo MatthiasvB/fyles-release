@@ -11,8 +11,8 @@ use tempfile::TempDir;
 use tracing::trace;
 use uuid::Uuid;
 
-use crate::library::util::duration_ext::DurationExt;
 use crate::constants::{RETRY_BASE_INTERVAL, RETRY_MAX_INTERVAL};
+use crate::library::util::duration_ext::DurationExt;
 
 macro_rules! creatable {
     // Match variant with doc strings for fields
@@ -42,45 +42,7 @@ macro_rules! creatable {
     };
 }
 
-#[derive(
-    Debug,
-    Clone,
-    PartialEq,
-    Eq,
-    Hash,
-    Display,
-    FromStr,
-    AsRef,
-    Serialize,
-    Deserialize,
-    Reconcile,
-    Hydrate,
-)]
-#[as_ref(forward)]
-#[repr(transparent)]
-pub struct ContactId(pub String);
-impl From<String> for ContactId {
-    fn from(id: String) -> Self {
-        ContactId(id)
-    }
-}
-impl From<&str> for ContactId {
-    fn from(id: &str) -> Self {
-        ContactId(id.into())
-    }
-}
-
-impl Default for ContactId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ContactId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4().to_string())
-    }
-}
+pub use crypto::{ContactId, ContactIdParseError};
 
 #[derive(
     Debug,
@@ -120,6 +82,50 @@ impl Default for FylesId {
 impl FylesId {
     pub fn new() -> Self {
         FylesId(Uuid::new_v4().to_string())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Display, AsRef, Deref)]
+#[as_ref(forward)]
+#[repr(transparent)]
+pub struct FilerequestId(pub FylesId);
+
+/// A name the user gave themselves or a device of theirs. The self contact and a device entry
+/// hold the empty string until they are named, rather than an optional name. Being unnamed is an
+/// artifact of a fresh identity, gone once it is set up and never back, so an optional name would
+/// make every reader of every name handle a case that exists only at the start. That only holds
+/// up while no name can ever be set to empty, so every name the user sets is parsed into this
+/// type first.
+#[derive(Debug, Clone, PartialEq, Eq, Display)]
+pub struct GivenName(String);
+
+#[derive(Debug, thiserror::Error)]
+#[error("A name must not be empty")]
+pub struct EmptyName;
+
+impl TryFrom<String> for GivenName {
+    type Error = EmptyName;
+
+    fn try_from(name: String) -> Result<Self, Self::Error> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            Err(EmptyName)
+        } else {
+            Ok(GivenName(trimmed.to_owned()))
+        }
+    }
+}
+
+impl GivenName {
+    /// What a self contact or a device entry holds until it is named, and never after.
+    pub fn unnamed() -> String {
+        String::new()
+    }
+}
+
+impl From<GivenName> for String {
+    fn from(name: GivenName) -> Self {
+        name.0
     }
 }
 
@@ -170,18 +176,53 @@ creatable!(CreateFilerequest Filerequest {
     pub is_active: bool,
 });
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendRefusal {
+    Inactive,
+    NoAccess,
+}
+
+impl Filerequest {
+    /// The user's own devices may send into any active filerequest, whatever its audience.
+    /// `self_id` is looked up only for a sender outside the audience.
+    pub async fn admits_sender(
+        &self,
+        sender: &Option<ContactId>,
+        self_id: impl AsyncFnOnce() -> Option<ContactId>,
+    ) -> Result<(), SendRefusal> {
+        if !self.is_active {
+            return Err(SendRefusal::Inactive);
+        }
+        if self.access.is_accessible_by(sender.clone()) {
+            return Ok(());
+        }
+        let Some(sender) = sender else {
+            return Err(SendRefusal::NoAccess);
+        };
+        if self_id().await.as_ref() == Some(sender) {
+            Ok(())
+        } else {
+            Err(SendRefusal::NoAccess)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Contact {
-    pub id: ContactId,
     pub name: String,
     pub public_keys: ContactPublicKeys,
+}
+
+impl Contact {
+    pub fn id(&self) -> ContactId {
+        self.public_keys.id()
+    }
 }
 
 #[cfg(any(test, feature = "test-support"))]
 impl Contact {
     pub fn for_test() -> Self {
         Contact {
-            id: ContactId::new(),
             name: format!("Test Contact {}", Uuid::new_v4()),
             public_keys: ContactPublicKeys::random(),
         }
@@ -197,7 +238,7 @@ pub struct DisplayContact {
 impl From<Contact> for DisplayContact {
     fn from(contact: Contact) -> Self {
         DisplayContact {
-            id: contact.id,
+            id: contact.id(),
             name: contact.name,
         }
     }
@@ -205,9 +246,21 @@ impl From<Contact> for DisplayContact {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SelfContact {
-    pub id: ContactId,
     pub name: String,
     pub keys: ContactKeys,
+}
+
+impl SelfContact {
+    pub fn id(&self) -> ContactId {
+        self.keys.id()
+    }
+
+    pub fn to_public(&self) -> Contact {
+        Contact {
+            name: self.name.clone(),
+            public_keys: self.keys.public.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -217,10 +270,13 @@ pub struct SelfContactInvite {
     pub inviter_device_name: String,
 }
 
+/// `file_size_bytes` and `source_modified_ms` describe the source file as the transfer found it, so a
+/// resume can tell whether it changed since.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TransferData {
     pub progress_bytes: u64,
     pub file_size_bytes: u64,
+    pub source_modified_ms: i64,
     pub transfer_id: FylesId,
 }
 
@@ -306,11 +362,13 @@ impl SendStatus {
         progress_bytes: Option<u64>,
         file_size_bytes: Option<u64>,
         transfer_id: Option<String>,
+        source_modified_ms: Option<i64>,
     ) -> Result<Self, String> {
         let transfer_data = || -> Option<TransferData> {
             Some(TransferData {
                 progress_bytes: progress_bytes?,
                 file_size_bytes: file_size_bytes?,
+                source_modified_ms: source_modified_ms?,
                 transfer_id: transfer_id.clone()?.into(),
             })
         };
@@ -406,6 +464,51 @@ pub struct ReceivedFile {
     pub started_at_ms: i64,
     /// `None` while the transfer is still in progress.
     pub received_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotOwner {
+    OtherPeer,
+    OtherContact,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unwithdrawable {
+    NotOwner(NotOwner),
+    Settled,
+}
+
+impl ReceivedFile {
+    /// Only the peer and contact that started an incoming transfer may continue it.
+    pub fn continuable_by(
+        &self,
+        peer_id: &str,
+        contact_id: &Option<ContactId>,
+    ) -> Result<(), NotOwner> {
+        if self.peer_id != peer_id {
+            return Err(NotOwner::OtherPeer);
+        }
+        if self.contact_id != *contact_id {
+            return Err(NotOwner::OtherContact);
+        }
+        Ok(())
+    }
+
+    /// The same sender may withdraw it, until it has settled.
+    pub fn withdrawable_by(
+        &self,
+        peer_id: &str,
+        contact_id: &Option<ContactId>,
+    ) -> Result<(), Unwithdrawable> {
+        self.continuable_by(peer_id, contact_id)
+            .map_err(Unwithdrawable::NotOwner)?;
+        match self.status {
+            ReceiveStatus::Receiving | ReceiveStatus::Interrupted => Ok(()),
+            ReceiveStatus::Completed | ReceiveStatus::Failed | ReceiveStatus::Unknown(_) => {
+                Err(Unwithdrawable::Settled)
+            }
+        }
+    }
 }
 
 /// Payload for creating a new in-progress receive entry (status = Receiving).
@@ -707,4 +810,151 @@ pub enum DataRedistributionModel {
     MoveToSpecificPeer(PeerIdWrapper),
     /// Push the data to a specific set of peers.
     PushToPeers(Vec<PeerIdWrapper>),
+}
+
+#[cfg(test)]
+mod given_name_tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_name_is_refused() {
+        assert!(GivenName::try_from(String::new()).is_err());
+        assert!(GivenName::try_from("  \t".to_owned()).is_err());
+    }
+
+    #[test]
+    fn a_name_is_kept_without_surrounding_space() {
+        let name = GivenName::try_from("  Anna's phone ".to_owned()).unwrap();
+        assert_eq!(String::from(name), "Anna's phone");
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    fn filerequest(access: FilerequestAccess, is_active: bool) -> Filerequest {
+        Filerequest {
+            id: FylesId::new(),
+            title: "inbox".into(),
+            description: String::new(),
+            access,
+            is_active,
+        }
+    }
+
+    fn audience(contact: &ContactId) -> FilerequestAccess {
+        FilerequestAccess::Audience {
+            contact_ids: vec![contact.clone()],
+        }
+    }
+
+    async fn never_asked() -> Option<ContactId> {
+        panic!("the self id to be looked up only for a sender outside the audience")
+    }
+
+    #[tokio::test]
+    async fn an_inactive_filerequest_admits_nobody() {
+        let me = ContactId::for_test(1);
+        let inactive = filerequest(FilerequestAccess::Public, false);
+        assert_eq!(
+            inactive.admits_sender(&Some(me), never_asked).await,
+            Err(SendRefusal::Inactive)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_public_filerequest_admits_anyone_without_asking_who_we_are() {
+        let public = filerequest(FilerequestAccess::Public, true);
+        assert_eq!(public.admits_sender(&None, never_asked).await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn an_audience_admits_its_members_and_our_own_devices() {
+        let (member, stranger, me) = (
+            ContactId::for_test(1),
+            ContactId::for_test(2),
+            ContactId::for_test(3),
+        );
+        let restricted = filerequest(audience(&member), true);
+        let ours = async || Some(ContactId::for_test(3));
+        assert_eq!(
+            restricted.admits_sender(&Some(member), never_asked).await,
+            Ok(())
+        );
+        assert_eq!(restricted.admits_sender(&Some(me), ours).await, Ok(()));
+        assert_eq!(
+            restricted.admits_sender(&Some(stranger), ours).await,
+            Err(SendRefusal::NoAccess)
+        );
+        assert_eq!(
+            restricted.admits_sender(&None, never_asked).await,
+            Err(SendRefusal::NoAccess)
+        );
+        assert_eq!(
+            restricted
+                .admits_sender(&Some(ContactId::for_test(3)), async || None)
+                .await,
+            Err(SendRefusal::NoAccess)
+        );
+    }
+
+    fn received(status: ReceiveStatus) -> ReceivedFile {
+        ReceivedFile {
+            id: FylesId::new(),
+            contact_id: Some(ContactId::for_test(1)),
+            peer_id: "peer".into(),
+            filerequest_id: FylesId::new(),
+            transfer_id: Some(FylesId::new()),
+            file_name: "file".into(),
+            persisted_as_name: "file".into(),
+            file_path: None,
+            file_size_bytes: 10,
+            progress_bytes: 4,
+            status,
+            started_at_ms: 0,
+            received_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn only_the_sender_that_started_a_transfer_continues_it() {
+        let file = received(ReceiveStatus::Interrupted);
+        let sender = Some(ContactId::for_test(1));
+        assert_eq!(file.continuable_by("peer", &sender), Ok(()));
+        assert_eq!(
+            file.continuable_by("other peer", &sender),
+            Err(NotOwner::OtherPeer)
+        );
+        assert_eq!(
+            file.continuable_by("peer", &Some(ContactId::for_test(2))),
+            Err(NotOwner::OtherContact)
+        );
+        assert_eq!(
+            file.continuable_by("peer", &None),
+            Err(NotOwner::OtherContact)
+        );
+    }
+
+    #[test]
+    fn a_transfer_can_be_withdrawn_by_its_sender_until_it_settles() {
+        let sender = Some(ContactId::for_test(1));
+        for status in [ReceiveStatus::Receiving, ReceiveStatus::Interrupted] {
+            assert_eq!(received(status).withdrawable_by("peer", &sender), Ok(()));
+        }
+        for status in [
+            ReceiveStatus::Completed,
+            ReceiveStatus::Failed,
+            ReceiveStatus::Unknown("from a newer version".into()),
+        ] {
+            assert_eq!(
+                received(status).withdrawable_by("peer", &sender),
+                Err(Unwithdrawable::Settled)
+            );
+        }
+        assert_eq!(
+            received(ReceiveStatus::Receiving).withdrawable_by("other peer", &sender),
+            Err(Unwithdrawable::NotOwner(NotOwner::OtherPeer))
+        );
+    }
 }

@@ -12,6 +12,11 @@ use tokio_util::task::TaskTracker;
 use tonic::Status;
 use tracing::{Instrument, Level, debug, instrument, span};
 
+use crate::core::brain::client_presence::ClientPresence;
+use crate::core::brain::plugin::BrainPluginRef;
+use crate::core::listen::ListenStatus;
+use crate::core::{brain::types::SelfContactInviteChallenge, p2p::RunnableNetworkNode};
+use crate::library::util::util::TimeoutLock;
 use crate::{
     BrainAction,
     core::brain::types::ContactShareChallenge,
@@ -30,9 +35,6 @@ use crate::{
         },
     },
 };
-use crate::core::brain::client_presence::ClientPresence;
-use crate::core::{brain::types::SelfContactInviteChallenge, p2p::RunnableNetworkNode};
-use crate::library::util::util::TimeoutLock;
 
 use super::db::FilerequestDb;
 use crate::constants::{CONTACT_SHARE_TTL, SELF_CONTACT_INVITE_TTL, STALE_CLEANUP_INTERVAL};
@@ -40,11 +42,19 @@ use crate::constants::{CONTACT_SHARE_TTL, SELF_CONTACT_INVITE_TTL, STALE_CLEANUP
 pub mod action;
 pub mod action_client;
 pub mod action_p2p;
+pub mod action_plugin;
 #[cfg(any(test, feature = "test-support"))]
 pub mod action_test;
+mod backup;
 pub mod client_presence;
+pub mod client_push;
+#[cfg(feature = "debug-server")]
+mod debug_server;
 pub mod error;
 pub mod handle_action;
+mod host_state;
+mod listen_port;
+pub mod plugin;
 pub mod stale_cleanup;
 mod sweep_timer;
 pub mod sync_exchange;
@@ -87,11 +97,20 @@ pub struct Brain {
     db: BrainDb,
     network: BrainNetwork,
     host_controller: BrainHostController,
+    plugin: BrainPluginRef,
     ephemeral_data: Arc<Mutex<EphemeralBrainData>>,
     client_push_sender: BrainClientPushSender,
     /// Wakes the presence decay watcher, which otherwise parks indefinitely at `Idle`.
     presence_wakeup: Notify,
+    /// `None` until the node first reported ready. Held across every bind, so changes apply one
+    /// at a time.
+    listen_status: Mutex<Option<ListenStatus>>,
+    listen_wakeup: Notify,
+    /// A restore restarts the node, which would cut a running export short, so backups and
+    /// restores run one at a time.
+    backup_files: Mutex<()>,
     tasks: TaskTracker,
+    end: mpsc::Sender<GenerationEnd>,
     /// Cancelled before the workloads are awaited, so tasks spawned by the p2p loop stop before
     /// their counterparties disappear rather than sending into a dropped receiver.
     shutdown: CancellationToken,
@@ -114,6 +133,14 @@ pub type BrainApiServer = Box<
 >;
 pub type BrainClientPushSender = mpsc::Sender<ServerMessage>;
 
+/// How a brain's generation ended. Every generation is built from scratch, so a restart starts on
+/// whatever the database holds by then.
+#[derive(Debug)]
+pub enum GenerationEnd {
+    Stop,
+    Restart,
+}
+
 impl Brain {
     /// Spells out the guard type, which rust-analyzer cannot infer through `timeout_lock` while
     /// `EphemeralBrainData` transitively holds an `automerge::AutoCommit`.
@@ -130,17 +157,22 @@ impl Brain {
         run_db: impl AsyncFn() -> BrainDb,
         host_controller_factory: impl AsyncFn() -> BrainHostController,
         network_factory: impl AsyncFn() -> BrainNetwork,
+        plugin_factory: impl AsyncFn() -> BrainPluginRef,
         api_server_factory: impl AsyncFnOnce() -> BrainApiServer,
         mut brain_receiver: mpsc::Receiver<BrainAction>,
+        brain_sender: mpsc::Sender<BrainAction>,
         client_push_sender: BrainClientPushSender,
         shutdown: CancellationToken,
-    ) -> (JoinHandle<()>, GigaBrain) {
+    ) -> (JoinHandle<GenerationEnd>, GigaBrain) {
         let tasks = TaskTracker::new();
 
         let db = run_db().await;
 
         debug!("Creating host controller");
         let host_controller = host_controller_factory().await;
+
+        debug!("Creating brain plugin");
+        let plugin = plugin_factory().await;
 
         let db_cleanup = db.clone();
         let hc_cleanup = host_controller.clone();
@@ -150,15 +182,11 @@ impl Brain {
             let tasks = tasks.clone();
             let shutdown = shutdown.clone();
             move |fut| {
-                tasks.spawn(
-                    shutdown
-                        .clone()
-                        .run_until_cancelled_owned(fut)
-                        .map(|_: Option<()>| ()),
-                )
+                tasks.spawn(shutdown.clone().run_until_cancelled_owned(fut));
             }
         };
 
+        debug!("Spawning cleanup task");
         spawn(
             async move {
                 loop {
@@ -176,21 +204,29 @@ impl Brain {
 
         debug!("Spawing API server");
         let api_server = api_server_factory().await;
-        spawn(api_server.run().boxed());
+        // Not cancelled from outside: the server shuts down gracefully on the token, so the
+        // socket is released and in-flight answers are delivered before the generation ends.
+        tasks.spawn(api_server.run());
 
         debug!("Creating network node");
         let net = network_factory().await;
 
         let ephemeral_data = Arc::new(Mutex::new(EphemeralBrainData::new()));
+        let (end, mut end_receiver) = mpsc::channel(1);
 
         let giga_brain = GigaBrain(Arc::new(Brain {
             db,
             network: net.clone(),
             host_controller,
+            plugin: plugin.clone(),
             ephemeral_data,
             client_push_sender,
             presence_wakeup: Notify::new(),
+            listen_status: Mutex::new(None),
+            listen_wakeup: Notify::new(),
+            backup_files: Mutex::new(()),
             tasks,
+            end,
             shutdown: shutdown.clone(),
             internal_data_dir,
             #[cfg(any(test, feature = "test-support"))]
@@ -199,29 +235,74 @@ impl Brain {
 
         debug!("Spawning brain");
         let giga_brain_clone = giga_brain.clone();
-        let brain_shutdown = shutdown.clone();
+        let spawn_handler = spawn.clone();
         let brain_handle = tokio::spawn(
-            brain_shutdown.run_until_cancelled_owned(async move {
+            async move {
+                let end = loop {
+                    tokio::select! {
+                        end = end_receiver.recv() => {
+                            break end.expect("the brain to hold its own end sender");
+                        }
+                        () = giga_brain_clone.shutdown.cancelled() => break GenerationEnd::Stop,
+                        action = brain_receiver
+                            .recv()
+                            .instrument(span!(Level::TRACE, "Waiting for action")) => {
+                            let action = action.expect(
+                                "All action senders got closed (this should be impossible)",
+                            );
+                            let brain = giga_brain_clone.clone();
+                            spawn_handler(
+                                async move { brain.handle_action(action).await }
+                                    .in_current_span()
+                                    .boxed(),
+                            );
+                        }
+                    }
+                };
+                debug!(?end, "Ending the brain's generation");
+                let teardown = giga_brain_clone.shutdown_workloads();
+                tokio::pin!(teardown);
                 loop {
-                    let action = brain_receiver
-                        .recv()
-                        .instrument(span!(Level::TRACE, "Waiting for action"))
-                        .await
-                        .expect("All action senders got closed (this should be impossible)");
-
-                    let giga_brain_clone = giga_brain_clone.clone();
-                    tokio::task::spawn(
-                        async move { giga_brain_clone.clone().handle_action(action).await }
-                            .in_current_span(),
-                    );
+                    tokio::select! {
+                        () = &mut teardown => break,
+                        // Nobody handles actions any more, but callers outside the tracker, such
+                        // as API calls in flight, may still send them. Once the channel is full
+                        // they would wait forever, and the teardown waits for them. Dropping what
+                        // arrives lets them fail fast instead.
+                        Some(_) = brain_receiver.recv() => {}
+                    }
                 }
+                end
             }
-            .in_current_span())
-            .map(|_: Option<()>| ()),
+            .in_current_span(),
         );
+        // Subscribed before `start`, so a reading that lands between the two is still delivered
+        // to the watcher rather than lost.
+        let host_state = giga_brain.host_controller.host_state();
+        debug!("Starting brain plugin");
+        let reading = *host_state.borrow();
+        plugin.write().await.start(reading).await;
+
         let presence_brain = giga_brain.clone();
+        debug!("Spawning client presence watcher");
         spawn(
             async move { presence_brain.watch_presence_decay().await }
+                .in_current_span()
+                .boxed(),
+        );
+
+        let listen_brain = giga_brain.clone();
+        debug!("Spawning listen status watcher");
+        spawn(
+            async move { listen_brain.watch_listen_status().await }
+                .in_current_span()
+                .boxed(),
+        );
+
+        let host_state_brain = giga_brain.clone();
+        debug!("Spawning host state watcher");
+        spawn(
+            async move { host_state_brain.watch_host_state(host_state).await }
                 .in_current_span()
                 .boxed(),
         );
@@ -236,6 +317,15 @@ impl Brain {
             .boxed(),
         );
 
+        #[cfg(feature = "debug-server")]
+        {
+            use crate::core::brain::debug_server::run_debug_server;
+            debug!("Spawning debug server");
+            spawn(run_debug_server(brain_sender).boxed());
+        }
+        #[cfg(not(feature = "debug-server"))]
+        drop(brain_sender);
+
         (brain_handle, giga_brain)
     }
 
@@ -245,6 +335,11 @@ impl Brain {
         self.tasks.close();
         self.shutdown.cancel();
         self.tasks.wait().await;
+    }
+
+    /// A generation ends once. Asking again while an end is pending changes nothing.
+    pub(super) fn end_generation(&self, end: GenerationEnd) {
+        let _ = self.end.try_send(end);
     }
 }
 
@@ -352,8 +447,13 @@ mod test {
     use std::sync::Arc;
 
     use super::*;
-    use crate::constants::{CLIENT_HEARTBEAT_TTL, SWEEP_INTERVAL_ACTIVE, SWEEP_JITTER_FRACTION};
+    use crate::constants::{
+        CLIENT_HEARTBEAT_TTL, LISTEN_PORT_PICKS, RANDOM_LISTEN_PORTS, SWEEP_INTERVAL_ACTIVE,
+        SWEEP_JITTER_FRACTION,
+    };
+    use crate::core::brain::types::{ContactRegistration, SignedContactShare};
     use crate::core::db::test::setup_test_db;
+    use crate::core::listen::{ListenFailure, ListenPort, TemporaryPort};
     use crate::core::sync;
     use crate::library::util::epoch::unix_epoch_millis;
     use crate::{
@@ -364,12 +464,12 @@ mod test {
             },
             domain_models::{
                 CompleteReceivedFile, ContactId, CreateFilerequest, CreateIncomingFile,
-                FilerequestAccess, FilerequestLocation, FylesId, PeerIdWrapper,
+                FilerequestAccess, FilerequestLocation, FylesId, PeerIdWrapper, ReceiveStatus,
             },
             p2p::NodeStatusInfo,
         },
         io_controller::test::TestHostController,
-        mocks::p2p::MockP2pNode,
+        mocks::{p2p::MockP2pNode, plugin::MockBrainPlugin},
     };
     use tokio::sync::{Mutex, oneshot};
 
@@ -384,7 +484,24 @@ mod test {
         Arc<MockP2pNode>,
         CancellationToken,
     ) {
-        let out_dir_handler = Arc::new(TestHostController::new(None));
+        let (brain, sender, node, shutdown, mut pushes, _host, _plugin) =
+            setup_brain_watching_pushes().await;
+        // Unclog the channel for tests that don't care what the clients are told.
+        tokio::spawn(async move { while pushes.recv().await.is_some() {} });
+        (brain, sender, node, shutdown)
+    }
+
+    async fn setup_brain_watching_pushes() -> (
+        GigaBrain,
+        mpsc::Sender<BrainAction>,
+        Arc<MockP2pNode>,
+        CancellationToken,
+        mpsc::Receiver<ServerMessage>,
+        Arc<TestHostController>,
+        MockBrainPlugin,
+    ) {
+        let host_controller = Arc::new(TestHostController::new(None));
+        let out_dir_handler = host_controller.clone();
         let node_info = NodeStatusInfo {
             peer_id: PeerIdWrapper::for_test(),
             external_addresses: vec!["/ip4/127.0.0.1/tcp/8080".to_string()],
@@ -393,12 +510,12 @@ mod test {
             start_timestamp: 0,
         };
 
-        let (stream_sender, mut receiver) = mpsc::channel(16);
-        // throw away everything the receiver gets for now, to unclog the channel
-        tokio::spawn(async move { while let Some(_) = receiver.recv().await {} });
+        let (stream_sender, pushes) = mpsc::channel(16);
 
         let node = Arc::new(MockP2pNode::new(node_info.clone()));
         let node_for_factory = node.clone();
+        let plugin = MockBrainPlugin::default();
+        let plugin_for_factory = plugin.clone();
         let shutdown = CancellationToken::new();
         let (sender, receiver) = mpsc::channel(16);
         let brain = Brain::run(
@@ -406,8 +523,10 @@ mod test {
             async || setup_test_db(None).await,
             async || out_dir_handler.clone() as _,
             async || Arc::new(RwLock::new(MockP2pNode::clone(&node_for_factory))) as _,
+            async || Arc::new(RwLock::new(plugin_for_factory.clone())) as _,
             async || Box::new(MockRunnableFilerequestServer {}) as _,
             receiver,
+            sender.clone(),
             stream_sender,
             shutdown.clone(),
         )
@@ -423,7 +542,15 @@ mod test {
             .unwrap();
         response.await.unwrap().unwrap();
 
-        (brain.1, sender, node, shutdown)
+        (
+            brain.1,
+            sender,
+            node,
+            shutdown,
+            pushes,
+            host_controller,
+            plugin,
+        )
     }
 
     async fn create_test_filerequest(sender: &mpsc::Sender<BrainAction>) -> FylesId {
@@ -579,7 +706,7 @@ mod test {
         let filerequest = create_test_filerequest(&sender).await;
 
         // First, create an incoming file (simulates starting a transfer)
-        let contact_id = ContactId::new();
+        let contact_id = ContactId::for_test(1);
         let transfer_id = FylesId::new();
         let (create_sender, create_receiver) = oneshot::channel();
         let incoming = CreateIncomingFile {
@@ -636,11 +763,161 @@ mod test {
         assert_eq!(files[0].contact_id.take().unwrap(), contact_id);
     }
 
+    async fn start_incoming_transfer(
+        sender: &mpsc::Sender<BrainAction>,
+        filerequest_id: FylesId,
+        contact_id: Option<ContactId>,
+    ) -> FylesId {
+        let transfer_id = FylesId::new();
+        let (create_sender, create_receiver) = oneshot::channel();
+        sender
+            .send(BrainAction::NetworkNode(
+                NetworkNodeAction::CreateIncomingFile(types::BrainRequest {
+                    request: CreateIncomingFile {
+                        contact_id,
+                        filerequest_id,
+                        transfer_id: transfer_id.clone(),
+                        peer_id: "test-peer-id".to_string(),
+                        file_name: "abandoned.txt".to_string(),
+                        persisted_as_name: "abandoned.txt".to_string(),
+                        file_size_bytes: 1234,
+                        started_at_ms: unix_epoch_millis().unwrap(),
+                    },
+                    response_sender: Mutex::new(Some(create_sender)),
+                }),
+            ))
+            .await
+            .unwrap();
+        create_receiver.await.unwrap().unwrap();
+        transfer_id
+    }
+
+    #[tokio::test]
+    async fn a_withdrawn_incoming_transfer_is_removed() {
+        let (brain, sender) = setup_brain().await;
+        let filerequest = create_test_filerequest(&sender).await;
+        let contact_id = Some(ContactId::for_test(1));
+        let transfer_id = start_incoming_transfer(&sender, filerequest, contact_id.clone()).await;
+
+        brain
+            .handle_action(BrainAction::NetworkNode(
+                NetworkNodeAction::DropIncomingTransfer {
+                    transfer_id: transfer_id.clone(),
+                    peer_id: "test-peer-id".to_string(),
+                    contact_id,
+                },
+            ))
+            .await;
+
+        assert!(
+            brain
+                .db
+                .get_received_file_by_transfer_id(&transfer_id)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn another_contact_cannot_withdraw_a_transfer() {
+        let (brain, sender) = setup_brain().await;
+        let filerequest = create_test_filerequest(&sender).await;
+        let transfer_id =
+            start_incoming_transfer(&sender, filerequest, Some(ContactId::for_test(1))).await;
+
+        brain
+            .handle_action(BrainAction::NetworkNode(
+                NetworkNodeAction::DropIncomingTransfer {
+                    transfer_id: transfer_id.clone(),
+                    peer_id: "test-peer-id".to_string(),
+                    contact_id: Some(ContactId::for_test(2)),
+                },
+            ))
+            .await;
+
+        assert_eq!(
+            brain
+                .db
+                .get_received_file_by_transfer_id(&transfer_id)
+                .await
+                .unwrap()
+                .status,
+            ReceiveStatus::Receiving
+        );
+    }
+
+    #[tokio::test]
+    async fn a_user_edited_name_replaces_the_one_the_share_attests_to() {
+        let (brain, sender, _node, _shutdown) = setup_brain_with_node().await;
+        let share = SignedContactShare::for_test();
+        let id = share.contact_unverified().id();
+        let attested_name = share.contact_unverified().name.clone();
+
+        let (response_sender, response) = oneshot::channel();
+        sender
+            .send(BrainAction::Client(ClientAction::RegisterContact(
+                BrainRequest {
+                    request: ContactRegistration {
+                        share,
+                        user_edited_name: Some("My name for them".into()),
+                    },
+                    response_sender: Mutex::new(Some(response_sender)),
+                },
+            )))
+            .await
+            .unwrap();
+        response.await.unwrap().unwrap();
+
+        let stored = brain.db.get_contact(&id).await.unwrap();
+        assert_eq!(stored.name, "My name for them");
+        assert_ne!(stored.name, attested_name);
+        assert_eq!(
+            stored.id(),
+            id,
+            "renaming must not move the contact off the id its keys derive"
+        );
+    }
+
+    #[tokio::test]
+    async fn decoding_reports_the_signed_contact_and_refuses_a_forged_one() {
+        let (_brain, sender, _node, _shutdown) = setup_brain_with_node().await;
+        let share = SignedContactShare::for_test();
+        let expected = share.contact_unverified().clone();
+
+        let (response_sender, response) = oneshot::channel();
+        sender
+            .send(BrainAction::Client(ClientAction::DecodeSignedContact(
+                BrainRequest {
+                    request: share,
+                    response_sender: Mutex::new(Some(response_sender)),
+                },
+            )))
+            .await
+            .unwrap();
+        let decoded = response.await.unwrap().expect("a valid share to decode");
+        assert_eq!(decoded.id, expected.id());
+        assert_eq!(decoded.name, expected.name);
+
+        let (response_sender, response) = oneshot::channel();
+        sender
+            .send(BrainAction::Client(ClientAction::DecodeSignedContact(
+                BrainRequest {
+                    request: SignedContactShare::forged_for_test(expected),
+                    response_sender: Mutex::new(Some(response_sender)),
+                },
+            )))
+            .await
+            .unwrap();
+        assert!(
+            response.await.unwrap().is_none(),
+            "a share not signed by the keys it carries must not decode"
+        );
+    }
+
     /// A local write hands the owned-device list to the network exactly once, tagged with the
     /// document that changed. The network decides who of them is reachable.
     #[tokio::test]
     async fn a_local_write_announces_the_owned_devices_once() {
-        use crate::core::domain_models::Contact;
         use crate::core::sync::{DocKind, add_or_update_owned_device};
 
         let (brain, sender, node, _shutdown) = setup_brain_with_node().await;
@@ -655,7 +932,7 @@ mod test {
         sender
             .send(BrainAction::Client(ClientAction::RegisterContact(
                 BrainRequest {
-                    request: Contact::for_test(),
+                    request: SignedContactShare::for_test().into(),
                     response_sender: Mutex::new(Some(response_sender)),
                 },
             )))
@@ -681,14 +958,172 @@ mod test {
         );
     }
 
+    async fn await_host_state(plugin: &MockBrainPlugin, wanted: crate::io_controller::HostState) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !plugin.host_states().contains(&wanted) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the plugin should have been told about {wanted:?}"));
+    }
+
+    /// The reading arrives with `start`, not as a change, so the network node can be built from a
+    /// correct config the first time instead of being rebuilt the moment the watcher catches up.
+    #[tokio::test]
+    async fn the_startup_host_reading_arrives_with_start() {
+        use crate::io_controller::HostState;
+
+        let (_brain, _sender, _node, _shutdown, mut pushes, _host, plugin) =
+            setup_brain_watching_pushes().await;
+        tokio::spawn(async move { while pushes.recv().await.is_some() {} });
+
+        assert_eq!(plugin.started_with(), vec![HostState::UNSUPPORTED]);
+        assert!(
+            plugin.host_states().is_empty(),
+            "a host that never moved is not a change: {:?}",
+            plugin.host_states()
+        );
+    }
+
+    /// The daemon has to notice the host moving under it even with no client attached, so the
+    /// signal travels host controller → brain → plugin rather than over the client stream.
+    #[tokio::test]
+    async fn a_host_state_change_reaches_the_plugin() {
+        use crate::io_controller::{
+            HostSignal, HostState, NetworkCost, NetworkStatus, PowerSource,
+        };
+
+        let (_brain, _sender, _node, _shutdown, mut pushes, host, plugin) =
+            setup_brain_watching_pushes().await;
+        tokio::spawn(async move { while pushes.recv().await.is_some() {} });
+
+        let unplugged = HostState {
+            power: HostSignal::Known(PowerSource::Battery),
+            network: HostSignal::Known(NetworkStatus::Present(NetworkCost::Unmetered)),
+        };
+        host.set_host_state(unplugged);
+
+        await_host_state(&plugin, unplugged).await;
+    }
+
+    /// The plugin, not the network node, is what a settings mutation reaches, and its answer is
+    /// both the RPC reply and what every attached window is pushed.
+    #[tokio::test]
+    async fn a_settings_mutation_goes_through_the_plugin() {
+        use crate::core::settings::{SettingsMutation, SettingsView};
+        use crate::library::wire::api::server_message::Message;
+
+        let (_brain, sender, node, _shutdown, mut pushes, _host, plugin) =
+            setup_brain_watching_pushes().await;
+        plugin.set_view(b"the-view".to_vec());
+
+        let (request, response) =
+            BrainRequest::with_receiver(SettingsMutation(b"the-request".to_vec()));
+        sender
+            .send(BrainAction::Client(ClientAction::MutateSettings(request)))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.await.unwrap().unwrap(),
+            SettingsView(b"the-view".to_vec())
+        );
+        assert_eq!(plugin.mutations(), vec![b"the-request".to_vec()]);
+        // The node is not in this path at all any more.
+        assert!(node.restarts().is_empty());
+
+        let pushed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(message) = pushes.recv().await {
+                if let Some(Message::SettingsChanged(changed)) = message.message {
+                    return changed.view;
+                }
+            }
+            panic!("the push channel closed before a settings push arrived");
+        })
+        .await
+        .expect("a settings mutation should push the resulting view");
+        assert_eq!(pushed, b"the-view".to_vec());
+    }
+
+    /// The plugin's only way to reach the network node, so a restart it asks for has to land.
+    #[tokio::test]
+    async fn a_plugin_restart_reaches_the_network_node() {
+        use crate::core::brain::action_plugin::PluginAction;
+        use crate::core::p2p::NodeConfig;
+
+        let (_brain, sender, node, _shutdown, mut pushes, _host, _plugin) =
+            setup_brain_watching_pushes().await;
+        tokio::spawn(async move { while pushes.recv().await.is_some() {} });
+
+        sender
+            .send(BrainAction::Plugin(PluginAction::RestartNetwork(
+                NodeConfig(b"the-config".to_vec()),
+            )))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while node.restarts().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the brain should restart the network node when the plugin asks");
+        assert_eq!(node.restarts(), vec![NodeConfig(b"the-config".to_vec())]);
+    }
+
+    /// A window that issued no request still learns about the change. Without this, a mutation made
+    /// in one desktop window stays invisible in every other one, which is the whole reason clients
+    /// no longer build state out of their own replies.
+    #[tokio::test]
+    async fn a_local_write_pushes_the_new_state_to_clients() {
+        use crate::library::wire::api::server_message::Message;
+
+        let (_brain, sender, _node, _shutdown, mut pushes, _host, _plugin) =
+            setup_brain_watching_pushes().await;
+
+        let (response_sender, response) = oneshot::channel();
+        sender
+            .send(BrainAction::Client(ClientAction::RegisterContact(
+                BrainRequest {
+                    request: SignedContactShare::for_test().into(),
+                    response_sender: Mutex::new(Some(response_sender)),
+                },
+            )))
+            .await
+            .unwrap();
+        response.await.unwrap().unwrap();
+
+        // Self-registration pushed its own devices first, so look past whatever precedes it.
+        let upserted = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(message) = pushes.recv().await {
+                if let Some(Message::ContactUpserted(upserted)) = message.message {
+                    return upserted.contact;
+                }
+            }
+            panic!("the push channel closed before a contact push arrived");
+        })
+        .await
+        .expect("registering a contact should push the registered contact");
+
+        assert!(
+            upserted.is_some(),
+            "the push should carry the contact that was registered"
+        );
+    }
+
     /// `shutdown_workloads` must not return until every workload has stopped, including ones that
     /// never poll the token themselves.
     #[tokio::test]
     async fn shutdown_waits_for_workloads_to_stop() {
         let (brain, _sender, _node, _shutdown) = setup_brain_with_node().await;
-        tokio::time::timeout(std::time::Duration::from_secs(5), brain.shutdown_workloads())
-            .await
-            .expect("shutdown_workloads should not hang on a non-cancellation-aware workload");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            brain.shutdown_workloads(),
+        )
+        .await
+        .expect("shutdown_workloads should not hang on a non-cancellation-aware workload");
         assert!(brain.tasks.is_empty(), "a workload outlived the shutdown");
     }
 
@@ -804,7 +1239,6 @@ mod test {
     /// actually part of what is under test.
     #[tokio::test]
     async fn a_converged_exchange_persists_on_both_sides() {
-        use crate::core::domain_models::Contact;
         use crate::core::sync::DocKind;
 
         async fn synced_contacts(brain: &GigaBrain) -> Vec<ContactId> {
@@ -814,8 +1248,8 @@ mod test {
             view.contacts.into_keys().collect()
         }
 
-        async fn register(sender: &mpsc::Sender<BrainAction>, contact: Contact) {
-            let (request, response) = BrainRequest::with_receiver(contact);
+        async fn register(sender: &mpsc::Sender<BrainAction>, share: SignedContactShare) {
+            let (request, response) = BrainRequest::with_receiver(share.into());
             sender
                 .send(BrainAction::Client(ClientAction::RegisterContact(request)))
                 .await
@@ -827,10 +1261,12 @@ mod test {
         let (b, sender_b, _node_b, _shutdown_b) = setup_brain_with_node().await;
 
         // One contact per side, so convergence has something to carry in both directions.
-        let contact_a = Contact::for_test();
-        let contact_b = Contact::for_test();
-        register(&sender_a, contact_a.clone()).await;
-        register(&sender_b, contact_b.clone()).await;
+        let share_a = SignedContactShare::for_test();
+        let share_b = SignedContactShare::for_test();
+        let contact_a = share_a.contact_unverified().id();
+        let contact_b = share_b.contact_unverified().id();
+        register(&sender_a, share_a).await;
+        register(&sender_b, share_b).await;
 
         let peer = PeerIdWrapper::for_test();
         let b_self_id = b.db.get_self_contact_id().await.unwrap();
@@ -852,7 +1288,7 @@ mod test {
         for (label, brain) in [("initiator", &a), ("responder", &b)] {
             let synced = synced_contacts(brain).await;
             assert!(
-                synced.contains(&contact_a.id) && synced.contains(&contact_b.id),
+                synced.contains(&contact_a) && synced.contains(&contact_b),
                 "{label} should have persisted both contacts, has {synced:?}"
             );
         }
@@ -898,5 +1334,244 @@ mod test {
             ),
             "an incompatible schema major must be declined"
         );
+    }
+
+    fn listen_port(port: u16) -> ListenPort {
+        ListenPort::try_from(port).unwrap()
+    }
+
+    async fn report_ready(sender: &mpsc::Sender<BrainAction>) {
+        sender
+            .send(BrainAction::NetworkNode(NetworkNodeAction::Ready))
+            .await
+            .unwrap();
+    }
+
+    async fn await_listen_push(pushes: &mut mpsc::Receiver<ServerMessage>) {
+        use crate::library::wire::api::server_message::Message;
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(message) = pushes.recv().await {
+                if let Some(Message::ListenStatusChanged(_)) = message.message {
+                    return;
+                }
+            }
+            panic!("the push channel closed before a listen status arrived");
+        })
+        .await
+        .expect("a new listen status should be pushed");
+    }
+
+    fn assert_random_pick(port: ListenPort) {
+        assert!(
+            RANDOM_LISTEN_PORTS.contains(&port.get()),
+            "{port} is no random pick"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_install_keeps_the_first_port_that_binds() {
+        let (brain, sender, node, _shutdown, mut pushes, _host, _plugin) =
+            setup_brain_watching_pushes().await;
+        let mut first = true;
+        node.set_listen_outcome(move |_| {
+            if std::mem::take(&mut first) {
+                Err(ListenFailure::AddressInUse)
+            } else {
+                Ok(())
+            }
+        });
+
+        report_ready(&sender).await;
+        await_listen_push(&mut pushes).await;
+
+        let calls = node.listen_calls();
+        assert_eq!(calls.len(), 2);
+        calls.iter().copied().for_each(assert_random_pick);
+        assert_eq!(
+            brain.listen_status().await,
+            Some(ListenStatus::Listening(calls[1]))
+        );
+        assert_eq!(brain.db.get_listen_port().await.unwrap(), Some(calls[1]));
+    }
+
+    #[tokio::test]
+    async fn a_fresh_install_without_a_free_port_chooses_none() {
+        let (brain, sender, node, _shutdown, mut pushes, _host, _plugin) =
+            setup_brain_watching_pushes().await;
+        node.set_listen_outcome(|_| Err(ListenFailure::AddressInUse));
+
+        report_ready(&sender).await;
+        await_listen_push(&mut pushes).await;
+
+        assert_eq!(node.listen_calls().len(), LISTEN_PORT_PICKS);
+        assert_eq!(
+            brain.listen_status().await,
+            Some(ListenStatus::NotListening {
+                configured: None,
+                failure: ListenFailure::AddressInUse,
+            })
+        );
+        assert_eq!(brain.db.get_listen_port().await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_taken_configured_port_falls_back_without_being_forgotten() {
+        let (brain, sender, node, _shutdown, mut pushes, _host, _plugin) =
+            setup_brain_watching_pushes().await;
+        let configured = listen_port(24256);
+        brain.db.store_listen_port(configured).await.unwrap();
+        node.set_listen_outcome(move |port| {
+            if port == configured {
+                Err(ListenFailure::AddressInUse)
+            } else {
+                Ok(())
+            }
+        });
+
+        report_ready(&sender).await;
+        await_listen_push(&mut pushes).await;
+
+        let Some(ListenStatus::Temporary(temporary)) = brain.listen_status().await else {
+            panic!("the node should listen on a temporary port");
+        };
+        assert_eq!(temporary.configured(), configured);
+        assert_eq!(temporary.failure(), &ListenFailure::AddressInUse);
+        assert_random_pick(temporary.active());
+        assert_eq!(brain.db.get_listen_port().await.unwrap(), Some(configured));
+    }
+
+    #[tokio::test]
+    async fn a_taken_configured_port_without_a_free_fallback_listens_nowhere() {
+        let (brain, sender, node, _shutdown, mut pushes, _host, _plugin) =
+            setup_brain_watching_pushes().await;
+        let configured = listen_port(24256);
+        brain.db.store_listen_port(configured).await.unwrap();
+        node.set_listen_outcome(|_| Err(ListenFailure::AccessDenied));
+
+        report_ready(&sender).await;
+        await_listen_push(&mut pushes).await;
+
+        assert_eq!(
+            brain.listen_status().await,
+            Some(ListenStatus::NotListening {
+                configured: Some(configured),
+                failure: ListenFailure::AccessDenied,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn setting_a_free_port_moves_the_node_there() {
+        let (brain, sender, node, _shutdown, mut pushes, _host, _plugin) =
+            setup_brain_watching_pushes().await;
+        report_ready(&sender).await;
+        await_listen_push(&mut pushes).await;
+        let next = listen_port(30000);
+
+        let (request, response) = BrainRequest::with_receiver(next);
+        sender
+            .send(BrainAction::Client(ClientAction::SetListenPort(request)))
+            .await
+            .unwrap();
+        response.await.unwrap().unwrap();
+        await_listen_push(&mut pushes).await;
+
+        assert_eq!(
+            brain.listen_status().await,
+            Some(ListenStatus::Listening(next))
+        );
+        assert_eq!(brain.db.get_listen_port().await.unwrap(), Some(next));
+        assert_eq!(node.listen_calls().last(), Some(&next));
+    }
+
+    #[tokio::test]
+    async fn setting_a_taken_port_keeps_the_node_where_it_was() {
+        let (brain, sender, node, _shutdown, mut pushes, _host, _plugin) =
+            setup_brain_watching_pushes().await;
+        report_ready(&sender).await;
+        await_listen_push(&mut pushes).await;
+        let Some(ListenStatus::Listening(before)) = brain.listen_status().await else {
+            panic!("the node should listen on its first pick");
+        };
+        let taken = listen_port(24256);
+        node.set_listen_outcome(move |port| {
+            if port == taken {
+                Err(ListenFailure::AddressInUse)
+            } else {
+                Ok(())
+            }
+        });
+
+        let (request, response) = BrainRequest::with_receiver(taken);
+        sender
+            .send(BrainAction::Client(ClientAction::SetListenPort(request)))
+            .await
+            .unwrap();
+        response.await.unwrap().unwrap();
+        await_listen_push(&mut pushes).await;
+
+        assert_eq!(
+            brain.listen_status().await,
+            TemporaryPort::new(taken, ListenFailure::AddressInUse, before)
+                .map(ListenStatus::Temporary)
+        );
+        assert_eq!(brain.db.get_listen_port().await.unwrap(), Some(taken));
+        assert_eq!(node.listen_calls().last(), Some(&before));
+    }
+
+    #[tokio::test]
+    async fn a_rebuilt_swarm_listens_again() {
+        use crate::core::brain::action_plugin::PluginAction;
+        use crate::core::p2p::NodeConfig;
+
+        let (brain, sender, node, _shutdown, mut pushes, _host, _plugin) =
+            setup_brain_watching_pushes().await;
+        report_ready(&sender).await;
+        await_listen_push(&mut pushes).await;
+        let Some(ListenStatus::Listening(port)) = brain.listen_status().await else {
+            panic!("the node should listen on its first pick");
+        };
+
+        sender
+            .send(BrainAction::Plugin(PluginAction::RestartNetwork(
+                NodeConfig(Vec::new()),
+            )))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while node.listen_calls().len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the rebuilt swarm should be told to listen");
+        assert_eq!(node.listen_calls(), vec![port, port]);
+    }
+
+    #[tokio::test]
+    async fn a_restart_before_ready_leaves_listening_to_ready() {
+        use crate::core::brain::action_plugin::PluginAction;
+        use crate::core::p2p::NodeConfig;
+
+        let (brain, sender, node, _shutdown) = setup_brain_with_node().await;
+
+        sender
+            .send(BrainAction::Plugin(PluginAction::RestartNetwork(
+                NodeConfig(Vec::new()),
+            )))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while node.restarts().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the brain should restart the network node");
+
+        assert!(node.listen_calls().is_empty());
+        assert_eq!(brain.listen_status().await, None);
     }
 }

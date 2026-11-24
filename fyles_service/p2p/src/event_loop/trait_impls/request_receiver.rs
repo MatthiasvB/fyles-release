@@ -1,7 +1,9 @@
 use crate::event_loop::filerequest::file_tracker::FileTracker;
+use crate::event_loop::filerequest::receive_manager::FilerequestReceiver;
+use crate::event_loop::filerequest::stream_receiver::BrainPorts;
 use crate::event_loop::{LocalNetworkSwarm, RefCountEventLoopData};
 use crate::send_receive_traits::request_receiver::RequestReceiver;
-use crate::types::{FileRequest, FileResponse};
+use crate::types::{FileRequest, FileRequestV2, FileResponse, FileResponseV2};
 use async_trait::async_trait;
 use fyles_core::core::brain::action::BrainAction;
 use fyles_core::core::brain::action_p2p::{
@@ -9,9 +11,9 @@ use fyles_core::core::brain::action_p2p::{
 };
 use fyles_core::core::brain::types::{
     BrainRequest, ContactShareChallenge, FetchedContactKeys, PubkeyFetchRequest,
-    PubkeyFetchResponse, SelfContactInviteChallenge,
+    PubkeyFetchResponse, SelfContactInviteChallenge, SignedContactShare,
 };
-use fyles_core::core::domain_models::{Contact, ContactId, SelfContact};
+use fyles_core::core::domain_models::{ContactId, SelfContact};
 use fyles_core::core::sync::{SyncRequest, SyncResponse};
 use fyles_core::library::util::util::TimeoutLock;
 use libp2p::PeerId;
@@ -64,8 +66,8 @@ impl<T: FileTracker, S: LocalNetworkSwarm> RequestReceiver<SelfContactInviteChal
 }
 
 #[async_trait]
-impl<T: FileTracker, S: LocalNetworkSwarm> RequestReceiver<ContactShareChallenge, Contact>
-    for RefCountEventLoopData<T, S>
+impl<T: FileTracker, S: LocalNetworkSwarm>
+    RequestReceiver<ContactShareChallenge, SignedContactShare> for RefCountEventLoopData<T, S>
 {
     type NodeId = PeerId;
     type ContactId = ContactId;
@@ -77,7 +79,7 @@ impl<T: FileTracker, S: LocalNetworkSwarm> RequestReceiver<ContactShareChallenge
         _contact_id: Option<Self::ContactId>,
         request: ContactShareChallenge,
         _request_id: Self::InboundRequestId,
-    ) -> Option<Contact> {
+    ) -> Option<SignedContactShare> {
         let (request, response) = BrainRequest::with_receiver(request);
         self.brain_action_sender
             .send(BrainAction::NetworkNode(
@@ -161,7 +163,7 @@ impl<T: FileTracker, S: LocalNetworkSwarm> RequestReceiver<PubkeyFetchRequest, P
         Some(PubkeyFetchResponse {
             keys: found
                 .into_iter()
-                .map(|(contact_id, keys)| FetchedContactKeys { contact_id, keys })
+                .map(|(_, keys)| FetchedContactKeys { keys })
                 .collect(),
         })
     }
@@ -189,6 +191,35 @@ impl<T: FileTracker, S: LocalNetworkSwarm> RequestReceiver<FileRequest, FileResp
             .await
             .respond_to(node_id, contact_id, request, request_id)
             .await;
+        debug!(peer=?node_id, ?request_id, ?response, "Responding");
+        Some(response)
+    }
+}
+
+#[async_trait]
+impl<T: FileTracker, S: LocalNetworkSwarm> RequestReceiver<FileRequestV2, FileResponseV2>
+    for RefCountEventLoopData<T, S>
+{
+    type NodeId = PeerId;
+    type ContactId = ContactId;
+    type InboundRequestId = InboundRequestId;
+
+    async fn respond_to(
+        &self,
+        node_id: Self::NodeId,
+        contact_id: Option<Self::ContactId>,
+        request: FileRequestV2,
+        request_id: InboundRequestId,
+    ) -> Option<FileResponseV2> {
+        debug!(peer=?node_id, ?request, ?request_id, "Got filerequest request");
+        let response = FilerequestReceiver::respond_to_v2(
+            &self.receive_manager,
+            &BrainPorts(&self.brain_action_sender),
+            node_id,
+            contact_id,
+            request,
+        )
+        .await;
         debug!(peer=?node_id, ?request_id, ?response, "Responding");
         Some(response)
     }

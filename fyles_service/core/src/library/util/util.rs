@@ -1,7 +1,10 @@
-use tokio::{sync::MutexGuard, time::timeout};
+use tokio::{
+    sync::{MutexGuard, RwLockReadGuard, RwLockWriteGuard},
+    time::timeout,
+};
 
-use crate::core::brain::types::ByteChallenge;
 use crate::constants::LOCK_TIMEOUT;
+use crate::core::brain::types::ByteChallenge;
 
 pub fn generate_random_bytes(length: usize) -> Vec<u8> {
     generate_random_bytes_internal(length)
@@ -85,6 +88,36 @@ impl<T: Send> TimeoutLock<T> for tokio::sync::Mutex<T> {
                 .expect("Locking timed out")
         } else {
             self.lock().await
+        }
+    }
+}
+
+/// The [`TimeoutLock`] counterpart for `RwLock`, which needs one method per guard type.
+#[async_trait::async_trait]
+pub trait TimeoutRwLock<T> {
+    async fn timeout_read(&self) -> RwLockReadGuard<'_, T>;
+    async fn timeout_write(&self) -> RwLockWriteGuard<'_, T>;
+}
+
+#[async_trait::async_trait]
+impl<T: Send + Sync> TimeoutRwLock<T> for tokio::sync::RwLock<T> {
+    async fn timeout_read(&self) -> RwLockReadGuard<'_, T> {
+        if cfg!(debug_assertions) {
+            timeout(LOCK_TIMEOUT, self.read())
+                .await
+                .expect("Read locking timed out")
+        } else {
+            self.read().await
+        }
+    }
+
+    async fn timeout_write(&self) -> RwLockWriteGuard<'_, T> {
+        if cfg!(debug_assertions) {
+            timeout(LOCK_TIMEOUT, self.write())
+                .await
+                .expect("Write locking timed out")
+        } else {
+            self.write().await
         }
     }
 }

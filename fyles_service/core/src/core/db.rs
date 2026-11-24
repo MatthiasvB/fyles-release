@@ -1,8 +1,12 @@
+use crate::core::backup::{RestoredFrom, StoredBackupSecret, VerificationSchedule};
 use crate::core::brain::action_p2p::NodeInfo;
 use crate::core::domain_models::{ContactId, DisplayContact};
+use crate::core::listen::ListenPort;
 use crate::core::p2p::NodeKeyPairBinary;
-use crate::core::sync::{DocKind, LocalDocWrite};
+use crate::core::settings::SettingsBlob;
+use crate::core::sync::{DeviceChange, DevicesDoc, DocKind, LocalDocWrite};
 use async_trait::async_trait;
+use automerge::AutoCommit;
 use crypto::{ContactKeys, ContactPublicKeys};
 use derive_more::Display;
 use std::collections::HashMap;
@@ -13,8 +17,8 @@ use thiserror::Error;
 
 use super::domain_models::{
     CompleteReceivedFile, Contact, CreateFilerequest, CreateIncomingFile, CreatePendingFiles,
-    CreateRemoteFilerequest, Filerequest, FylesId, PendingFile, ReceiveStatus, ReceivedFile,
-    RemoteFilerequest, SelfContact, SendStatus,
+    CreateRemoteFilerequest, Filerequest, FilerequestId, FylesId, PendingFile, ReceiveStatus,
+    ReceivedFile, RemoteFilerequest, SelfContact, SendStatus,
 };
 
 pub type DatabaseResult<T> = Result<T, DbError>;
@@ -62,12 +66,11 @@ pub trait FilerequestDb: Send + Sync {
     // Node key operations
     async fn store_node_keys(&self, keys: NodeInfo) -> DatabaseResult<()>;
     async fn get_node_keys(&self) -> DatabaseResult<NodeInfo>;
-    /// Reads the libp2p keypair and self contact id, without the signing keys.
-    async fn get_node_and_self_contact_id(&self) -> DatabaseResult<(NodeKeyPairBinary, ContactId)>;
-    /// Reads only the self contact id (cheaper than the keypair variant above).
+    /// Reads the libp2p keypair alone, for the case where the signing keys are absent.
+    async fn get_node_keypair(&self) -> DatabaseResult<NodeKeyPairBinary>;
     async fn get_self_contact_id(&self) -> DatabaseResult<ContactId>;
     /// Persists the signing keys into the existing self_contact row, leaving the
-    /// contact id, name and node_keys untouched.
+    /// name and node_keys untouched.
     async fn store_signing_keys(&self, keys: ContactKeys) -> DatabaseResult<()>;
 
     // Remote filerequest operations
@@ -134,7 +137,7 @@ pub trait FilerequestDb: Send + Sync {
         &self,
         filerequest_id: &FylesId,
     ) -> DatabaseResult<Vec<ReceivedFile>>;
-    async fn delete_received_file(&self, id: &FylesId) -> DatabaseResult<()>;
+    async fn delete_received_file(&self, id: &FylesId) -> DatabaseResult<FilerequestId>;
     async fn get_stale_received_files(
         &self,
         older_than_ms: i64,
@@ -145,7 +148,6 @@ pub trait FilerequestDb: Send + Sync {
     async fn get_self_contact_for_display(&self) -> DatabaseResult<DisplayContact>;
     async fn update_self_contact_name(&self, name: String) -> DatabaseResult<()>;
     async fn update_identity(&self, self_contact: SelfContact) -> DatabaseResult<()>;
-    async fn get_sharable_public_self_contact(&self) -> DatabaseResult<Contact>;
     async fn update_contact_projection(&self, contact: Contact) -> DatabaseResult<LocalDocWrite>;
     /// Delete cached key rows for contacts no longer in the synced contacts document —
     /// how a contact removed on another device is pruned locally after sync.
@@ -155,29 +157,44 @@ pub trait FilerequestDb: Send + Sync {
     /// another device are cleaned up locally after sync (formerly a foreign-key cascade).
     async fn prune_orphaned_pending_files(&self) -> DatabaseResult<()>;
 
-    async fn backup_database(
+    async fn snapshot_database(&self, destination: PathBuf) -> DatabaseResult<()>;
+    async fn restore_database(&self, sqlite: PathBuf, from: RestoredFrom) -> DatabaseResult<()>;
+    async fn get_backup_secret(&self) -> DatabaseResult<Option<StoredBackupSecret>>;
+    async fn store_backup_secret(&self, stored: StoredBackupSecret) -> DatabaseResult<()>;
+    async fn store_verification_schedule(
         &self,
-        backup_file: std::fs::File,
-        internal_data_dir: PathBuf,
+        schedule: VerificationSchedule,
     ) -> DatabaseResult<()>;
-    async fn restore_database(&self, backup_file: tokio::fs::File) -> DatabaseResult<()>;
 
     // Opaque settings – stored as a binary blob (version is managed internally by the DB layer)
-    async fn get_settings(&self) -> DatabaseResult<Vec<u8>>;
-    async fn store_settings(&self, settings: Vec<u8>) -> DatabaseResult<()>;
+    async fn get_settings(&self) -> DatabaseResult<SettingsBlob>;
+    async fn store_settings(&self, settings: SettingsBlob) -> DatabaseResult<()>;
+
+    async fn get_license_cache(&self) -> DatabaseResult<Option<Vec<u8>>>;
+    async fn store_license_cache(&self, data: Vec<u8>) -> DatabaseResult<()>;
+
+    async fn get_listen_port(&self) -> DatabaseResult<Option<ListenPort>>;
+    async fn store_listen_port(&self, port: ListenPort) -> DatabaseResult<()>;
 
     /// Creates a shared-genesis empty document if none is stored yet.
     async fn get_sync_doc(&self, kind: DocKind) -> DatabaseResult<Vec<u8>>;
     async fn save_sync_doc(&self, kind: DocKind, blob: Vec<u8>) -> DatabaseResult<()>;
     /// Read-modify-write in one actor turn, so concurrent writers cannot drop each other's changes.
     ///
-    /// Returns no [`LocalDocWrite`] on purpose: convergence merges go through here, and being
-    /// unable to mint the token is what stops a merge announcing itself back around the device set.
-    async fn mutate_sync_doc(
+    /// A transform rather than the per-entry methods contacts and remote filerequests get, because
+    /// not every edit to this document is legal: a device writes only its own entry, and the rest
+    /// of the list is whatever the CRDT exchange carried in. An `upsert_owned_device(peer_id, name)`
+    /// would be an interface for the illegal edits, so there isn't one. Callers hold the invariant
+    /// instead — see the wrappers in [`crate::core::sync`].
+    async fn mutate_devices_doc(
         &self,
-        kind: DocKind,
-        transform: Box<dyn FnOnce(Vec<u8>) -> DatabaseResult<Vec<u8>> + Send>,
-    ) -> DatabaseResult<()>;
+        transform: Box<dyn for<'a> FnOnce(&'a mut DevicesDoc) -> DeviceChange + Send>,
+    ) -> DatabaseResult<DeviceChange>;
+    /// Read-modify-write in one actor turn, as above.
+    ///
+    /// Returns no [`LocalDocWrite`] on purpose: being unable to mint the token is what stops a
+    /// convergence merge announcing itself back around the device set.
+    async fn merge_sync_doc(&self, kind: DocKind, incoming: Box<AutoCommit>) -> DatabaseResult<()>;
 }
 
 #[derive(Debug, Clone)]

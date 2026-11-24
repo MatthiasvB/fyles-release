@@ -1,6 +1,8 @@
 syntax = "proto3";
 package api;
 
+import "filerequest_compat.proto";
+
 // Add version messages before the FileRequestProto
 message GetVersionRequest {}
 
@@ -38,15 +40,10 @@ message SpecificUsersProto {
 
 message ContactProto {
   string id = 1;
+  // Empty for the user's own contact until they name themselves, and never again after, since a
+  // name is never set to empty. Not optional, because being unnamed only exists before setup and
+  // every reader would otherwise carry that case for good.
   string name = 2;
-}
-
-message SelfContactInviteProto {
-  string id = 1;
-  string name = 2;
-  ContactKeysProto keys = 3;
-  string inviter_peer_id = 4;
-  string inviter_device_name = 5;
 }
 
 message CreatePeerProto {
@@ -331,6 +328,7 @@ message GetSelfContactRequest {
 }
 
 message UpdateSelfContactNameRequest {
+  // Rejected as INVALID_ARGUMENT when empty or whitespace only.
   string name = 1;
 }
 
@@ -374,6 +372,10 @@ message WaitForReadyResponse {
 // Opaque settings command interface. The request/response bytes are a serialized
 // internet_settings.SettingsRequest / SettingsResponse; core never interprets
 // them, it only relays them to the network node.
+message GetSettingsRequest {
+  // empty
+}
+
 message SettingsRequestEnvelope {
   bytes request = 1;
 }
@@ -381,6 +383,62 @@ message SettingsRequestEnvelope {
 message SettingsResponseEnvelope {
   bytes response = 1;
 }
+
+// The port peers reach this node on. Ports travel as uint32 because proto3 has no 16-bit type.
+// The service rejects values outside 1024..=65535.
+message AddressInUse {}
+message AccessDenied {}
+
+message ListenFailureProto {
+  oneof failure {
+    AddressInUse address_in_use = 1;
+    AccessDenied access_denied = 2;
+    string other = 3;
+  }
+}
+
+message ListeningOnConfiguredPort {
+  uint32 port = 1;
+}
+
+// `configured` is the port stored for the user. It could not be bound, so peers reach the node on
+// `active` until it can.
+message ListeningOnTemporaryPort {
+  uint32 configured = 1;
+  ListenFailureProto failure = 2;
+  uint32 active = 3;
+}
+
+// Absent `configured` means no port could be picked at all.
+message NotListening {
+  optional uint32 configured = 1;
+  ListenFailureProto failure = 2;
+}
+
+message ListenStatusProto {
+  oneof status {
+    ListeningOnConfiguredPort listening = 1;
+    ListeningOnTemporaryPort temporary = 2;
+    NotListening not_listening = 3;
+  }
+}
+
+message GetListenStatusRequest {}
+
+message ListenStarting {}
+
+message GetListenStatusResponse {
+  oneof state {
+    ListenStarting starting = 1;
+    ListenStatusProto status = 2;
+  }
+}
+
+message SetListenPortRequest {
+  uint32 port = 1;
+}
+
+message SetListenPortResponse {}
 
 // Define a service for the server
 service FileRequestService {
@@ -392,6 +450,7 @@ service FileRequestService {
   rpc UpdateIdentity( UpdateIdentityRequest) returns (UpdateIdentityResponse);
   rpc SharePublicSelfContact (SharePublicSelfContactRequest) returns (SharePublicSelfContactResponse);
   rpc RegisterContact (RegisterContactRequest) returns (RegisterContactResponse);
+  rpc DecodeSignedContact (DecodeSignedContactRequest) returns (DecodeSignedContactResponse);
   
   // Add new methods at the beginning
   rpc GetContactName (GetContactNameRequest) returns (GetContactNameResponse);
@@ -451,6 +510,12 @@ service FileRequestService {
 
   rpc BackupData (BackupDataRequest) returns (BackupDataResponse);
   rpc RestoreData (RestoreDataRequest) returns (RestoreDataResponse);
+  rpc GetBackupPasswordStatus (GetBackupPasswordStatusRequest) returns (GetBackupPasswordStatusResponse);
+  rpc EvaluateBackupPassword (EvaluateBackupPasswordRequest) returns (EvaluateBackupPasswordResponse);
+  rpc SetBackupPassword (SetBackupPasswordRequest) returns (SetBackupPasswordResponse);
+  // Counts toward the re-verification schedule only while a verification is due.
+  rpc VerifyBackupPassword (VerifyBackupPasswordRequest) returns (VerifyBackupPasswordResponse);
+  rpc SnoozeBackupPasswordVerification (SnoozeBackupPasswordVerificationRequest) returns (SnoozeBackupPasswordVerificationResponse);
 
   // Owned devices (this user's other devices)
   rpc ListOwnedDevices (ListOwnedDevicesRequest) returns (ListOwnedDevicesResponse);
@@ -459,13 +524,70 @@ service FileRequestService {
   rpc RemoveOwnedDevice (RemoveOwnedDeviceRequest) returns (RemoveOwnedDeviceResponse);
 
   // Opaque settings
-  rpc Settings (SettingsRequestEnvelope) returns (SettingsResponseEnvelope);
+  rpc GetSettings (GetSettingsRequest) returns (SettingsResponseEnvelope);
+  rpc MutateSettings (SettingsRequestEnvelope) returns (SettingsResponseEnvelope);
+
+  rpc GetListenStatus (GetListenStatusRequest) returns (GetListenStatusResponse);
+  rpc SetListenPort (SetListenPortRequest) returns (SetListenPortResponse);
+
+  rpc GetEntitlementStatus (GetEntitlementStatusRequest) returns (GetEntitlementStatusResponse);
+  rpc GetLicenseIdentity (GetLicenseIdentityRequest) returns (GetLicenseIdentityResponse);
+  rpc PrepareLicenseCheck (PrepareLicenseCheckRequest) returns (PrepareLicenseCheckResponse);
+  rpc SubmitLicenseCheckResponse (SubmitLicenseCheckResponseRequest) returns (LicenseCheckAck);
 
   rpc Stream (stream ClientMessage) returns (stream ServerMessage);
 }
 
+message EntitlementProto {
+  string id = 1;
+  // Unix seconds; unset means the entitlement never expires.
+  optional uint64 expires_at = 2;
+}
+
+message GetEntitlementStatusRequest {}
+
+message GetEntitlementStatusResponse {
+  repeated EntitlementProto entitlements = 1;
+  // True while pro is granted only by fail-open (license server unreachable and no
+  // verified certificate for the current identity).
+  bool provisional = 2;
+}
+
+message GetLicenseIdentityRequest {}
+
+message GetLicenseIdentityResponse {
+  string identity = 1;
+}
+
+message LicenseHttpRequest {
+  bytes body = 1;
+}
+
+message PrepareLicenseCheckRequest {
+  bool force = 1;
+}
+
+message LicenseCheckNotDue {}
+
+message PrepareLicenseCheckResponse {
+  oneof outcome {
+    LicenseHttpRequest request = 1;
+    LicenseCheckNotDue not_due = 2;
+  }
+}
+
+message SubmitLicenseCheckResponseRequest {
+  uint32 http_status = 1;
+  bytes body = 2;
+}
+
+message LicenseCheckAck {}
+
 message OwnedDeviceProto {
   string peer_id = 1;
+  // Empty until the device is named, and never again after, since a name is never set to empty.
+  // Not optional, because being unnamed only exists before setup and every reader would
+  // otherwise carry that case for good.
   string name = 2;
 }
 
@@ -478,6 +600,7 @@ message ListOwnedDevicesResponse {
 }
 
 message RenameThisDeviceRequest {
+  // Rejected as INVALID_ARGUMENT when empty or whitespace only.
   string name = 1;
 }
 
@@ -493,25 +616,127 @@ message RemoveOwnedDeviceResponse {
   bool success = 1;
 }
 
-message BackupDataRequest {
-  // empty
+message BackupDataRequest {}
+
+// Failures arrive as a gRPC status.
+message BackupDataResponse {
+  oneof outcome {
+    BackupWritten written = 1;
+    BackupPasswordNotSet password_not_set = 2;
+  }
 }
 
-message BackupDataResponse {
-  bool success = 1;
-}
+message BackupWritten {}
+message BackupPasswordNotSet {}
 
 message RestoreDataRequest {
   string backup_file_path = 1;
+  optional string password = 2;
 }
 
+// Failures arrive as a gRPC status.
 message RestoreDataResponse {
-  bool success = 1;
+  oneof outcome {
+    RestoredEncrypted restored = 1;
+    // Deprecated format: an unencrypted backup from before passwords existed.
+    RestoredLegacyPlain restored_legacy_plain = 2;
+    BackupNotABackup not_a_backup = 3;
+    BackupUnsupported unsupported = 4;
+    BackupPasswordRequired password_required = 5;
+    BackupWrongPassword wrong_password = 6;
+    BackupCorrupt corrupt = 7;
+  }
 }
+
+message RestoredEncrypted {}
+message RestoredLegacyPlain {}
+message BackupNotABackup {}
+message BackupUnsupported {}
+message BackupPasswordRequired {}
+message BackupWrongPassword {}
+message BackupCorrupt {}
+
+message GetBackupPasswordStatusRequest {}
+
+message GetBackupPasswordStatusResponse {
+  oneof status {
+    BackupPasswordNotSet missing = 1;
+    BackupPasswordSet present = 2;
+  }
+}
+
+message BackupPasswordSet {
+  bool verification_due = 1;
+}
+
+message EvaluateBackupPasswordRequest {
+  string password = 1;
+}
+
+// Never calls a password safe. The estimate has no word lists, so it only errs towards more
+// guesses (ADR-0012). Warnings and suggestions are zxcvbn's.
+message EvaluateBackupPasswordResponse {
+  oneof check {
+    PasswordTooShort too_short = 1;
+    PasswordGuessable guessable = 2;
+    PasswordNoWeaknessFound no_weakness_found = 3;
+  }
+}
+
+message PasswordTooShort {}
+
+message PasswordGuessable {
+  optional PasswordWarning warning = 1;
+  repeated PasswordSuggestion suggestions = 2;
+}
+
+message PasswordNoWeaknessFound {}
+
+enum PasswordWarning {
+  PASSWORD_WARNING_UNSPECIFIED = 0;
+  PASSWORD_WARNING_STRAIGHT_ROWS_OF_KEYS = 1;
+  PASSWORD_WARNING_SHORT_KEYBOARD_PATTERNS = 2;
+  PASSWORD_WARNING_REPEATED_CHARACTERS = 3;
+  PASSWORD_WARNING_REPEATED_BLOCKS = 4;
+  PASSWORD_WARNING_SEQUENCES = 5;
+  PASSWORD_WARNING_RECENT_YEARS = 6;
+  PASSWORD_WARNING_DATES = 7;
+}
+
+enum PasswordSuggestion {
+  PASSWORD_SUGGESTION_UNSPECIFIED = 0;
+  PASSWORD_SUGGESTION_USE_A_FEW_WORDS = 1;
+  PASSWORD_SUGGESTION_NO_NEED_FOR_SYMBOLS = 2;
+  PASSWORD_SUGGESTION_ADD_ANOTHER_WORD = 3;
+  PASSWORD_SUGGESTION_LONGER_KEYBOARD_PATTERN = 4;
+  PASSWORD_SUGGESTION_AVOID_REPEATS = 5;
+  PASSWORD_SUGGESTION_AVOID_SEQUENCES = 6;
+  PASSWORD_SUGGESTION_AVOID_RECENT_YEARS = 7;
+  PASSWORD_SUGGESTION_AVOID_PERSONAL_YEARS = 8;
+  PASSWORD_SUGGESTION_AVOID_PERSONAL_DATES = 9;
+}
+
+// A password shorter than six characters is refused with INVALID_ARGUMENT.
+message SetBackupPasswordRequest {
+  string password = 1;
+}
+
+message SetBackupPasswordResponse {}
+
+message VerifyBackupPasswordRequest {
+  string password = 1;
+}
+
+message VerifyBackupPasswordResponse {
+  bool correct = 1;
+}
+
+message SnoozeBackupPasswordVerificationRequest {}
+
+message SnoozeBackupPasswordVerificationResponse {}
 
 message ClientMessage {
   oneof message {
-    StoreRemoteFileRequestRequest store_remote_file_request = 1;
     ClientHeartbeat heartbeat = 2;
   }
 }
@@ -534,13 +759,97 @@ message ServerMessage {
     DatabaseRestoredFromBackup database_restored_from_backup = 4;
     PendingFileStatusChanged pending_file_status_changed = 5;
     ReceivedFileStatusChanged received_file_status_changed = 6;
-    // Emitted after a synced document converges (add/remove on another of the user's devices).
-    // Each carries the full new state for that concern so the client can replace it directly,
-    // without issuing any follow-up fetch.
+    // A sync with another device converged. The changed entities are not known, so these carry
+    // the full new state for the concern and the client replaces its copy outright.
     ContactsChanged contacts_changed = 7;
     RemoteFilerequestsChanged remote_filerequests_changed = 8;
     OwnedDevicesChanged owned_devices_changed = 9;
+
+    EntitlementsChanged entitlements_changed = 10;
+    SelfContactChanged self_contact_changed = 12;
+    SettingsChanged settings_changed = 13;
+    ReceivedFilesChanged received_files_changed = 14;
+
+    ContactUpserted contact_upserted = 15;
+    ContactRemoved contact_removed = 16;
+    FilerequestUpserted filerequest_upserted = 17;
+    FilerequestRemoved filerequest_removed = 18;
+    RemoteFilerequestUpserted remote_filerequest_upserted = 19;
+    RemoteFilerequestRemoved remote_filerequest_removed = 20;
+    PendingFilesAdded pending_files_added = 21;
+    PendingFileRemoved pending_file_removed = 22;
+    OwnedDeviceUpserted owned_device_upserted = 23;
+    OwnedDeviceRemoved owned_device_removed = 24;
+    ContactShareRejected contact_share_rejected = 25;
+    ListenStatusChanged listen_status_changed = 26;
   }
+}
+
+message ContactShareRejected {}
+
+message ContactUpserted {
+  ContactProto contact = 1;
+}
+
+message ContactRemoved {
+  string contact_id = 1;
+}
+
+message FilerequestUpserted {
+  FileRequestProto file_request = 1;
+}
+
+message FilerequestRemoved {
+  string id = 1;
+}
+
+message RemoteFilerequestUpserted {
+  RemoteFileRequestProto remote_file_request = 1;
+}
+
+message RemoteFilerequestRemoved {
+  string id = 1;
+}
+
+message PendingFilesAdded {
+  repeated PendingFileProto pending_files = 1;
+}
+
+message PendingFileRemoved {
+  string id = 1;
+  string target_file_request_id = 2;
+}
+
+message OwnedDeviceUpserted {
+  OwnedDeviceProto device = 1;
+}
+
+message OwnedDeviceRemoved {
+  string peer_id = 1;
+}
+
+message SelfContactChanged {
+  ContactProto self_contact = 1;
+}
+
+// A serialized `internet_settings.SettingsView` — the same bytes the Settings relay answers with.
+message SettingsChanged {
+  bytes view = 1;
+}
+
+// A signal rather than the files themselves. Received-file lists are per-filerequest and can be
+// long, so the client refetches just the one that changed.
+message ReceivedFilesChanged {
+  string filerequest_id = 1;
+}
+
+message ListenStatusChanged {
+  ListenStatusProto status = 1;
+}
+
+message EntitlementsChanged {
+  repeated EntitlementProto entitlements = 1;
+  bool provisional = 2;
 }
 
 message ReceivedSelfContactInviteOverNetwork {}
@@ -548,20 +857,20 @@ message SelfContactInviteAcceptedOverNetwork {}
 message ReceivedContactShareOverNetwork {}
 message DatabaseRestoredFromBackup {}
 
-// The synced contacts document changed; carries the full contact list.
+// The full contact list after a sync converged.
 message ContactsChanged {
   repeated ContactProto contacts = 1;
 }
 
-// The synced remote-filerequests document changed; carries the full remote-filerequest list plus
-// every pending file (each tagged with its target_file_request_id) so the client can rebuild the
-// nested structure. Pending files for a remote filerequest removed elsewhere are already gone.
+// The full remote-filerequest list after a sync converged, plus every pending file (each tagged
+// with its target_file_request_id) so the client can rebuild the nested structure. Pending files
+// for a remote filerequest removed elsewhere are already gone.
 message RemoteFilerequestsChanged {
   repeated RemoteFileRequestProto remote_file_requests = 1;
   repeated PendingFileProto pending_files = 2;
 }
 
-// The synced owned-devices document changed; carries the full owned-device list.
+// The full owned-device list after a sync converged.
 message OwnedDevicesChanged {
   repeated OwnedDeviceProto devices = 1;
 }
@@ -701,16 +1010,6 @@ message ContactPublicKeysProto {
   bytes ed25519 = 2;
 }
 
-message ContactPrivateKeysProto {
-  bytes pq_signing = 1;
-  bytes ed25519 = 2;
-}
-
-// Only the private keys are carried; the public keys are derived from them.
-message ContactKeysProto {
-  ContactPrivateKeysProto private_keys = 2;
-}
-
 message CreateContactRequest {
   string name = 1;
   ContactPublicKeysProto public_keys = 2;
@@ -807,18 +1106,31 @@ message SharePublicSelfContactRequest {
   // Empty as we just want to share the public self contact
 }
 
-message SelfContactPublicProto {
-    string name = 1;
-  string contact_id = 2;
-  ContactPublicKeysProto public_keys = 3;
-}
-
 message SharePublicSelfContactResponse {
  SelfContactPublicProto sharable_contact = 1;
 }
 
 message RegisterContactRequest {
   SelfContactPublicProto sharable_contact = 1;
+  optional string user_edited_name = 2;
+}
+
+message DecodeSignedContactRequest {
+  SelfContactPublicProto sharable_contact = 1;
+}
+
+message DecodedContactProto {
+  string contact_id = 1;
+  string name = 2;
+}
+
+message ContactShareInvalidProto {}
+
+message DecodeSignedContactResponse {
+  oneof result {
+    DecodedContactProto decoded = 1;
+    ContactShareInvalidProto invalid = 2;
+  }
 }
 
 message RegisterContactResponse {

@@ -1,0 +1,156 @@
+use std::fmt;
+use std::io;
+
+use thiserror::Error;
+
+const MIN_LISTEN_PORT: u16 = 1024;
+
+/// A port the node may listen on for peers, over TCP and QUIC alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ListenPort(u16);
+
+impl ListenPort {
+    pub fn get(self) -> u16 {
+        self.0
+    }
+}
+
+impl fmt::Display for ListenPort {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{0} is not a port peers can be served on, which needs 1024 to 65535")]
+pub struct InvalidListenPort(pub u32);
+
+impl TryFrom<u16> for ListenPort {
+    type Error = InvalidListenPort;
+
+    fn try_from(port: u16) -> Result<Self, Self::Error> {
+        if port >= MIN_LISTEN_PORT {
+            Ok(ListenPort(port))
+        } else {
+            Err(InvalidListenPort(port.into()))
+        }
+    }
+}
+
+impl TryFrom<u32> for ListenPort {
+    type Error = InvalidListenPort;
+
+    fn try_from(port: u32) -> Result<Self, Self::Error> {
+        u16::try_from(port)
+            .map_err(|_| InvalidListenPort(port))
+            .and_then(ListenPort::try_from)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ListenFailure {
+    #[error("the port is in use")]
+    AddressInUse,
+    #[error("the system denied access to the port")]
+    AccessDenied,
+    #[error("{0}")]
+    Other(String),
+}
+
+impl From<io::Error> for ListenFailure {
+    fn from(e: io::Error) -> Self {
+        match e.kind() {
+            io::ErrorKind::AddrInUse => ListenFailure::AddressInUse,
+            io::ErrorKind::PermissionDenied => ListenFailure::AccessDenied,
+            _ => ListenFailure::Other(e.to_string()),
+        }
+    }
+}
+
+/// The node listens on [`Self::active`] because [`Self::configured`], the port stored for the user,
+/// failed. The two never coincide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemporaryPort {
+    configured: ListenPort,
+    failure: ListenFailure,
+    active: ListenPort,
+}
+
+impl TemporaryPort {
+    pub fn new(configured: ListenPort, failure: ListenFailure, active: ListenPort) -> Option<Self> {
+        (active != configured).then_some(TemporaryPort {
+            configured,
+            failure,
+            active,
+        })
+    }
+
+    pub fn configured(&self) -> ListenPort {
+        self.configured
+    }
+
+    pub fn failure(&self) -> &ListenFailure {
+        &self.failure
+    }
+
+    pub fn active(&self) -> ListenPort {
+        self.active
+    }
+}
+
+/// Where the node accepts peers, against the port configured for the user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListenStatus {
+    Listening(ListenPort),
+    Temporary(TemporaryPort),
+    NotListening {
+        configured: Option<ListenPort>,
+        failure: ListenFailure,
+    },
+}
+
+impl ListenStatus {
+    pub fn active_port(&self) -> Option<ListenPort> {
+        match self {
+            ListenStatus::Listening(port) => Some(*port),
+            ListenStatus::Temporary(temporary) => Some(temporary.active()),
+            ListenStatus::NotListening { .. } => None,
+        }
+    }
+
+    pub fn is_degraded(&self) -> bool {
+        !matches!(self, ListenStatus::Listening(_))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn privileged_ports_are_rejected() {
+        assert_eq!(ListenPort::try_from(1023u16), Err(InvalidListenPort(1023)));
+        assert_eq!(ListenPort::try_from(1024u16).map(ListenPort::get), Ok(1024));
+    }
+
+    #[test]
+    fn the_configured_port_is_never_temporary() {
+        let port = ListenPort::try_from(24256u16).unwrap();
+        assert_eq!(
+            TemporaryPort::new(port, ListenFailure::AddressInUse, port),
+            None
+        );
+    }
+
+    #[test]
+    fn values_beyond_u16_are_rejected() {
+        assert_eq!(
+            ListenPort::try_from(65536u32),
+            Err(InvalidListenPort(65536))
+        );
+        assert_eq!(
+            ListenPort::try_from(65535u32).map(ListenPort::get),
+            Ok(65535)
+        );
+    }
+}

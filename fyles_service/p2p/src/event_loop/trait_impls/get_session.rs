@@ -1,9 +1,10 @@
-use crate::crypto::{Session, SessionEstablishmentError};
 use crate::event_loop::filerequest::file_tracker::FileTracker;
 use crate::event_loop::{LocalNetworkSwarm, RefCountEventLoopData};
 use crate::send_receive_traits::get_session::GetSession;
+use crate::sessions::SessionEstablishmentError;
 use crate::utils::W;
 use async_trait::async_trait;
+use crypto::session::Session;
 use fyles_core::core::domain_models::ContactId;
 use libp2p::PeerId;
 use std::sync::Arc;

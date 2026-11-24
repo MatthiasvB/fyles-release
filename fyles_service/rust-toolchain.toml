@@ -9,4 +9,6 @@ targets = [
     "armv7-linux-androideabi",
     "x86_64-linux-android",
     "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
 ]

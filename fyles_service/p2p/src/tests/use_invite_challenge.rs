@@ -7,6 +7,7 @@ use fyles_core::core::brain::action::BrainAction;
 use fyles_core::core::brain::action_client::ClientAction;
 use fyles_core::core::brain::action_p2p::NetworkNodeAction;
 use fyles_core::core::brain::types::BrainRequest;
+use fyles_core::core::domain_models::GivenName;
 
 use crate::types::Wrap;
 
@@ -40,6 +41,16 @@ async fn use_self_contact_invite_challenge(start_with_incorrect_challenge: bool)
         .run()
         .instrument(span!(Level::INFO, "Secondary New"))
         .await;
+
+    let name = GivenName::try_from("Owner".to_owned()).unwrap();
+    let (request, response) = BrainRequest::with_receiver(name);
+    owner_harness
+        .act(ClientAction::UpdateSelfContactName(request))
+        .await;
+    response
+        .await
+        .expect("Naming the owner to work")
+        .expect("Naming the owner to succeed");
 
     let (request, response) = BrainRequest::with_receiver(());
     owner_harness
@@ -86,7 +97,7 @@ async fn use_self_contact_invite_challenge(start_with_incorrect_challenge: bool)
     };
 
     let (request, response) =
-        BrainRequest::with_receiver((first_challenge, owner_harness.peer_id.clone().wrap()));
+        BrainRequest::with_receiver((first_challenge, owner_harness.peer_id.wrap()));
     new_harness
         .act(ClientAction::UseSelfContactInviteChallenge(request))
         .await;
@@ -142,7 +153,7 @@ async fn use_self_contact_invite_challenge(start_with_incorrect_challenge: bool)
     }
 
     let (request, response) =
-        BrainRequest::with_receiver((second_challenge, owner_harness.peer_id.clone().wrap()));
+        BrainRequest::with_receiver((second_challenge, owner_harness.peer_id.wrap()));
 
     secondary_new_harness
         .act(ClientAction::UseSelfContactInviteChallenge(request))

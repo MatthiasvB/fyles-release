@@ -113,7 +113,10 @@ mod tests {
         let mut timer = SweepTimer::with_draw(WakenessLevel::Active, 0.5);
         for period in 1..=5 {
             tokio::time::advance(SWEEP_INTERVAL_ACTIVE - 1.millis()).await;
-            assert!(!fired(&mut timer), "period {period} fired a millisecond early");
+            assert!(
+                !fired(&mut timer),
+                "period {period} fired a millisecond early"
+            );
 
             tokio::time::advance(1.millis()).await;
             assert!(fired(&mut timer), "period {period} never came due");

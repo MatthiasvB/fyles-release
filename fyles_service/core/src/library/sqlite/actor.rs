@@ -1,18 +1,28 @@
 use super::SqliteMsg;
 use super::SqlitePath;
-use super::migrations::run_migrations;
+use super::migrations::{MigrationError, run_migrations};
 use super::schema::initialize_tables;
 use super::util::db_op;
+use crate::core::backup::{
+    Gap, RestoredFrom, StoredBackupSecret, VerificationSchedule, VerifyEvent,
+};
 use crate::core::brain::action_p2p::NodeInfo;
 use crate::core::db::{DbError, DbOperationInfo, OperationType};
 use crate::core::domain_models::{
     CompleteReceivedFile, Contact, ContactId, CreateFilerequest, CreateIncomingFile,
     CreatePendingFiles, CreateRemoteFilerequest, DisplayContact, Filerequest, FilerequestAccess,
-    FylesId, PendingFile, ReceiveStatus, ReceivedFile, RemoteFilerequest, SelfContact, SendStatus,
+    FilerequestId, FylesId, GivenName, PendingFile, ReceiveStatus, ReceivedFile, RemoteFilerequest,
+    SelfContact, SendStatus,
 };
+use crate::core::listen::ListenPort;
 use crate::core::p2p::NodeKeyPairBinary;
-use crate::core::sync::{self, ContactEntry, ContactsDoc, DocKind, RemoteFrDoc, RemoteFrEntry};
+use crate::core::settings::SettingsBlob;
+use crate::core::sync::{
+    self, ContactEntry, ContactsDoc, DeviceChange, DevicesDoc, DocKind, RemoteFrDoc, RemoteFrEntry,
+};
 use crate::library::util::error_handling::AutoMapError;
+use automerge::AutoCommit;
+use crypto::backup::{BackupKey, BackupSecret, KdfParams, Salt};
 use crypto::{
     ContactKeys, ContactPrivateKeys, ContactPublicKeys, deserialize_ed25519_private_key,
     deserialize_ed25519_public_key, deserialize_pq_signing_private_key,
@@ -24,32 +34,45 @@ use rusqlite::{Connection, OptionalExtension, Result, ToSql, backup::Backup};
 use semver::Version;
 use std::collections::HashMap;
 use std::path::Path;
-use std::{fs, io};
+use std::sync::Arc;
 use tokio::sync::mpsc::Receiver;
 use tracing::{debug, instrument, trace, warn};
-use uuid::Uuid;
-use zstd;
 
 pub(super) struct SqliteActor {
     pub(super) conn: Connection,
     pub(super) receiver: Receiver<SqliteMsg>,
 }
 
-impl ToSql for ContactId {
+pub(super) struct SqlContactId(pub(super) ContactId);
+
+impl ToSql for SqlContactId {
     fn to_sql(&self) -> Result<rusqlite::types::ToSqlOutput<'_>> {
-        ToSql::to_sql(&self.0)
+        ToSql::to_sql(self.0.as_ref())
     }
 }
 
-impl FromSql for ContactId {
+impl FromSql for SqlContactId {
     fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
-        let x: String = FromSql::column_result(value)?;
-        Ok(x.into())
+        let text: String = FromSql::column_result(value)?;
+        text.parse()
+            .map(SqlContactId)
+            .map_err(|e| rusqlite::types::FromSqlError::Other(Box::new(e)))
+    }
+}
+
+fn migration_failed(error: MigrationError) -> DbError {
+    DbError::Operation {
+        info: DbOperationInfo::new(
+            "schema_version",
+            OperationType::Init,
+            "running migrations".into(),
+        ),
+        source: Arc::new(error),
     }
 }
 
 impl SqliteActor {
-    fn initialize_database(path: &SqlitePath) -> Result<Connection, rusqlite::Error> {
+    fn initialize_database(path: &SqlitePath) -> Result<Connection, DbError> {
         let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
             | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
             | rusqlite::OpenFlags::SQLITE_OPEN_URI;
@@ -64,7 +87,7 @@ impl SqliteActor {
         initialize_tables(&mut conn)?;
 
         // Then run any necessary migrations if schema version is older
-        run_migrations(&mut conn)?;
+        run_migrations(&mut conn).map_err(migration_failed)?;
 
         Ok(conn)
     }
@@ -124,8 +147,8 @@ impl SqliteActor {
                 SqliteMsg::GetNodeInfo(response) => {
                     let _ = response.send(self.handle_get_node_keys());
                 }
-                SqliteMsg::GetNodeAndSelfContactId(response) => {
-                    let _ = response.send(self.handle_get_node_and_self_contact_id());
+                SqliteMsg::GetNodeKeypair(response) => {
+                    let _ = response.send(self.handle_get_node_keypair());
                 }
                 SqliteMsg::GetSelfContactId(response) => {
                     let _ = response.send(self.handle_get_self_contact_id());
@@ -248,10 +271,6 @@ impl SqliteActor {
                     let result = self.handle_update_identity(self_contact);
                     let _ = sender.send(result);
                 }
-                SqliteMsg::GetSharablePublicSelfContact(sender) => {
-                    let result = self.handle_get_sharable_public_self_contact();
-                    let _ = sender.send(result);
-                }
                 SqliteMsg::UpdateContactProjection(contact, sender) => {
                     let result = self.handle_update_contact_projection(contact);
                     let _ = sender.send(result);
@@ -262,20 +281,20 @@ impl SqliteActor {
                 SqliteMsg::PruneOrphanedPendingFiles(sender) => {
                     let _ = sender.send(self.handle_prune_orphaned_pending_files());
                 }
-                SqliteMsg::Backup {
-                    mut backup_file,
-                    internal_data_dir,
-                    response_sender,
-                } => {
-                    let result = self.backup_database(&mut backup_file, &internal_data_dir);
-                    let _ = response_sender.send(result);
+                SqliteMsg::Snapshot(destination, sender) => {
+                    let _ = sender.send(self.snapshot_database(&destination));
                 }
-                SqliteMsg::Restore {
-                    backup_file,
-                    response_sender,
-                } => {
-                    let result = self.restore_database(backup_file);
-                    let _ = response_sender.send(result);
+                SqliteMsg::Restore(sqlite, from, sender) => {
+                    let _ = sender.send(self.restore_database(&sqlite, from));
+                }
+                SqliteMsg::GetBackupSecret(sender) => {
+                    let _ = sender.send(self.handle_get_backup_secret());
+                }
+                SqliteMsg::StoreBackupSecret(stored, sender) => {
+                    let _ = sender.send(self.handle_store_backup_secret(&stored));
+                }
+                SqliteMsg::StoreVerificationSchedule(schedule, sender) => {
+                    let _ = sender.send(self.handle_store_verification_schedule(schedule));
                 }
                 SqliteMsg::GetSettings(sender) => {
                     let _ = sender.send(self.handle_get_settings());
@@ -283,18 +302,29 @@ impl SqliteActor {
                 SqliteMsg::StoreSettings(data, sender) => {
                     let _ = sender.send(self.handle_store_settings(data));
                 }
+                SqliteMsg::GetLicenseCache(sender) => {
+                    let _ = sender.send(self.handle_get_license_cache());
+                }
+                SqliteMsg::StoreLicenseCache(data, sender) => {
+                    let _ = sender.send(self.handle_store_license_cache(data));
+                }
+                SqliteMsg::GetListenPort(sender) => {
+                    let _ = sender.send(self.handle_get_listen_port());
+                }
+                SqliteMsg::StoreListenPort(port, sender) => {
+                    let _ = sender.send(self.handle_store_listen_port(port));
+                }
                 SqliteMsg::GetSyncDoc(kind, sender) => {
                     let _ = sender.send(self.handle_get_sync_doc(kind));
                 }
                 SqliteMsg::SaveSyncDoc(kind, blob, sender) => {
                     let _ = sender.send(self.handle_save_sync_doc(kind, blob));
                 }
-                SqliteMsg::MutateSyncDoc(kind, transform, sender) => {
-                    let result = self
-                        .handle_get_sync_doc(kind)
-                        .and_then(transform)
-                        .and_then(|blob| self.handle_save_sync_doc(kind, blob));
-                    let _ = sender.send(result);
+                SqliteMsg::MutateDevicesDoc(transform, sender) => {
+                    let _ = sender.send(self.handle_mutate_devices_doc(transform));
+                }
+                SqliteMsg::MergeSyncDoc(kind, incoming, sender) => {
+                    let _ = sender.send(self.handle_merge_sync_doc(kind, incoming));
                 }
             }
         }
@@ -314,7 +344,7 @@ impl SqliteActor {
             || {
                 let fr = self.conn.query_row(
                     "SELECT id, title, description, status, access_type FROM filerequests WHERE id = ?",
-                    [&id.0],
+                    [id.as_str()],
                     |row| {
                         let access_type: String = row.get(4)?;
                         let access = match access_type.as_str() {
@@ -323,7 +353,7 @@ impl SqliteActor {
                                 let mut stmt = self.conn.prepare(
                                     "SELECT contact_id FROM filerequest_audience WHERE filerequest_id = ?"
                                 )?;
-                                let contact_ids = stmt.query_map([&id.0], |row| row.get::<_, ContactId>(0))?
+                                let contact_ids = stmt.query_map([id.as_str()], |row| row.get::<_, SqlContactId>(0).map(|c| c.0))?
                                     .collect::<Result<Vec<_>, _>>()?;
                                 FilerequestAccess::Audience { contact_ids }
                             },
@@ -367,7 +397,7 @@ impl SqliteActor {
                                 let mut stmt = self.conn.prepare(
                                     "SELECT contact_id FROM filerequest_audience WHERE filerequest_id = ?"
                                 )?;
-                                let contact_ids = stmt.query_map([&id], |row| row.get::<_, ContactId>(0))?
+                                let contact_ids = stmt.query_map([&id], |row| row.get::<_, SqlContactId>(0).map(|c| c.0))?
                                     .collect::<Result<Vec<_>, _>>()?;
                                 FilerequestAccess::Audience { contact_ids }
                             },
@@ -403,7 +433,7 @@ impl SqliteActor {
             },
             || {
                 let tx = self.conn.transaction()?;
-                let id = id.0.clone();
+                let id = id.to_string();
 
                 let (access_type, contact_ids) = match &filerequest.access {
                     FilerequestAccess::Public => ("public", vec![]),
@@ -429,7 +459,7 @@ impl SqliteActor {
                     tx.execute(
                         "INSERT INTO filerequest_audience (filerequest_id, contact_id, created_at)
                          VALUES (?, ?, datetime('now'))",
-                        (&id, &contact_id),
+                        (&id, contact_id.as_ref()),
                     )?;
                 }
 
@@ -482,7 +512,7 @@ impl SqliteActor {
                     tx.execute(
                         "INSERT INTO filerequest_audience (filerequest_id, contact_id, created_at)
                          VALUES (?, ?, datetime('now'))",
-                        (&filerequest.id.0, &contact_id),
+                        (&filerequest.id.0, contact_id.as_ref()),
                     )?;
                 }
 
@@ -546,7 +576,7 @@ impl SqliteActor {
             || {
                 let result = self.conn.query_row(
                     "SELECT pq_signing_public_key, ed25519_public_key FROM contacts WHERE id = ?",
-                    [id],
+                    [id.as_ref()],
                     |row| {
                         let pq_signing_key: Option<Vec<u8>> = row.get(0)?;
                         let ed25519_key: Option<Vec<u8>> = row.get(1)?;
@@ -602,7 +632,7 @@ impl SqliteActor {
                     .read_contacts_view()?
                     .contacts
                     .into_keys()
-                    .filter(|id| !cached.contains(&id.0))
+                    .filter(|id| !cached.contains(id.as_ref()))
                     .collect())
             },
         )
@@ -661,11 +691,11 @@ impl SqliteActor {
                     .ok_or_else(|| DbError::NotFound {
                         message: format!("The contact with id {id} could not be found"),
                     })?;
-                let id_str = id.0.clone();
+                let id_str = id.to_string();
 
                 let (pq_signing_key, ed25519_key) = self.conn.query_row(
                     "SELECT pq_signing_public_key, ed25519_public_key FROM contacts WHERE id = ?",
-                    [&id],
+                    [id.as_ref()],
                     |row| {
                         let pq_signing_key: Option<Vec<u8>> = row.get(0)?;
                         let ed25519_key: Option<Vec<u8>> = row.get(1)?;
@@ -704,11 +734,7 @@ impl SqliteActor {
                     .into());
                 };
 
-                Ok(Contact {
-                    id: id_str.into(),
-                    name,
-                    public_keys,
-                })
+                Ok(Contact { name, public_keys })
             },
         )
     }
@@ -773,7 +799,7 @@ impl SqliteActor {
                     view.contacts.remove(id);
                 })?;
                 self.conn
-                    .execute("DELETE FROM contacts WHERE id = ?", [&id])?;
+                    .execute("DELETE FROM contacts WHERE id = ?", [id.as_ref()])?;
                 Ok(())
             },
         )
@@ -783,14 +809,10 @@ impl SqliteActor {
         db_op(
             || DbOperationInfo::new("node_keys", OperationType::Update, "Store node keys".into()),
             || {
-                // Store the node_key_pair directly as bytes
                 let key_bytes = &keys.node_key_pair;
 
-                // Store contact ID directly as a string
-                let contact_id = &keys.self_contact_id;
-
                 // Store the post-quantum signing key as its 32-byte seed and the ed25519
-                // private key. Public keys are derived on read, so they are not stored.
+                // private key. Public keys and the contact id are derived on read.
                 let pq_signing_private_key =
                     serialize_pq_signing_private_key(&keys.self_contact_keys.private.pq_signing);
                 let ed25519_private_key = keys.self_contact_keys.private.ed25519.as_bytes();
@@ -800,11 +822,18 @@ impl SqliteActor {
                     rusqlite::params![key_bytes],
                 )?;
 
-                trace!("Storing self contact with ID: {}", contact_id);
+                trace!(
+                    "Storing self contact with ID: {}",
+                    keys.self_contact_keys.id()
+                );
 
                 self.conn.execute(
-                    "INSERT OR REPLACE INTO self_contact (id, contact_id, name, pq_signing_private_key, ed25519_private_key) VALUES (1, ?, ?, ?, ?)",
-                    rusqlite::params![contact_id, contact_id, pq_signing_private_key, ed25519_private_key],
+                    "INSERT INTO self_contact (id, name, pq_signing_private_key, ed25519_private_key)
+                     VALUES (1, ?, ?, ?)
+                     ON CONFLICT(id) DO UPDATE SET
+                         pq_signing_private_key = excluded.pq_signing_private_key,
+                         ed25519_private_key = excluded.ed25519_private_key",
+                    rusqlite::params![GivenName::unnamed(), pq_signing_private_key, ed25519_private_key],
                 )?;
 
                 Ok(())
@@ -837,86 +866,30 @@ impl SqliteActor {
                     }
                 };
 
-                // Read the stored private keys; the public keys are derived from them.
-                // These columns are nullable; when they are absent the signing keys need to be
-                // (re)generated by the caller before the identity is usable.
-                let result = self
-                    .conn
-                    .query_row(
-                        "SELECT contact_id, pq_signing_private_key, ed25519_private_key
-                     FROM self_contact WHERE id = 1",
-                        [],
-                        |row| {
-                            let contact_id: String = row.get(0)?;
-                            let pq_signing_private_key: Option<Vec<u8>> = row.get(1)?;
-                            let ed25519_private_key: Option<Vec<u8>> = row.get(2)?;
-                            Ok((contact_id, pq_signing_private_key, ed25519_private_key))
-                        },
-                    )
-                    .optional()?;
-
-                match result {
-                    Some((contact_id, Some(pq_signing_private_key), Some(ed25519_private_key))) => {
-                        let pq_signing = Box::new(
-                            deserialize_pq_signing_private_key(pq_signing_private_key)
-                                .map_err(|e| DbError::DataConversion { message: format!("Failed to deserialize post-quantum private signing key: {e}") })?
-                        );
-
-                        let ed25519 = deserialize_ed25519_private_key(ed25519_private_key)
-                            .map_err(|e| DbError::DataConversion {
-                                message: format!("Failed to deserialize ed25519 private key: {e}"),
-                            })?;
-
-                        Ok(NodeInfo {
-                            node_key_pair: key_bytes,
-                            self_contact_id: contact_id.into(),
-                            self_contact_keys: ContactKeys::from_private(ContactPrivateKeys {
-                                pq_signing,
-                                ed25519,
-                            }),
-                        })
-                    }
-                    // The row exists (contact id + node_keys present) but the signing keys are
-                    // absent and need to be generated by the caller.
-                    Some(_) => Err(DbError::SigningKeysMissing.into()),
-                    None => Err(DbError::DataNotYetInitialized.into()),
-                }
+                Ok(NodeInfo {
+                    node_key_pair: key_bytes,
+                    self_contact_keys: self.read_self_signing_keys()?,
+                })
             },
         )
     }
 
-    /// Reads the libp2p keypair and the self contact id, without the signing keys.
-    fn handle_get_node_and_self_contact_id(
-        &self,
-    ) -> Result<(NodeKeyPairBinary, ContactId), DbError> {
+    fn handle_get_node_keypair(&self) -> Result<NodeKeyPairBinary, DbError> {
         db_op(
             || {
                 DbOperationInfo::new(
-                    "node_keys and self_contact",
+                    "node_keys",
                     OperationType::Read,
-                    "Retrieve node keypair and self contact id".into(),
+                    "Retrieve node keypair".into(),
                 )
             },
             || {
-                let key_bytes: Vec<u8> = self
-                    .conn
+                self.conn
                     .query_row("SELECT key_bytes FROM node_keys WHERE id = 1", [], |row| {
                         row.get(0)
                     })
                     .optional()?
-                    .ok_or(DbError::DataNotYetInitialized)?;
-
-                let contact_id: ContactId = self
-                    .conn
-                    .query_row(
-                        "SELECT contact_id FROM self_contact WHERE id = 1",
-                        [],
-                        |row| row.get::<_, ContactId>(0),
-                    )
-                    .optional()?
-                    .ok_or(DbError::DataNotYetInitialized)?;
-
-                Ok((key_bytes, contact_id))
+                    .ok_or(DbError::DataNotYetInitialized.into())
             },
         )
     }
@@ -930,23 +903,61 @@ impl SqliteActor {
                     "Retrieve self contact id".into(),
                 )
             },
-            || {
-                let contact_id: ContactId = self
-                    .conn
-                    .query_row(
-                        "SELECT contact_id FROM self_contact WHERE id = 1",
-                        [],
-                        |row| row.get::<_, ContactId>(0),
-                    )
-                    .optional()?
-                    .ok_or(DbError::DataNotYetInitialized)?;
-                Ok(contact_id)
-            },
+            || Ok(self.read_self_signing_keys()?.id()),
         )
     }
 
-    /// Writes the signing keys into the existing self_contact row, leaving the
-    /// contact id, name and node_keys untouched. Only the private keys are stored.
+    fn self_contact_name(&self) -> Result<String, DbError> {
+        self.conn
+            .query_row("SELECT name FROM self_contact WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .optional()?
+            .ok_or(DbError::DataNotYetInitialized)
+    }
+
+    fn read_self_signing_keys(&self) -> Result<ContactKeys, DbError> {
+        let (ed25519_private, pq_signing_private) = self
+            .conn
+            .query_row(
+                "SELECT ed25519_private_key, pq_signing_private_key FROM self_contact WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<Vec<u8>>>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(DbError::DataNotYetInitialized)?;
+
+        let (Some(ed25519_private), Some(pq_signing_private)) =
+            (ed25519_private, pq_signing_private)
+        else {
+            return Err(DbError::SigningKeysMissing);
+        };
+
+        let pq_signing = Box::new(
+            deserialize_pq_signing_private_key(pq_signing_private).map_err(|_| {
+                DbError::Validation {
+                    message: "Could not deserialize post-quantum private signing key".into(),
+                }
+            })?,
+        );
+        let ed25519 =
+            deserialize_ed25519_private_key(ed25519_private).map_err(|_| DbError::Validation {
+                message: "Could not deserialize ed25519 private key".into(),
+            })?;
+
+        Ok(ContactKeys::from_private(ContactPrivateKeys {
+            pq_signing,
+            ed25519,
+        }))
+    }
+
+    /// Writes the signing keys into the existing self_contact row, leaving the name and
+    /// node_keys untouched. Only the private keys are stored.
     fn handle_store_signing_keys(&self, keys: &ContactKeys) -> Result<(), DbError> {
         db_op(
             || {
@@ -1080,7 +1091,7 @@ impl SqliteActor {
                 // Delete any pending files for this remote filerequest and remove it from the doc.
                 self.conn.execute(
                     "DELETE FROM pending_files WHERE target_filerequest_id = ?",
-                    [&id.0],
+                    [id.as_str()],
                 )?;
                 self.mutate_remote_fr_view(|view| {
                     view.remote_filerequests.remove(id);
@@ -1122,8 +1133,8 @@ impl SqliteActor {
             || {
                 // Get the basic pending file data
                 let basic_file = self.conn.query_row(
-                    "SELECT id, file_path, target_filerequest_id, status, retry_count, progress_bytes, file_size_bytes, transfer_id, display_name, interruption_reasons FROM pending_files WHERE id = ?",
-                    [&id.0],
+                    "SELECT id, file_path, target_filerequest_id, status, retry_count, progress_bytes, file_size_bytes, transfer_id, display_name, interruption_reasons, source_modified_ms FROM pending_files WHERE id = ?",
+                    [id.as_str()],
                     |row| {
                         Ok((
                             row.get::<_, String>(0)?,
@@ -1136,6 +1147,7 @@ impl SqliteActor {
                             row.get::<_, Option<String>>(7)?,
                             row.get::<_, Option<String>>(8)?,
                             row.get::<_, String>(9)?,
+                            row.get::<_, Option<i64>>(10)?,
                         ))
                     },
                 )?;
@@ -1151,6 +1163,7 @@ impl SqliteActor {
                     transfer_id,
                     display_name,
                     interruption_reasons_json,
+                    source_modified_ms,
                 ) = basic_file;
 
                 let interruption_reasons: Vec<String> =
@@ -1170,6 +1183,7 @@ impl SqliteActor {
                     progress_bytes,
                     file_size_bytes,
                     transfer_id,
+                    source_modified_ms,
                 )
                 .map_err(|e| DbError::DataConversion {
                     message: format!("Failed to parse send status: {e}"),
@@ -1206,7 +1220,7 @@ impl SqliteActor {
             || {
                 // First get all the basic pending file data
                 let mut stmt = self.conn.prepare(
-                    "SELECT id, file_path, target_filerequest_id, status, retry_count, progress_bytes, file_size_bytes, transfer_id, display_name, interruption_reasons FROM pending_files WHERE target_filerequest_id = ?",
+                    "SELECT id, file_path, target_filerequest_id, status, retry_count, progress_bytes, file_size_bytes, transfer_id, display_name, interruption_reasons, source_modified_ms FROM pending_files WHERE target_filerequest_id = ?",
                 )?;
 
                 #[allow(clippy::type_complexity)]
@@ -1222,6 +1236,7 @@ impl SqliteActor {
                         Option<String>,
                         Option<String>,
                         String,
+                        Option<i64>,
                     )>,
                     rusqlite::Error,
                 > = stmt
@@ -1237,6 +1252,7 @@ impl SqliteActor {
                             row.get(7)?,
                             row.get(8)?,
                             row.get(9)?,
+                            row.get(10)?,
                         ))
                     })?
                     .collect();
@@ -1265,6 +1281,7 @@ impl SqliteActor {
                     transfer_id,
                     display_name,
                     interruption_reasons_json,
+                    source_modified_ms,
                 ) in pending_files
                 {
                     let status = SendStatus::from_db_columns(
@@ -1272,6 +1289,7 @@ impl SqliteActor {
                         progress_bytes,
                         file_size_bytes,
                         transfer_id,
+                        source_modified_ms,
                     )
                     .map_err(|e| DbError::DataConversion {
                         message: format!("Failed to parse send status: {e}"),
@@ -1305,7 +1323,7 @@ impl SqliteActor {
             },
             || {
                 let mut stmt = self.conn.prepare(
-                    "SELECT id, file_path, target_filerequest_id, status, retry_count, progress_bytes, file_size_bytes, transfer_id, display_name, interruption_reasons
+                    "SELECT id, file_path, target_filerequest_id, status, retry_count, progress_bytes, file_size_bytes, transfer_id, display_name, interruption_reasons, source_modified_ms
                      FROM pending_files",
                 )?;
 
@@ -1322,6 +1340,7 @@ impl SqliteActor {
                             row.get::<_, Option<String>>(7)?, // transfer_id
                             row.get::<_, Option<String>>(8)?, // display_name
                             row.get::<_, String>(9)?, // interruption_reasons
+                            row.get::<_, Option<i64>>(10)?, // source_modified_ms
                         ))
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
@@ -1342,6 +1361,7 @@ impl SqliteActor {
                     transfer_id,
                     display_name,
                     interruption_reasons_json,
+                    source_modified_ms,
                 ) in pending_files_data
                 {
                     // A pending file whose remote filerequest is gone is an orphan; skip it rather
@@ -1359,6 +1379,7 @@ impl SqliteActor {
                         progress_bytes,
                         file_size_bytes,
                         transfer_id,
+                        source_modified_ms,
                     )
                     .map_err(|e| DbError::DataConversion {
                         message: format!("Failed to parse send status: {e}"),
@@ -1420,7 +1441,7 @@ impl SqliteActor {
                         "INSERT INTO pending_files (id, file_path, target_filerequest_id, status, display_name, created_at)
                          VALUES (?, ?, ?, ?, ?, datetime('now'))",
                         (
-                            &id.0,
+                            id.as_str(),
                             *file_path,
                             &pending_file.target_filerequest_id.0,
                             "Pending",
@@ -1447,7 +1468,7 @@ impl SqliteActor {
             },
             || {
                 self.conn
-                    .execute("DELETE FROM pending_files WHERE id = ?", [&id.0])?;
+                    .execute("DELETE FROM pending_files WHERE id = ?", [id.as_str()])?;
                 Ok(())
             },
         )
@@ -1471,7 +1492,7 @@ impl SqliteActor {
                      WHERE file_path = (SELECT file_path FROM pending_files WHERE id = ?1)
                        AND id != ?1
                        AND status IN ('Pending', 'Sending', 'Interrupted')",
-                    [&id.0],
+                    [id.as_str()],
                     |row| Ok(row.get::<_, i64>(0)? as usize),
                 )?;
                 Ok(count)
@@ -1492,7 +1513,7 @@ impl SqliteActor {
                 // Read current, parse, append, serialize, update
                 let current_json: String = self.conn.query_row(
                     "SELECT interruption_reasons FROM pending_files WHERE id = ?",
-                    [&id.0],
+                    [id.as_str()],
                     |row| row.get(0),
                 )?;
                 let mut reasons: Vec<String> =
@@ -1502,7 +1523,7 @@ impl SqliteActor {
 
                 self.conn.execute(
                     "UPDATE pending_files SET interruption_reasons = ? WHERE id = ?",
-                    [&new_json, &id.0],
+                    [&new_json, id.as_str()],
                 )?;
                 Ok(())
             },
@@ -1533,14 +1554,15 @@ impl SqliteActor {
                     (Some(count), _) => {
                         // Full update: status, retry_count, and transfer data columns
                         self.conn.query_row(
-                            "UPDATE pending_files SET status = ?, retry_count = ?, progress_bytes = ?, file_size_bytes = ?, transfer_id = ? WHERE id = ? RETURNING target_filerequest_id",
+                            "UPDATE pending_files SET status = ?, retry_count = ?, progress_bytes = ?, file_size_bytes = ?, transfer_id = ?, source_modified_ms = ? WHERE id = ? RETURNING target_filerequest_id",
                             (
                                 tag,
                                 count as i64,
                                 transfer_data.map(|d| d.progress_bytes as i64),
                                 transfer_data.map(|d| d.file_size_bytes as i64),
                                 transfer_data.map(|d| &*d.transfer_id),
-                                &id.0,
+                                transfer_data.map(|d| d.source_modified_ms),
+                                id.as_str(),
                             ),
                             |row| {
                                 let target_filerequest_id: String = row.get(0)?;
@@ -1551,13 +1573,27 @@ impl SqliteActor {
                     (None, Some(td)) => {
                         // Progress update without retry_count change (e.g. FileSending)
                         self.conn.query_row(
-                            "UPDATE pending_files SET status = ?, progress_bytes = ?, file_size_bytes = ?, transfer_id = ? WHERE id = ? RETURNING target_filerequest_id",
+                            "UPDATE pending_files SET status = ?, progress_bytes = ?, file_size_bytes = ?, transfer_id = ?, source_modified_ms = ? WHERE id = ? RETURNING target_filerequest_id",
                             (
                                 tag,
                                 td.progress_bytes as i64,
                                 td.file_size_bytes as i64,
                                 &*td.transfer_id,
-                                &id.0,
+                                td.source_modified_ms,
+                                id.as_str(),
+                            ),
+                            |row| {
+                                let target_filerequest_id: String = row.get(0)?;
+                                Ok(target_filerequest_id)
+                            }
+                        )?.into()
+                    }
+                    (None, None) if matches!(status, SendStatus::Pending) => {
+                        self.conn.query_row(
+                            "UPDATE pending_files SET status = ?, progress_bytes = NULL, file_size_bytes = NULL, transfer_id = NULL, source_modified_ms = NULL WHERE id = ? RETURNING target_filerequest_id",
+                            (
+                                tag,
+                                id.as_str(),
                             ),
                             |row| {
                                 let target_filerequest_id: String = row.get(0)?;
@@ -1573,7 +1609,7 @@ impl SqliteActor {
                             "UPDATE pending_files SET status = ? WHERE id = ? RETURNING target_filerequest_id",
                             (
                                 tag,
-                                &id.0,
+                                id.as_str(),
                             ),
                             |row| {
                                 let target_filerequest_id: String = row.get(0)?;
@@ -1607,7 +1643,7 @@ impl SqliteActor {
                      VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, 0, 'Receiving', ?, NULL)",
                     (
                         &new_id,
-                        &incoming.contact_id,
+                        incoming.contact_id.as_ref().map(|id| id.to_string()),
                         &incoming.peer_id,
                         &incoming.filerequest_id.0,
                         &incoming.transfer_id.0,
@@ -1678,7 +1714,7 @@ impl SqliteActor {
                     |row| {
                         Ok(ReceivedFile {
                             id: row.get::<_, String>(0)?.into(),
-                            contact_id: row.get::<_, Option<ContactId>>(1)?,
+                            contact_id: row.get::<_, Option<SqlContactId>>(1)?.map(|c| c.0),
                             peer_id: row.get(2)?,
                             filerequest_id: row.get::<_, String>(3)?.into(),
                             transfer_id: row.get::<_, Option<String>>(4)?.map(Into::into),
@@ -1754,7 +1790,7 @@ impl SqliteActor {
                     .query_map([&filerequest_id.0], |row| {
                         Ok(ReceivedFile {
                             id: row.get::<_, String>(0)?.into(),
-                            contact_id: row.get::<_, Option<ContactId>>(1)?,
+                            contact_id: row.get::<_, Option<SqlContactId>>(1)?.map(|c| c.0),
                             peer_id: row.get(2)?,
                             filerequest_id: row.get::<_, String>(3)?.into(),
                             transfer_id: row.get::<_, Option<String>>(4)?.map(Into::into),
@@ -1774,7 +1810,7 @@ impl SqliteActor {
         )
     }
 
-    fn handle_delete_received_file(&self, id: &FylesId) -> Result<(), DbError> {
+    fn handle_delete_received_file(&self, id: &FylesId) -> Result<FilerequestId, DbError> {
         db_op(
             || {
                 DbOperationInfo::new(
@@ -1784,17 +1820,20 @@ impl SqliteActor {
                 )
             },
             || {
-                let changes = self
-                    .conn
-                    .execute("DELETE FROM received_files WHERE id = ?", [&id.0])?;
-
-                if changes == 0 {
-                    return Err(DbError::NotFound {
-                        message: format!("Received file with id {} not found", id.0),
-                    }
-                    .into());
-                }
-                Ok(())
+                self.conn
+                    .query_row(
+                        "DELETE FROM received_files WHERE id = ? RETURNING filerequest_id",
+                        [id.as_str()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .map(|id| FilerequestId(FylesId(id)))
+                    .ok_or_else(|| {
+                        DbError::NotFound {
+                            message: format!("Received file with id {} not found", id.0),
+                        }
+                        .into()
+                    })
             },
         )
     }
@@ -1822,7 +1861,7 @@ impl SqliteActor {
                     .query_map([older_than_ms], |row| {
                         Ok(ReceivedFile {
                             id: row.get::<_, String>(0)?.into(),
-                            contact_id: row.get::<_, Option<ContactId>>(1)?,
+                            contact_id: row.get::<_, Option<SqlContactId>>(1)?.map(|c| c.0),
                             peer_id: row.get(2)?,
                             filerequest_id: row.get::<_, String>(3)?.into(),
                             transfer_id: row.get::<_, Option<String>>(4)?.map(Into::into),
@@ -1853,97 +1892,10 @@ impl SqliteActor {
             },
             || {
                 trace!("SQLITE retrieving self contact information");
-                let (id, ed25519_private, pq_signing_private, name) = self.conn.query_row(
-                    "SELECT contact_id, ed25519_private_key, pq_signing_private_key, name FROM self_contact WHERE id = 1",
-                    [],
-                    |row| {
-                        Ok((
-                            row.get::<_, ContactId>(0)?,
-                            row.get::<_, Vec<u8>>(1)?,
-                            row.get::<_, Vec<u8>>(2)?,
-                            row.get::<_, String>(3)?,
-                        ))
-                    },
-                )?;
-
-                // Now deserialize in the outer scope where we can properly return DbError.
-                // The public keys are derived from the private ones.
-                let pq_signing = Box::new(
-                    deserialize_pq_signing_private_key(pq_signing_private).map_err(|_| {
-                        DbError::Validation {
-                            message: "Could not deserialize post-quantum private signing key"
-                                .into(),
-                        }
-                    })?,
-                );
-
-                let ed25519 = deserialize_ed25519_private_key(ed25519_private).map_err(|_| {
-                    DbError::Validation {
-                        message: "Could not deserialize ed25519 private key".into(),
-                    }
-                })?;
-
+                let name = self.self_contact_name()?;
                 Ok(SelfContact {
-                    id,
                     name,
-                    keys: ContactKeys::from_private(ContactPrivateKeys {
-                        pq_signing,
-                        ed25519,
-                    }),
-                })
-            },
-        )
-    }
-
-    fn handle_get_sharable_public_self_contact(&self) -> Result<Contact, DbError> {
-        db_op(
-            || {
-                DbOperationInfo::new(
-                    "self_contact",
-                    OperationType::Read,
-                    "Retrieve self contact public information".into(),
-                )
-            },
-            || {
-                // The self contact stores only private keys; derive the public keys to share.
-                let (id, ed25519_private, pq_signing_private, name) = self.conn.query_row(
-                    "SELECT contact_id, ed25519_private_key, pq_signing_private_key, name FROM self_contact WHERE id = 1",
-                    [],
-                    |row| {
-                        Ok((
-                            row.get::<_, ContactId>(0)?,
-                            row.get::<_, Vec<u8>>(1)?,
-                            row.get::<_, Vec<u8>>(2)?,
-                            row.get::<_, String>(3)?,
-                        ))
-                    },
-                )?;
-
-                let pq_signing = Box::new(
-                    deserialize_pq_signing_private_key(pq_signing_private).map_err(|_| {
-                        DbError::Validation {
-                            message: "Could not deserialize post-quantum private signing key"
-                                .into(),
-                        }
-                    })?,
-                );
-
-                let ed25519 = deserialize_ed25519_private_key(ed25519_private).map_err(|_| {
-                    DbError::Validation {
-                        message: "Could not deserialize ed25519 private key".into(),
-                    }
-                })?;
-
-                let public_keys = ContactPrivateKeys {
-                    pq_signing,
-                    ed25519,
-                }
-                .derive_public();
-
-                Ok(Contact {
-                    id,
-                    name,
-                    public_keys,
+                    keys: self.read_self_signing_keys()?,
                 })
             },
         )
@@ -1959,14 +1911,10 @@ impl SqliteActor {
                 )
             },
             || {
-                // Only fetch the id and name from the database (avoiding expensive crypto keys)
-                let (id, name) = self.conn.query_row(
-                    "SELECT contact_id, name FROM self_contact WHERE id = 1",
-                    [],
-                    |row| Ok((row.get::<_, ContactId>(0)?, row.get::<_, String>(1)?)),
-                )?;
-
-                Ok(DisplayContact { id, name })
+                Ok(DisplayContact {
+                    id: self.read_self_signing_keys()?.id(),
+                    name: self.self_contact_name()?,
+                })
             },
         )
     }
@@ -2004,17 +1952,14 @@ impl SqliteActor {
                 let ed25519_private_key =
                     serialize_ed25519_private_key(&self_contact.keys.private.ed25519);
 
-                // Update the self_contact table
                 self.conn.execute(
                     "UPDATE self_contact
                      SET name = ?,
-                         contact_id = ?,
                          ed25519_private_key = ?,
                          pq_signing_private_key = ?
                      WHERE id = 1",
                     (
                         &self_contact.name,
-                        &self_contact.id,
                         &ed25519_private_key,
                         &pq_signing_private_key,
                     ),
@@ -2049,25 +1994,17 @@ impl SqliteActor {
                          ed25519_public_key = excluded.ed25519_public_key,
                          pq_signing_public_key = excluded.pq_signing_public_key",
                     (
-                        &contact.id,
+                        &SqlContactId(contact.id()),
                         &contact.name,
                         &ed25519_public_key,
                         &pq_signing_public_key,
                     ),
                 )?;
 
-                let key_fingerprint =
-                    sync::fingerprint(&pq_signing_public_key, &ed25519_public_key);
-                let id = contact.id.clone();
+                let id = contact.id();
                 let name = contact.name.clone();
                 self.mutate_contacts_view(move |view| {
-                    view.contacts.insert(
-                        id,
-                        ContactEntry {
-                            name,
-                            key_fingerprint,
-                        },
-                    );
+                    view.contacts.insert(id, ContactEntry { name });
                 })?;
 
                 Ok(())
@@ -2089,7 +2026,7 @@ impl SqliteActor {
                     .read_contacts_view()?
                     .contacts
                     .into_keys()
-                    .map(|id| id.0)
+                    .map(|id| id.to_string())
                     .collect();
                 if keep.is_empty() {
                     self.conn.execute("DELETE FROM contacts", [])?;
@@ -2141,106 +2078,177 @@ impl SqliteActor {
         )
     }
 
-    /// Backs up the database to [backup_path]. Since some platforms may make it hard to write to
-    /// it directly, the backup is created in the internal data dir and then moved to the target
-    /// location. This may incur overhead, but is the only solution on platforms that don't have
-    /// guaranteed meaningful paths to user-accessible files.
-    fn backup_database(
-        &mut self,
-        backup_file: &mut std::fs::File,
-        internal_data_dir: &Path,
-    ) -> Result<(), DbError> {
-        let filename = format!("{}_backup.sqlite", Uuid::new_v4()); // avoid naming conflicts
-        let full_path = internal_data_dir.join(filename);
-
-        debug!("initiating backup to {:?}", full_path);
-
-        let mut backup_conn = Connection::open(full_path.clone())?;
-
-        let backup = Backup::new(&self.conn, &mut backup_conn)?;
-
-        // Copy all pages in one go (-1 means "all remaining pages")
-        backup.step(-1)?;
-
-        drop(backup);
-        backup_conn.close().map_err(|(_, e)| e)?;
-
-        debug!("compressing and moving backup to target location");
-
-        let mut compressor = zstd::Encoder::new(backup_file, 10)?;
-
-        let mut new_backup = fs::File::open(&full_path)?;
-
-        io::copy(&mut new_backup, &mut compressor)?;
-        debug!("waiting for compressor to finish");
-        compressor.finish()?;
-        debug!("writing to file finished");
-
-        fs::remove_file(&full_path)?;
-
+    fn snapshot_database(&mut self, destination: &Path) -> Result<(), DbError> {
+        debug!("snapshotting the database to {}", destination.display());
+        let mut snapshot = Connection::open(destination)?;
+        Backup::new(&self.conn, &mut snapshot)?.step(-1)?;
+        snapshot.close().map_err(|(_, e)| e)?;
         Ok(())
     }
 
-    fn restore_database(&mut self, backup_file: tokio::fs::File) -> Result<(), DbError> {
-        debug!("restoring database from backup");
+    fn restore_database(&mut self, sqlite: &Path, from: RestoredFrom) -> Result<(), DbError> {
+        debug!("restoring the database from {}", sqlite.display());
+        let mut restored = Connection::open(sqlite)?;
+        run_migrations(&mut restored).map_err(migration_failed)?;
+        Backup::new(&restored, &mut self.conn)?.step(-1)?;
+        restored.close().map_err(|(_, e)| e)?;
+        if let RestoredFrom::Encrypted { at_ms } = from
+            && let Err(e) = self.count_restore_as_verified(at_ms)
+        {
+            warn!("the restore did not advance the backup password schedule: {e}");
+        }
+        Ok(())
+    }
 
-        let mut decompressor = zstd::Decoder::new(backup_file.try_into_std().map_err(|_| {
-            DbError::Generic {
-                message:
-                    "The file used to restore the backup is used elsewhere which is not allowed"
-                        .into(),
-            }
-        })?)?;
+    /// Runs after the database is already replaced, so a failure here must not fail the restore.
+    fn count_restore_as_verified(&self, at_ms: i64) -> Result<(), DbError> {
+        match self.handle_get_backup_secret()? {
+            Some(stored) => self.handle_store_verification_schedule(
+                stored.schedule.verified(VerifyEvent::Correct, at_ms),
+            ),
+            None => Ok(()),
+        }
+    }
 
-        let temp_filename = format!("{}_restore_temp.sqlite", Uuid::new_v4());
-        let temp_path = std::env::temp_dir().join(temp_filename);
+    fn handle_get_backup_secret(&self) -> Result<Option<StoredBackupSecret>, DbError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT salt, m_cost_kib, t_cost, p_cost, key, verify_gap, verify_due_at_ms, \
+                 verify_missed FROM backup_secret WHERE id = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, [u8; _]>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, u32>(2)?,
+                        row.get::<_, u32>(3)?,
+                        row.get::<_, [u8; _]>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, bool>(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((salt, m_cost, t_cost, p_cost, key, gap, due_at_ms, missed)) = row else {
+            return Ok(None);
+        };
+        let conversion = |message: String| DbError::DataConversion { message };
+        let params =
+            KdfParams::new(m_cost, t_cost, p_cost).map_err(|e| conversion(e.to_string()))?;
+        let gap = Gap::try_from(gap).map_err(|e| conversion(e.to_string()))?;
+        Ok(Some(StoredBackupSecret {
+            secret: BackupSecret::from_parts(Salt::from(salt), params, BackupKey::from(key)),
+            schedule: VerificationSchedule::from_parts(gap, due_at_ms, missed),
+        }))
+    }
 
-        debug!(
-            "creating temporary file for backup decompression at {:?}",
-            temp_path
-        );
-        let mut temp_file = fs::File::create(&temp_path)?;
+    fn handle_store_backup_secret(&self, stored: &StoredBackupSecret) -> Result<(), DbError> {
+        let StoredBackupSecret { secret, schedule } = stored;
+        self.conn.execute(
+            "INSERT INTO backup_secret (id, salt, m_cost_kib, t_cost, p_cost, key, verify_gap, \
+             verify_due_at_ms, verify_missed) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT(id) DO UPDATE SET salt = excluded.salt, m_cost_kib = excluded.m_cost_kib, \
+             t_cost = excluded.t_cost, p_cost = excluded.p_cost, key = excluded.key, \
+             verify_gap = excluded.verify_gap, verify_due_at_ms = excluded.verify_due_at_ms, \
+             verify_missed = excluded.verify_missed",
+            rusqlite::params![
+                secret.salt().as_bytes(),
+                secret.params().m_cost_kib(),
+                secret.params().t_cost(),
+                secret.params().p_cost(),
+                secret.key().as_bytes(),
+                i64::from(schedule.gap()),
+                schedule.due_at_ms(),
+                schedule.missed(),
+            ],
+        )?;
+        Ok(())
+    }
 
-        debug!("decompressing backup into temporary file");
-        io::copy(&mut decompressor, &mut temp_file)?;
-        drop(temp_file);
-
-        debug!("replacing current database with restored database");
-
-        let mut backup_conn = Connection::open(&temp_path)?;
-
-        debug!("Running migrations on restored database if needed");
-        run_migrations(&mut backup_conn)?;
-
-        let restore = Backup::new(&backup_conn, &mut self.conn)?;
-        restore.step(-1)?;
-        drop(restore);
-        backup_conn.close().map_err(|(_, e)| e)?;
-
-        debug!("cleaning up temporary file {}", temp_path.display());
-        fs::remove_file(&temp_path)?;
-
+    fn handle_store_verification_schedule(
+        &self,
+        schedule: VerificationSchedule,
+    ) -> Result<(), DbError> {
+        self.conn.execute(
+            "UPDATE backup_secret SET verify_gap = ?1, verify_due_at_ms = ?2, verify_missed = ?3 \
+             WHERE id = 1",
+            rusqlite::params![
+                i64::from(schedule.gap()),
+                schedule.due_at_ms(),
+                schedule.missed(),
+            ],
+        )?;
         Ok(())
     }
 
     /// Current version of the binary settings format, stored alongside the blob for future migrations.
     const SETTINGS_VERSION: Version = Version::new(1, 0, 0);
 
-    fn handle_get_settings(&self) -> Result<Vec<u8>, DbError> {
+    fn handle_get_settings(&self) -> Result<SettingsBlob, DbError> {
         let result: Option<Vec<u8>> = self
             .conn
             .query_row("SELECT data FROM settings WHERE id = 1", [], |row| {
                 row.get(0)
             })
             .optional()?;
-        Ok(result.unwrap_or_default())
+        Ok(SettingsBlob(result.unwrap_or_default()))
     }
 
-    fn handle_store_settings(&self, data: Vec<u8>) -> Result<(), DbError> {
+    fn handle_store_settings(&self, data: SettingsBlob) -> Result<(), DbError> {
         self.conn.execute(
             "INSERT INTO settings (id, data, version) VALUES (1, ?1, ?2) \
              ON CONFLICT(id) DO UPDATE SET data = excluded.data, version = excluded.version",
-            rusqlite::params![&data, Self::SETTINGS_VERSION.to_string()],
+            rusqlite::params![&data.0, Self::SETTINGS_VERSION.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Current version of the binary license-cache format, stored alongside the blob for
+    /// future migrations.
+    const LICENSE_CACHE_VERSION: Version = Version::new(1, 0, 0);
+
+    fn handle_get_license_cache(&self) -> Result<Option<Vec<u8>>, DbError> {
+        let result: Option<Vec<u8>> = self
+            .conn
+            .query_row("SELECT data FROM license_cache WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(result)
+    }
+
+    fn handle_store_license_cache(&self, data: Vec<u8>) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO license_cache (id, data, version) VALUES (1, ?1, ?2) \
+             ON CONFLICT(id) DO UPDATE SET data = excluded.data, version = excluded.version",
+            rusqlite::params![&data, Self::LICENSE_CACHE_VERSION.to_string()],
+        )?;
+        Ok(())
+    }
+
+    fn handle_get_listen_port(&self) -> Result<Option<ListenPort>, DbError> {
+        let stored: Option<u32> = self
+            .conn
+            .query_row("SELECT port FROM listen_port WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        stored
+            .map(|port| {
+                ListenPort::try_from(port).map_err(|e| DbError::DataConversion {
+                    message: e.to_string(),
+                })
+            })
+            .transpose()
+    }
+
+    fn handle_store_listen_port(&self, port: ListenPort) -> Result<(), DbError> {
+        self.conn.execute(
+            "INSERT INTO listen_port (id, port) VALUES (1, ?1) \
+             ON CONFLICT(id) DO UPDATE SET port = excluded.port",
+            [port.get()],
         )?;
         Ok(())
     }
@@ -2315,18 +2323,37 @@ impl SqliteActor {
 
     /// Reconcile into the loaded (genesis-descended) document, never a fresh one — that
     /// shared root is what makes devices converge on sync.
-    fn mutate_sync_view<T, F>(&self, kind: DocKind, f: F) -> Result<(), DbError>
+    fn mutate_sync_view<T, F, R>(&self, kind: DocKind, f: F) -> Result<R, DbError>
     where
         T: autosurgeon::Hydrate + autosurgeon::Reconcile,
-        F: FnOnce(&mut T),
+        F: FnOnce(&mut T) -> R,
     {
         let blob = self.handle_get_sync_doc(kind)?;
         let mut doc = sync::load(&blob).map_err(sync_db_err)?;
         let mut view: T = sync::hydrate(&doc).map_err(sync_db_err)?;
-        f(&mut view);
+        let outcome = f(&mut view);
         sync::reconcile(&mut doc, &view).map_err(sync_db_err)?;
         let new_blob = doc.save();
-        self.handle_save_sync_doc(kind, new_blob)
+        self.handle_save_sync_doc(kind, new_blob)?;
+        Ok(outcome)
+    }
+
+    fn handle_mutate_devices_doc(
+        &self,
+        f: Box<dyn for<'a> FnOnce(&'a mut DevicesDoc) -> DeviceChange + Send>,
+    ) -> Result<DeviceChange, DbError> {
+        self.mutate_sync_view(DocKind::Devices, f)
+    }
+
+    fn handle_merge_sync_doc(
+        &self,
+        kind: DocKind,
+        mut incoming: Box<AutoCommit>,
+    ) -> Result<(), DbError> {
+        let blob = self.handle_get_sync_doc(kind)?;
+        let mut stored = sync::load(&blob).map_err(sync_db_err)?;
+        sync::merge(&mut stored, &mut incoming).map_err(sync_db_err)?;
+        self.handle_save_sync_doc(kind, stored.save())
     }
 }
 

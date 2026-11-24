@@ -1,6 +1,6 @@
-use crate::crypto::Session as CryptoSession;
 use crate::utils::W;
 use async_trait::async_trait;
+use crypto::session::Session as CryptoSession;
 use crypto::{DeSerCryptError, Decrypt, Encrypt, Encrypted, SerCryptError};
 use fyles_core::core::domain_models::ContactId;
 use serde::de::DeserializeOwned;
