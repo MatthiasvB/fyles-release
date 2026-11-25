@@ -38,9 +38,9 @@ The distinguishing properties are:
 
 It runs on **Android, Linux, Windows, iOS and macOS**. On a local network (e.g. home Wi-Fi) it
 works reliably and crosses platform boundaries — much like AirDrop (Apple) or Quick Share
-(Android), but between *any* of those platforms. Over the open internet, direct connectivity is
-inherently less reliable (a limitation of how the internet is built). Optional relays are a
-planned remedy that would not compromise the serverless design for local use.
+(Android), but between *any* of those platforms. Over the open internet, direct connections are
+inherently less reliable, since routers and firewalls often stand between two devices, so Internet
+mode is experimental.
 
 Security is taken seriously: identities use **post-quantum** cryptography alongside classical
 schemes, so transfers should remain confidential even against a hypothetical future quantum
@@ -266,9 +266,9 @@ sudo ufw allow 5353/udp
 ### Without Nix (untested)
 
 On an ordinary distribution it *may* work to run the release tarball's binaries directly. Nobody
-tests this, and nothing here supports it. The binaries need glibc 2.39 or newer and the libstdc++ of
-GCC 13 or newer (Ubuntu 24.04, Fedora 40, Arch and newer), plus GTK 3, which every GNOME or KDE
-desktop has. The required versions can rise with any release.
+tests this, and nothing here supports it. The binaries are built against a recent glibc and
+libstdc++ and need GTK 3, so a current distribution has the best chance, and an older one may refuse
+to start them.
 
 Download `fyles-<version>-linux-x86_64.tar.gz` from the
 [releases](https://github.com/MatthiasvB/fyles-release/releases) and unpack it. Start the daemon
@@ -346,23 +346,16 @@ The full architecture documentation lives in **[`docs/`](docs/ARCHITECTURE.md)**
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), which links to focused sub-documents on the
 [backend](docs/architecture/backend.md), [networking & P2P](docs/architecture/networking.md),
 [security & cryptography](docs/architecture/security.md), and the
-[wire protocol](docs/architecture/wire-protocol.md). A few highlights:
+[wire protocol](docs/architecture/wire-protocol.md). They describe the details, so this page keeps
+to the outline:
 
-The system is **hexagonal** (ports & adapters). The `core` crate defines abstract ports — database,
-networking, file I/O, the API server — as Rust traits. Concrete adapters (`p2p/`,
-`direct_host_utils/`, the SQLite layer, …) are injected at startup via factory closures. The same
-core can therefore run as a desktop daemon, an Android service, or an iOS background task. The
-domain core, `Brain`, is an **actor**: it owns all state and runs a `tokio::select!` loop consuming
-typed command messages over an `mpsc` channel — no shared mutable state, no locks in the hot path.
-
-Files are transferred in **chunks** over libp2p — resumably, and **encrypted per session**
-(ChaCha20-Poly1305 with keys from a hybrid X25519 + Kyber exchange). Authorization is by
-cryptographic identity: when the first chunk of a transfer arrives, the receiver verifies 
-that the sender is authorized for that particular filerequest before accepting any data.
-
-Users don't manage device lists. All devices belonging to one user share the same cryptographic
-material (`ContactKeys`, signing with Ed25519 and Dilithium5). Because they sign with the same keys, the
-network mathematically recognises them as the **same contact**.
+- **Hexagonal core.** The `core` crate defines its ports (database, networking, file I/O, the API
+  server) as traits, and each platform plugs in its own adapters. The same core runs as a desktop
+  daemon, an Android service and an iOS background task.
+- **Transfers are end-to-end encrypted and resumable.** A receiver accepts data only from a sender
+  its cryptographic identity proves to be authorized for that request.
+- **Devices, not accounts.** All devices of one user share the same identity keys, so the network
+  recognises them as the same contact without a server keeping a device list.
 
 > **Note:** the `docs/` tree describes the **complete** Fyles system — including the Flutter
 > frontend and the internet transport that are *not* part of this repository (see the open-source
