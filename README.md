@@ -8,19 +8,38 @@
 Fyles is a cross-platform peer-to-peer file-sharing application. It recreates the convenience of
 the "share a link and receive files" workflow you know from OneDrive / Google Drive / Dropbox, but
 **without** any central service: there is no server, no account, and no third party that can see
-your data. Devices establish direct, end-to-end encrypted connections to each other.
+your files. Devices establish direct, end-to-end encrypted connections to each other.
 
 The distinguishing properties are:
 
-- **Strong data security** — files never leave the users' devices; nothing is stored on, or
+- **Strong data security** — files never leave the users' devices. Nothing is stored on, or
   visible to, a provider.
 - **No dependence** on a service that can fail, be shut down, or be surveilled.
 - **Nothing to operate** — no server infrastructure to run.
 
+> [!WARNING]
+> **These properties hold in full only while Internet mode is off, which is the default.**
+> Internet mode joins the public IPFS network, which third parties run, and to work at all it
+> publishes metadata that anyone can read and record:
+>
+> - **Where your device is.** So that contacts can find it, the device publishes an entry in the
+>   network's public distributed hash table: its device identifier with its current IP addresses
+>   and ports. The identifier never changes. Anyone who knows it, or who watches the table, can
+>   follow which addresses a device uses over time, and so roughly where it is and through which
+>   provider.
+> - **Whom you look for.** Finding a contact means asking the network's nodes for that contact's
+>   device identifier. Those nodes, and anyone watching them, see which device asks for which.
+> - **When you connect, and to whom.** Relay nodes that help two devices reach each other see both
+>   devices' addresses and when they connect.
+>
+> File contents stay end-to-end encrypted, and no third party stores them. But Internet mode does
+> depend on a public network and its bootstrap nodes, which can fail, be blocked or be surveilled.
+> If metadata matters to you, keep Internet mode off.
+
 It runs on **Android, Linux, Windows, iOS and macOS**. On a local network (e.g. home Wi-Fi) it
 works reliably and crosses platform boundaries — much like AirDrop (Apple) or Quick Share
 (Android), but between *any* of those platforms. Over the open internet, direct connectivity is
-inherently less reliable (a limitation of how the internet is built); optional relays are a
+inherently less reliable (a limitation of how the internet is built). Optional relays are a
 planned remedy that would not compromise the serverless design for local use.
 
 Security is taken seriously: identities use **post-quantum** cryptography alongside classical
@@ -288,7 +307,7 @@ The full architecture documentation lives in **[`docs/`](docs/ARCHITECTURE.md)**
 [wire protocol](docs/architecture/wire-protocol.md). A few highlights:
 
 The system is **hexagonal** (ports & adapters). The `core` crate defines abstract ports — database,
-networking, file I/O, the API server — as Rust traits; concrete adapters (`p2p/`,
+networking, file I/O, the API server — as Rust traits. Concrete adapters (`p2p/`,
 `direct_host_utils/`, the SQLite layer, …) are injected at startup via factory closures. The same
 core can therefore run as a desktop daemon, an Android service, or an iOS background task. The
 domain core, `Brain`, is an **actor**: it owns all state and runs a `tokio::select!` loop consuming
@@ -300,7 +319,7 @@ cryptographic identity: when the first chunk of a transfer arrives, the receiver
 that the sender is authorized for that particular filerequest before accepting any data.
 
 Users don't manage device lists. All devices belonging to one user share the same cryptographic
-material (`ContactKeys`; Ed25519 + Dilithium5 signing). Because they sign with the same keys, the
+material (`ContactKeys`, signing with Ed25519 and Dilithium5). Because they sign with the same keys, the
 network mathematically recognises them as the **same contact**.
 
 > **Note:** the `docs/` tree describes the **complete** Fyles system — including the Flutter
