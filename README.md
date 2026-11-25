@@ -71,6 +71,25 @@ For the licence, see [Licence](#licence): source-available, **not** open source.
 The flake offers the Linux app prebuilt, for x86_64. It is built from the private monorepo and
 patched against this flake's nixpkgs, so it runs on NixOS and on any Linux with Nix.
 
+Pick the setup that matches how your system is already configured:
+
+- **Is the computer running NixOS?**
+  - **No.** Do you manage your user with Home Manager?
+    - Yes → [Home Manager on another distribution](#home-manager-on-another-distribution)
+    - No → [Nix without a configuration](#nix-without-a-configuration)
+  - **Yes.** Is Home Manager part of your system configuration (`home-manager.nixosModules`)?
+    - Yes → [NixOS with Home Manager as a NixOS module](#nixos-with-home-manager-as-a-nixos-module)
+    - No, it runs on its own, or not at all →
+      [NixOS without Home Manager](#nixos-without-home-manager)
+
+Without Nix, see [Without Nix (untested)](#without-nix-untested).
+
+Only the NixOS setups can open the firewall for you, with `openFirewall`. With Home Manager on its
+own, the system configuration never sees Home Manager's settings, so configure Fyles in the system
+configuration instead.
+
+### Nix without a configuration
+
 Fyles is not free software, so Nix installs it only once you allow that:
 
 ```sh
@@ -89,11 +108,10 @@ systemctl --user enable --now fyles-daemon
 Received files go to `~/Downloads/Fyles`. Other devices reach yours on a port the app picks, which
 a firewall must let in, together with mDNS (5353/udp).
 
-### NixOS with Home Manager
+### NixOS with Home Manager as a NixOS module
 
-This is the usual setup: each user configures Fyles in their own Home Manager configuration, and
-the system opens their port in the firewall. A complete system flake, next to an existing
-`configuration.nix`, looks like this:
+Each user configures Fyles in their own Home Manager configuration, and the system opens their port
+in the firewall. A complete system flake, next to an existing `configuration.nix`, looks like this:
 
 ```nix
 {
@@ -152,7 +170,9 @@ port of their own, since two users cannot share one. Apply it with
 
 ### NixOS without Home Manager
 
-The same settings live in the system configuration, one entry per user:
+The same settings live in the system configuration, one entry per user. This is also the setup for
+NixOS with a Home Manager that runs on its own. Leave `programs.fyles` out of Home Manager there.
+Otherwise Home Manager's unit replaces the system's, and its settings quietly win over these.
 
 ```nix
 {
@@ -242,6 +262,28 @@ sudo ufw allow 5353/udp
   flake's own, at the cost of a second copy of GTK in the store.
 - Outside NixOS, a Nix-installed GUI app may need [nixGL](https://github.com/nix-community/nixGL)
   to find the system's OpenGL driver.
+
+### Without Nix (untested)
+
+On an ordinary distribution it *may* work to run the release tarball's binaries directly. Nobody
+tests this, and nothing here supports it. The binaries need glibc 2.39 or newer and the libstdc++ of
+GCC 13 or newer (Ubuntu 24.04, Fedora 40, Arch and newer), plus GTK 3, which every GNOME or KDE
+desktop has. The required versions can rise with any release.
+
+Download `fyles-<version>-linux-x86_64.tar.gz` from the
+[releases](https://github.com/MatthiasvB/fyles-release/releases) and unpack it. Start the daemon
+first, at the socket the app looks for, then the app:
+
+```sh
+mkdir -p ~/.local/share/fyles ~/Downloads/Fyles
+bin/fyles-daemon \
+  --endpoint "uds:$XDG_RUNTIME_DIR/fyles.sock" \
+  --db-path ~/.local/share/fyles/fyles.db \
+  --output-dir ~/Downloads/Fyles &
+app/Fyles
+```
+
+Files only arrive while the daemon runs, and nothing starts it at login or updates it for you.
 
 ## Install on Android
 
