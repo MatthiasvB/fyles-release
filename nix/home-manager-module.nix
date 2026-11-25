@@ -26,8 +26,18 @@ in {
       default = null;
       description = ''
         Pins the port other devices reach this user's node on, over TCP and UDP. Unset leaves it
-        to the app. A firewall must let it in, which the Fyles NixOS module does when Home Manager
-        runs inside NixOS.
+        to the app. A firewall must let it in, see openFirewall.
+      '';
+    };
+    openFirewall = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Opens listenPort over TCP and UDP in the NixOS firewall. It also opens mDNS (5353/udp), which
+        devices nearby need to find this one. mDNS is one port for the whole system, so it is open
+        while any Fyles user sets openFirewall, and closed when none does. Only takes effect when
+        Home Manager runs inside NixOS with the Fyles NixOS module imported. Elsewhere, Home Manager
+        cannot change a firewall.
       '';
     };
   };
@@ -37,8 +47,10 @@ in {
     systemd.user.services.fyles-daemon = {
       Unit.Description = "Fyles daemon";
       Service = {
+        ExecStartPre = "${cfg.package}/libexec/fyles/wait-for-dns";
         ExecStart = lib.getExe' cfg.package "fyles-daemon-start";
         Restart = "on-failure";
+        RestartSec = 5;
         SuccessExitStatus = toString cfg.package.passthru.exitAlreadyRunning;
         Environment =
           lib.optional (cfg.outputDir != null) "FYLES_OUTPUT_DIR=${cfg.outputDir}"

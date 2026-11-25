@@ -2,8 +2,10 @@
 Description=Fyles daemon
 
 [Service]
+ExecStartPre=@out@/libexec/fyles/wait-for-dns
 ExecStart=@out@/bin/fyles-daemon-start
 Restart=on-failure
+RestartSec=5
 SuccessExitStatus=@exitAlreadyRunning@
 
 [Install]

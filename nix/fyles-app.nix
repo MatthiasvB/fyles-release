@@ -1,4 +1,4 @@
-# The Linux app, packaged from the prebuilt tarball that fyles/release_linux.sh produces. The source
+# The Linux app, packaged from the prebuilt tarball that fyles/release/linux.py produces. The source
 # is not public, so the binaries are patched against this flake's nixpkgs rather than built here
 # (docs/architecture/adr/0013-linux-through-nix.md).
 {
@@ -12,6 +12,7 @@
   makeDesktopItem,
   runtimeShell,
   coreutils,
+  gnugrep,
   util-linux,
   xdg-user-dirs,
   gtk3,
@@ -61,7 +62,10 @@ in
 
     desktopItems = [
       (makeDesktopItem {
-        name = "fyles";
+        # Wayland compositors find a window's icon through the desktop file named after its app
+        # ID, which is APPLICATION_ID in fyles/linux/CMakeLists.txt.
+        name = "app.fyles.fyles";
+        startupWMClass = "app.fyles.fyles";
         desktopName = "Fyles";
         exec = "fyles";
         icon = "fyles";
@@ -73,7 +77,7 @@ in
     installPhase = ''
       runHook preInstall
 
-      mkdir -p $out/lib/fyles $out/lib/systemd/user
+      mkdir -p $out/lib/fyles $out/lib/systemd/user $out/libexec/fyles
       cp -r app/. $out/lib/fyles/
       install -Dm755 bin/fyles-daemon $out/bin/fyles-daemon
       install -Dm644 share/fyles.png $out/share/icons/hicolor/512x512/apps/fyles.png
@@ -88,7 +92,11 @@ in
         --subst-var-by coreutils ${coreutils} \
         --subst-var-by utilLinux ${util-linux} \
         --subst-var out
-      chmod +x $out/bin/fyles-daemon-start $out/bin/fyles
+      substitute ${./fyles/wait-for-dns.sh} $out/libexec/fyles/wait-for-dns \
+        --subst-var-by shell ${runtimeShell} \
+        --subst-var-by coreutils ${coreutils} \
+        --subst-var-by gnugrep ${gnugrep}
+      chmod +x $out/bin/fyles-daemon-start $out/bin/fyles $out/libexec/fyles/wait-for-dns
       substitute ${./fyles/fyles-daemon.service} $out/lib/systemd/user/fyles-daemon.service \
         --subst-var-by exitAlreadyRunning ${toString exitAlreadyRunning} \
         --subst-var out

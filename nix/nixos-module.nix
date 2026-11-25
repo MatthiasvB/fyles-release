@@ -23,6 +23,15 @@
         default = null;
         description = "Pins the port other devices reach this user's node on. Unset leaves it to the app.";
       };
+      openFirewall = lib.mkOption {
+        type = lib.types.bool;
+        default = false;
+        description = ''
+          Opens this user's listenPort over TCP and UDP in the firewall. It also opens mDNS (5353/udp),
+          which devices nearby need to find this one. mDNS is one port for the whole system, so it is
+          open while any Fyles user sets openFirewall, and closed when none does.
+        '';
+      };
     };
   };
 
@@ -30,10 +39,12 @@
     lib.optionalAttrs hasHomeManager
     (lib.filterAttrs (_: user: user.programs.fyles.enable) config.home-manager.users);
 
-  ports = lib.filter (port: port != null) (
-    lib.mapAttrsToList (_: user: user.listenPort) cfg.users
-    ++ lib.mapAttrsToList (_: user: user.programs.fyles.listenPort) homeManagerUsers
-  );
+  # Every Fyles user's settings, whether from programs.fyles.users or from Home Manager.
+  fylesUsers =
+    cfg.users
+    // lib.mapAttrs (_: user: user.programs.fyles) homeManagerUsers;
+  ports = lib.filter (port: port != null) (lib.mapAttrsToList (_: user: user.listenPort) fylesUsers);
+  openPorts = lib.mapAttrsToList (_: user: user.listenPort) (lib.filterAttrs (_: user: user.openFirewall) fylesUsers);
 
   # NixOS user units apply to every user, so the unit picks the logged-in user's settings.
   startForUser = pkgs.writeShellScript "fyles-daemon-for-user" ''
@@ -58,11 +69,6 @@ in {
       default = fylesFor pkgs;
       defaultText = lib.literalMD "the flake's package, allowed by this configuration's unfree policy";
     };
-    openFirewall = lib.mkOption {
-      type = lib.types.bool;
-      default = true;
-      description = "Opens mDNS (5353/udp) and every pinned listen port, over TCP and UDP.";
-    };
     users = lib.mkOption {
       type = lib.types.attrsOf (lib.types.submodule userOptions);
       default = {};
@@ -81,29 +87,37 @@ in {
         description = "Fyles daemon";
         wantedBy = ["default.target"];
         serviceConfig = {
+          ExecStartPre = "${cfg.package}/libexec/fyles/wait-for-dns";
           ExecStart = startForUser;
           Restart = "on-failure";
+          RestartSec = 5;
           SuccessExitStatus = toString cfg.package.passthru.exitAlreadyRunning;
         };
       };
     })
 
-    (lib.mkIf (cfg.openFirewall && (cfg.users != {} || homeManagerUsers != {})) {
-      networking.firewall.allowedUDPPorts = [5353] ++ ports;
-      networking.firewall.allowedTCPPorts = ports;
+    (lib.mkIf (openPorts != []) {
+      networking.firewall.allowedUDPPorts = [5353] ++ openPorts;
+      networking.firewall.allowedTCPPorts = openPorts;
     })
 
     {
-      assertions = [
-        {
-          assertion = lib.allUnique ports;
-          message = "Two Fyles users pin the same listen port.";
-        }
-        {
-          assertion = lib.intersectLists (lib.attrNames cfg.users) (lib.attrNames homeManagerUsers) == [];
-          message = "Configure a Fyles user either in programs.fyles.users or in Home Manager, not both.";
-        }
-      ];
+      assertions =
+        [
+          {
+            assertion = lib.allUnique ports;
+            message = "Two Fyles users pin the same listen port.";
+          }
+          {
+            assertion = lib.intersectLists (lib.attrNames cfg.users) (lib.attrNames homeManagerUsers) == [];
+            message = "Configure a Fyles user either in programs.fyles.users or in Home Manager, not both.";
+          }
+        ]
+        ++ lib.mapAttrsToList (name: user: {
+          assertion = user.openFirewall -> user.listenPort != null;
+          message = "Fyles user ${name} sets openFirewall without a listenPort, but only a pinned port can be opened.";
+        })
+        fylesUsers;
     }
   ];
 }

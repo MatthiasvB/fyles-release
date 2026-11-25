@@ -32,3 +32,4 @@ One file per decision: `NNNN-kebab-case-title.md`, numbered sequentially. Sectio
 | [0011](0011-file-data-on-streams.md) | File data travels on one authenticated stream per attempt |
 | [0012](0012-password-encrypted-backups.md) | Backups are encrypted with a password the device remembers as a key |
 | [0013](0013-linux-through-nix.md) | Fyles reaches Linux through Nix, as prebuilt binaries |
+| [0014](0014-one-release-for-every-platform.md) | One GitHub release carries every platform's build |

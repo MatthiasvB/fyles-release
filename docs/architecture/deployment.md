@@ -83,8 +83,8 @@ Fyles reaches Linux as a Nix package ([ADR 0013](adr/0013-linux-through-nix.md))
 - The daemon holds `<db-path>.lock`, and `<socket>.lock` for a Unix socket, for its life. A
   second daemon on the same database or socket exits with 75. The units count that as a clean
   exit, so they neither restart nor show as failed, and starting a daemon needs no check.
-- `--listen-port` (or `FYLES_LISTEN_PORT`) pins the peer port, which the modules also open in the
-  NixOS firewall.
+- `--listen-port` (or `FYLES_LISTEN_PORT`) pins the peer port. A user's `openFirewall` opens it,
+  and mDNS, in the NixOS firewall.
 
 **macOS** (UDS): the daemon binds gRPC to a Unix Domain Socket at
 `~/Library/Application Support/Fyles/fyles.sock`, and the Flutter app connects to the same fixed path
@@ -376,6 +376,10 @@ storePassword=…
 
 `storeFile` is relative to `fyles/android/`. The keystore is PKCS12, which keeps the key under the store password, so there is no separate key password. Without `key.properties` every build falls back to the debug key and the build output says so. Google Play rejects such a bundle. A `key.properties` that lacks one of the three entries fails the build.
 
+### 4.7 Release APKs
+
+`release/android.py` builds the APKs that a GitHub release of fyles-release carries ([ADR 0014](adr/0014-one-release-for-every-platform.md)): one each for `arm64-v8a`, `armeabi-v7a` and `x86_64`, and a universal one with all three. Each is built with `--target-platform`, and `fyles/android/app/build.gradle` derives Gradle's `abiFilters` from the target platforms (`gradle.properties` turns off Flutter's own filtering, which would replace them with every ABI), which also drops the native code that plugins ship for every ABI. All of them share the versionCode from `pubspec.yaml`. The script refuses a missing `key.properties`, since Gradle would quietly sign with the debug key, and checks every APK's ABIs, certificate and contents.
+
 ---
 
 ## 5. iOS Deployment
@@ -487,6 +491,7 @@ therefore `isExpensive`, is also unreachable. Both need a real device.
 | `build.sh` | Orchestrates full build: server + Flutter for current or specified platform |
 | `server_build.sh` | Builds backend binaries with cross-compilation support |
 | `fyles_service/build_android.sh` | Cross-compiles Rust for `aarch64-linux-android` |
+| `release/linux.py`, `release/android.py` | Build a release's assets into `fyles/build/release/v<version>/` ([ADR 0014](adr/0014-one-release-for-every-platform.md)) |
 | `c_ffi/build_ios.sh` | Builds iOS static library |
 | `c_ffi/build_full_ios.sh` | Full iOS build including universal binary creation |
 | `FylesInstaller.iss` | Inno Setup script for Windows installer |

@@ -33,8 +33,10 @@ This is a **curated, source-available subset** of the Fyles codebase, published 
 **transparency and code review** — so that interested (and especially security-minded) readers can
 inspect how authentication, authorization and encryption are actually implemented.
 
-**The source is meant to be read, not used as a product.** The one way to use Fyles from here is
-the prebuilt Linux app the flake offers, see [Install on Linux with Nix](#install-on-linux-with-nix).
+**The source is meant to be read, not used as a product.** What you can use from here are the
+prebuilt apps attached to the releases: for Linux through the flake, see
+[Install on Linux with Nix](#install-on-linux-with-nix), and for Android as APKs, see
+[Install on Android](#install-on-android).
 
 - It contains only the Rust backend crates that the `fyles-daemon` binary depends on. The
   **Flutter frontend** (the actual UI), the **internet-transport crates** (`*_internet`), and the
@@ -68,66 +70,151 @@ systemctl --user enable --now fyles-daemon
 Received files go to `~/Downloads/Fyles`. Other devices reach yours on a port the app picks, which
 a firewall must let in, together with mDNS (5353/udp).
 
-### NixOS
+### NixOS with Home Manager
 
-Add the input and the module to the system flake, and allow Fyles in the configuration's unfree
-policy:
-
-```nix
-inputs.fyles.url = "github:MatthiasvB/fyles-release";
-# in nixosSystem's modules:
-fyles.nixosModules.default
-# in the configuration:
-nixpkgs.config.allowUnfreePackages = [ "fyles" ];
-```
-
-With Home Manager inside NixOS, each user configures Fyles in their own Home Manager config, and
-the module opens the firewall for every pinned port:
+This is the usual setup: each user configures Fyles in their own Home Manager configuration, and
+the system opens their port in the firewall. A complete system flake, next to an existing
+`configuration.nix`, looks like this:
 
 ```nix
-home-manager.users.alice.programs.fyles = {
-  enable = true;
-  listenPort = 24001;
-};
-home-manager.users.bob.programs.fyles = {
-  enable = true;
-  listenPort = 24002;
-  outputDir = "/home/bob/Fyles";
-};
-```
-
-With `home-manager.useGlobalPkgs`, the system's unfree policy covers these users. Without it, each
-of them allows `fyles` in their own `nixpkgs.config`.
-
-Without Home Manager, the same settings live in the NixOS config:
-
-```nix
-programs.fyles.users = {
-  alice.listenPort = 24001;
-  bob = {
-    listenPort = 24002;
-    outputDir = "/home/bob/Fyles";
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    home-manager = {
+      url = "github:nix-community/home-manager";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    fyles.url = "github:MatthiasvB/fyles-release";
   };
-};
+
+  outputs = { nixpkgs, home-manager, fyles, ... }: {
+    nixosConfigurations.my-computer = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ./configuration.nix
+        home-manager.nixosModules.home-manager
+        fyles.nixosModules.default
+        {
+          nixpkgs.config.allowUnfreePackages = [ "fyles" ];
+          home-manager.useGlobalPkgs = true;
+
+          home-manager.users.alice = {
+            home.stateVersion = "26.05";
+            programs.fyles = {
+              enable = true;
+              listenPort = 24001;
+              openFirewall = true;
+            };
+          };
+        }
+      ];
+    };
+  };
+}
 ```
 
-Either way every listed user gets the daemon as a user service (`systemctl --user status
-fyles-daemon`), and the app shows the pinned port as set by the system.
+What the parts do:
+- `fyles.nixosModules.default` makes `programs.fyles` available in every Home Manager user's
+  configuration, and lets the system open the ports those users ask for.
+- `allowUnfreePackages` allows Fyles, which is not free software. `useGlobalPkgs` makes Home
+  Manager use the system's packages, so that allowance covers every user. Without it, each user
+  allows `fyles` in their own `nixpkgs.config`.
+- `enable` installs the app and runs the Fyles daemon as alice's user service from login.
+- `listenPort` pins the port other devices reach alice on. Leave it out and the app picks one, but
+  then no firewall can know it.
+- `openFirewall` opens that port over TCP and UDP, and mDNS (5353/udp) for finding devices nearby.
+- `outputDir = "/home/alice/Fyles";` would put received files somewhere other than
+  `~/Downloads/Fyles`.
+
+`alice` must be a user in `configuration.nix`. Each further user gets a block of their own, with a
+port of their own, since two users cannot share one. Apply it with
+`sudo nixos-rebuild switch --flake .#my-computer`, then check after logging in:
+`systemctl --user status fyles-daemon`. The app shows the pinned port as set by the system.
+
+### NixOS without Home Manager
+
+The same settings live in the system configuration, one entry per user:
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    fyles.url = "github:MatthiasvB/fyles-release";
+  };
+
+  outputs = { nixpkgs, fyles, ... }: {
+    nixosConfigurations.my-computer = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        ./configuration.nix
+        fyles.nixosModules.default
+        {
+          nixpkgs.config.allowUnfreePackages = [ "fyles" ];
+
+          programs.fyles.users = {
+            alice = {
+              listenPort = 24001;
+              openFirewall = true;
+            };
+            bob = {
+              listenPort = 24002;
+              openFirewall = true;
+              outputDir = "/home/bob/Fyles";
+            };
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+Every user listed gets the app and the daemon as a user service. The options mean the same as
+above.
 
 ### Home Manager on another distribution
 
 ```nix
-imports = [ fyles.homeManagerModules.default ];
-nixpkgs.config.allowUnfreePackages = [ "fyles" ];
-programs.fyles = {
-  enable = true;
-  listenPort = 24001;
-};
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    home-manager = {
+      url = "github:nix-community/home-manager";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    fyles.url = "github:MatthiasvB/fyles-release";
+  };
+
+  outputs = { nixpkgs, home-manager, fyles, ... }: {
+    homeConfigurations.alice = home-manager.lib.homeManagerConfiguration {
+      pkgs = import nixpkgs {
+        system = "x86_64-linux";
+        config.allowUnfreePackages = [ "fyles" ];
+      };
+      modules = [
+        fyles.homeManagerModules.default
+        {
+          home.username = "alice";
+          home.homeDirectory = "/home/alice";
+          home.stateVersion = "26.05";
+          programs.fyles = {
+            enable = true;
+            listenPort = 24001;
+          };
+        }
+      ];
+    };
+  };
+}
 ```
 
-With `home-manager.useGlobalPkgs`, the system configuration's unfree policy applies instead.
+Apply it with `home-manager switch --flake .#alice`. Home Manager cannot change a system firewall,
+so `openFirewall` has no effect here. Open the port yourself, with `ufw` for example:
 
-Home Manager cannot change a system firewall, so let that port in over TCP and UDP, and 5353/udp.
+```sh
+sudo ufw allow 24001
+sudo ufw allow 5353/udp
+```
 
 ### Notes
 
@@ -136,6 +223,41 @@ Home Manager cannot change a system firewall, so let that port in over TCP and U
   flake's own, at the cost of a second copy of GTK in the store.
 - Outside NixOS, a Nix-installed GUI app may need [nixGL](https://github.com/nix-community/nixGL)
   to find the system's OpenGL driver.
+
+## Install on Android
+
+Each [release](https://github.com/MatthiasvB/fyles-release/releases) carries four APKs. Download
+one onto the phone, open it, and allow the install when Android asks.
+
+> **Not sure which one? Take `…-android-universal.apk`.** It runs on every Android device that Fyles
+> supports. The others are a third of its size, which saves data if you know your device:
+>
+> | APK | Size | For |
+> |---|---|---|
+> | `…-android-arm64-v8a.apk` | about 40 MB | Nearly every phone and tablet from the last years. **Most likely yours.** |
+> | `…-android-armeabi-v7a.apk` | about 35 MB | Older or low-cost devices with a 32-bit system. |
+> | `…-android-x86_64.apk` | about 40 MB | Emulators and some Chromebooks. |
+> | `…-android-universal.apk` | about 105 MB | All of the above. |
+>
+> If you pick one that does not fit your device, Android refuses with "App not installed", and
+> nothing on the phone changes. Then take the universal one.
+
+All four are the same app with the same version, so a later release updates whichever one you
+installed, and you can switch between them at any time.
+
+**Coming from Google Play?** A Play install may be signed with a different key than these APKs. If
+it is, Android refuses to install one over the other. To switch, make a backup in the app first,
+uninstall, install the other, and restore the backup.
+
+**To verify a download,** compare `sha256sum` of the file with the digest GitHub shows beside
+it, and check who signed it:
+
+```sh
+apksigner verify --print-certs fyles-*-android-arm64-v8a.apk
+```
+
+The signing certificate's SHA-256 must be
+`52a65ec91e09079994a0229775a368ecb2b31c59f03c24b6f745e9ace8055aa3`.
 
 ## What's in here
 
@@ -195,8 +317,8 @@ rights to use, build, redistribute, or create derivative works are granted. All 
 The one exception is the Nix packaging, `flake.nix` and the files under `nix/`. You may use it to
 install and run Fyles as described in [Install on Linux with Nix](#install-on-linux-with-nix).
 
-The Fyles app itself, including the prebuilt Linux binaries attached to this repository's releases,
-is governed by the [Terms of Use](https://fyles.app/en/terms).
+The Fyles app itself, including the prebuilt apps attached to this repository's releases, is
+governed by the [Terms of Use](https://fyles.app/en/terms).
 
 `fyles_service/zxcvbn_lite/` holds third-party code under the MIT licence, which its own `LICENSE`
 file grants.
