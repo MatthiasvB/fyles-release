@@ -1918,7 +1918,7 @@ impl GigaBrain {
                     }
                 }
             },
-            NetworkNodeAction::ContactShareReceived(share) => {
+            NetworkNodeAction::ContactShareReceived { share, from } => {
                 let verified = share
                     .verify()
                     .inspect_err(|error| warn!(%error, "Rejecting contact share"))
@@ -1928,6 +1928,9 @@ impl GigaBrain {
                     Some(contact) => match self.db.update_contact_projection(contact).await {
                         Ok(write) => {
                             self.commit_local_write(write).await;
+                            // The share came over a session set up before we knew the sender,
+                            // which authenticates nobody. The sharer still holds its copy.
+                            self.network.read().await.discard_session(from).await;
                             self.client_push_sender
                                 .send(ServerMessage::contact_share_accepted_over_network())
                                 .await

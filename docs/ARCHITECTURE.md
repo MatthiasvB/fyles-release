@@ -118,6 +118,8 @@ Each sub-document covers one major area in depth:
 | [Design Patterns](../fyles_service/DESIGN_PATTERNS.md) | Catalogue of 22 identified patterns across frontend and backend |
 
 Cross-cutting decisions are recorded as [Architecture Decision Records](architecture/adr/README.md).
+States the code can reach and that we leave wrong on purpose are listed in
+[Accepted Inconsistencies](architecture/accepted-inconsistencies.md).
 
 ---
 

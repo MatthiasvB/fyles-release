@@ -129,7 +129,10 @@ pub enum NetworkNodeAction {
     RejectedSelfContactInvite,
     SelfContactInviteGotRejected,
     ValidateContactShareChallenge(BrainRequest<ContactShareChallenge, Option<SignedContactShare>>),
-    ContactShareReceived(SignedContactShare),
+    ContactShareReceived {
+        share: SignedContactShare,
+        from: PeerIdWrapper,
+    },
     AnsweredContactShare,
     RejectedContactShare,
     ContactShareGotRejected,

@@ -283,7 +283,10 @@ impl<T: FileTracker, S: LocalNetworkSwarm> ResponseReceiver<SignedContactShare>
         trace!("Received contact share response from {node_id:?}");
         self.brain_action_sender
             .send(BrainAction::NetworkNode(
-                NetworkNodeAction::ContactShareReceived(response),
+                NetworkNodeAction::ContactShareReceived {
+                    share: response,
+                    from: node_id.wrap(),
+                },
             ))
             .await
             .expect("Sending to work");

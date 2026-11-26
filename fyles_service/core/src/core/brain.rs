@@ -120,7 +120,6 @@ pub struct Brain {
     pub action_interceptor: Arc<Mutex<Option<ActionInterceptor>>>,
 }
 
-/// What the host decides about a node before it starts.
 #[derive(Debug, Clone)]
 pub struct NodeSettings {
     pub internal_data_dir: PathBuf,

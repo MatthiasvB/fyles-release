@@ -362,7 +362,7 @@ where
                             return;
                         };
                         if requires_new_session {
-                            self.clear_session(node_id.clone()).await;
+                            self.retire_session(node_id.clone()).await;
                         }
                         match self
                             .send_internal(

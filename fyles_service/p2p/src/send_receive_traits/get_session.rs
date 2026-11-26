@@ -59,9 +59,12 @@ pub trait GetSession {
     /// the current session, if one exists, should be in the first position.
     async fn get_recent_receive_sessions(&self, node_id: &Self::NodeId) -> Vec<Self::Session>;
 
-    /// Clears the active session. Does not affect sessions that are in the process
-    /// of being established
-    async fn clear_session(&self, node_id: Self::NodeId);
+    /// Moves the active session to the expired-session cache, where late messages can still be
+    /// decrypted. Does not affect sessions that are still being established.
+    async fn retire_session(&self, node_id: Self::NodeId);
+    /// Unlike [`Self::retire_session`], keeps no copy for late messages. A peer still sending on
+    /// its own copy is answered `MissingSession`, and so establishes a new session.
+    async fn discard_session(&self, node_id: Self::NodeId);
 }
 
 pub struct SessionManager<NodeId: Hash + Eq + Send, ContactId: Clone, Swarm: LocalNetworkSwarm> {
@@ -494,11 +497,20 @@ impl<Swarm: LocalNetworkSwarm + 'static> GetSession for SessionManager<PeerId, C
             .collect()
     }
 
-    async fn clear_session(&self, node_id: Self::NodeId) {
-        debug!(peer=?node_id, "Clearing session");
+    async fn retire_session(&self, node_id: Self::NodeId) {
+        debug!(peer=?node_id, "Retiring session");
         let mut session_store = self.session_store.timeout_lock().await;
         if let Some(session) = session_store.store.remove(&node_id) {
             self.expired_session_cache.push(node_id, session).await;
         }
+    }
+
+    async fn discard_session(&self, node_id: Self::NodeId) {
+        debug!(peer=?node_id, "Discarding session");
+        self.session_store
+            .timeout_lock()
+            .await
+            .store
+            .remove(&node_id);
     }
 }

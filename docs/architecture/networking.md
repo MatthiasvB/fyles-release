@@ -260,6 +260,17 @@ Cryptographic sessions are negotiated per-peer using the `SessionEstablishment` 
 
 The `SessionResponder` implements a **chain of responsibility**: when a message arrives, it tries decryption with the current session, then falls back to recently-expired sessions (maintained in a `ScopedExpiryMap`).
 
+A session authenticates the peer only if its keys were known when the session was established. A
+share code redeemed over the network travels on a session set up before either side knew the other.
+Once the redeemer's brain has stored the contact, it asks its node to discard the session with the
+peer that sent it (`NetworkNode::discard_session`). The node drops it outright, without the copy in
+the expired-session cache that retiring a session keeps. Through that copy the redeemer would
+still accept the sharer's requests on the old session, unauthenticated. Without it, the sharer's
+next request is answered `MissingSession`, and the sharer establishes a new session and sends again,
+as after a peer that crashed. The new session authenticates whatever each side knows by then.
+Contacts added by QR code or synced from an owned device come with no peer, which leaves those
+cases open ([Accepted Inconsistencies](accepted-inconsistencies.md)).
+
 See [Security & Cryptography](security.md) for details.
 
 ---

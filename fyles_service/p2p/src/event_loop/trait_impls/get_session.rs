@@ -42,7 +42,11 @@ impl<T: FileTracker, S: LocalNetworkSwarm + 'static> GetSession for RefCountEven
             .await
     }
 
-    async fn clear_session(&self, node_id: Self::NodeId) {
-        self.session_manager.clear_session(node_id).await
+    async fn retire_session(&self, node_id: Self::NodeId) {
+        self.session_manager.retire_session(node_id).await
+    }
+
+    async fn discard_session(&self, node_id: Self::NodeId) {
+        self.session_manager.discard_session(node_id).await
     }
 }

@@ -1599,7 +1599,7 @@ dependencies = [
 
 [[package]]
 name = "fyles-core"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "async-trait",
  "automerge",
@@ -1649,7 +1649,7 @@ dependencies = [
 
 [[package]]
 name = "fyles-daemon"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "async-trait",
  "clap",
@@ -3541,7 +3541,7 @@ dependencies = [
 
 [[package]]
 name = "p2p"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "asynchronous-codec",

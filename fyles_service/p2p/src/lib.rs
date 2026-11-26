@@ -383,6 +383,13 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> NetworkNode for P
             .expect("Command receiver not to be dropped.");
     }
 
+    async fn discard_session(&self, peer_id: PeerIdWrapper) {
+        self.command_sender
+            .send(DataCommand::DiscardSession { peer_id }.into())
+            .await
+            .expect("Command receiver not to be dropped.");
+    }
+
     async fn trigger_interactions_with_visible_peers(&self) {
         self.command_sender
             .send(LoopCommand::TriggerVisiblePeerInteractions.into())

@@ -221,6 +221,8 @@ impl NetworkNode for MockP2pNode {
         // The mock performs no networking.
     }
 
+    async fn discard_session(&self, _: PeerIdWrapper) {}
+
     async fn restart(&self, config: NodeConfig) {
         self.restarts.lock().unwrap().push(config);
     }

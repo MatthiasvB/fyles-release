@@ -91,8 +91,10 @@ flag and the firewall rule, so the two cannot disagree.
   `nix profile install` and `nix flake check` need `NIXPKGS_ALLOW_UNFREE=1` with `--impure`, as
   nixpkgs' own unfree packages do. The modules patch the app against the flake's nixpkgs, but under
   the unfree settings of the configuration that uses them.
-- A user configured both in Home Manager and in `programs.fyles.users` would get two units, which
-  an assertion rules out.
+- A user configured both in Home Manager and in `programs.fyles.users` would have the system's
+  unit replaced by Home Manager's. An assertion rules that out where Home Manager runs inside
+  NixOS.
+- Where the Nix code departs from community conventions, `nix/README.md` says why.
 - With a pinned port the app cannot choose another. A firewall only covers the pinned port, so the
   temporary fallback reaches local peers only where no firewall is in the way.
 

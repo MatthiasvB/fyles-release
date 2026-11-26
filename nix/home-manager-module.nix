@@ -1,11 +1,14 @@
-{fylesFor}: {
+{ fylesFor }:
+{
   config,
   lib,
   pkgs,
   ...
-}: let
+}:
+let
   cfg = config.programs.fyles;
-in {
+in
+{
   # Home Manager inside NixOS also gets this module from the NixOS module. The key loads it once.
   key = "fyles-home-manager-module";
 
@@ -43,7 +46,7 @@ in {
   };
 
   config = lib.mkIf cfg.enable {
-    home.packages = [cfg.package];
+    home.packages = [ cfg.package ];
     systemd.user.services.fyles-daemon = {
       Unit.Description = "Fyles daemon";
       Service = {
@@ -56,7 +59,7 @@ in {
           lib.optional (cfg.outputDir != null) "FYLES_OUTPUT_DIR=${cfg.outputDir}"
           ++ lib.optional (cfg.listenPort != null) "FYLES_LISTEN_PORT=${toString cfg.listenPort}";
       };
-      Install.WantedBy = ["default.target"];
+      Install.WantedBy = [ "default.target" ];
     };
   };
 }

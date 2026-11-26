@@ -72,7 +72,6 @@ use crate::event_loop::filerequest::receive_manager::FilerequestReceiver;
 use crate::event_loop::filerequest::stream_receiver::spawn_file_stream_acceptor;
 use crate::event_loop::listen::{ActiveListeners, listen_on_port};
 use crate::event_loop::with_swarm::{GetInnerEventSender, SwarmWorkDiscarded};
-#[cfg(test)]
 use crate::send_receive_traits::get_session::GetSession;
 use crate::send_receive_traits::get_session::SessionManager;
 use crate::send_receive_traits::request_registry::{
@@ -1420,6 +1419,14 @@ impl<T: FileTracker + 'static, S: LocalNetworkSwarm + 'static> RefCountEventLoop
                     error!("Invalid peer ID provided for pubkey fetch: {peer_id}");
                 }
             }
+            DataCommand::DiscardSession { peer_id } => match peer_id.parse() {
+                Ok(peer_id) => {
+                    tokio::spawn(
+                        async move { self.discard_session(peer_id).await }.in_current_span(),
+                    );
+                }
+                Err(_) => error!("Invalid peer ID provided to discard its session: {peer_id}"),
+            },
             #[cfg(feature = "debug-server")]
             DataCommand::GetDebugBlob { sender } => {
                 tokio::spawn(

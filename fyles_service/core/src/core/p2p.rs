@@ -119,6 +119,9 @@ pub trait NetworkNode: Send + Sync {
     /// `NetworkNodeAction::StoreFetchedContactKeys`. Best-effort — used to resolve contacts
     /// learned via sync that lack cached keys.
     async fn fetch_contact_keys(&self, peer_id: PeerIdWrapper, contact_ids: Vec<ContactId>);
+    /// Drops the session with `peer_id` outright, so the next request on either side establishes
+    /// one that authenticates the contacts known by then.
+    async fn discard_session(&self, peer_id: PeerIdWrapper);
     /// Re-poke every peer the node can currently see: send anything queued for it, and sync with it
     /// if it is one of our devices.
     async fn trigger_interactions_with_visible_peers(&self);

@@ -98,6 +98,9 @@ pub enum DataCommand {
         peer_id: PeerIdWrapper,
         contact_ids: Vec<ContactId>,
     },
+    DiscardSession {
+        peer_id: PeerIdWrapper,
+    },
     /// Intersect `devices` with what is reachable and ask the brain to sync `kind` with each hit.
     SyncDocsWithReachable {
         devices: Vec<PeerIdWrapper>,
